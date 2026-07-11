@@ -51,9 +51,12 @@ class _PackageFakeSeparator:
     def separate(
         self, audio_file_path: str, custom_output_names: dict[str, str] | None = None
     ) -> list[str]:
-        guitar_name = (custom_output_names or {}).get("Guitar", "mix_(Guitar)_fake")
+        # Honor whatever stem the caller asked to rename (Guitar for the
+        # guitar target, Vocals for vocals, ...) so this fake works for any
+        # TargetSpec, plus one "Other" stem for the backing track.
+        target_name = next(iter((custom_output_names or {"Guitar": "mix_(Guitar)_fake"}).values()))
         written = []
-        for name, value in ((guitar_name, 0.2), ("mix_(Other)_fake", 0.3)):
+        for name, value in ((target_name, 0.2), ("mix_(Other)_fake", 0.3)):
             filename = f"{name}.wav"
             samples = np.full((400, 2), value, dtype=np.float32)
             sf.write(str(self.output_dir / filename), samples, 8000)
@@ -90,15 +93,15 @@ def test_build_package_exports_expected_files_and_layout(tmp_path, song_input):
     assert package_dir == out_dir / "song"
     for name in (
         "song.guitar.wav", "song.guitar.mp3",
-        "song.backing.wav", "song.backing.mp3",
+        "song.guitar.backing.wav", "song.guitar.backing.mp3",
         "song.original.mp3",
-        "song.player.html",
+        "song.guitar.player.html",
     ):
         f = package_dir / name
         assert f.exists() and f.stat().st_size > 0, f"missing or empty: {f}"
 
-    html = (package_dir / "song.player.html").read_text(encoding="utf-8")
-    for src in ("song.original.mp3", "song.guitar.mp3", "song.backing.mp3"):
+    html = (package_dir / "song.guitar.player.html").read_text(encoding="utf-8")
+    for src in ("song.original.mp3", "song.guitar.mp3", "song.guitar.backing.mp3"):
         assert src in html, f"player must reference {src}"
     assert "ギター" in html
 
@@ -110,13 +113,13 @@ def test_build_package_skips_mp3_when_disabled(tmp_path, song_input):
     package_dir = build_package(song_input, out_dir, title="song", mp3=False)
 
     assert (package_dir / "song.guitar.wav").exists()
-    assert (package_dir / "song.backing.wav").exists()
-    for name in ("song.guitar.mp3", "song.backing.mp3", "song.original.mp3"):
+    assert (package_dir / "song.guitar.backing.wav").exists()
+    for name in ("song.guitar.mp3", "song.guitar.backing.mp3", "song.original.mp3"):
         assert not (package_dir / name).exists()
 
-    html = (package_dir / "song.player.html").read_text(encoding="utf-8")
+    html = (package_dir / "song.guitar.player.html").read_text(encoding="utf-8")
     assert "song.guitar.wav" in html
-    assert "song.backing.wav" in html
+    assert "song.guitar.backing.wav" in html
     assert "song.original.mp3" not in html
 
 
@@ -169,7 +172,7 @@ def test_build_package_rejects_unknown_target(tmp_path, song_input):
     out_dir = tmp_path / "out"
 
     with pytest.raises(ValueError, match="unknown target"):
-        build_package(song_input, out_dir, target="drums")
+        build_package(song_input, out_dir, target="theremin")
 
 
 class _FallbackFakeSeparator(_PackageFakeSeparator):
@@ -203,6 +206,31 @@ def test_build_package_fallback_result_still_cached_on_second_run(
         "a fallback run must still be a cache hit next time; if this grew, the "
         "separate meta was keyed on the post-fallback model instead of the "
         "configured one"
+    )
+
+
+@_NEED_FFMPEG
+def test_build_package_targets_coexist_in_cache(tmp_path, song_input):
+    """Switching --target on the same song must not invalidate the other
+    target's cached separation: step meta and stem files are target-scoped."""
+    out_dir = tmp_path / "out"
+
+    build_package(song_input, out_dir, title="song")  # guitar
+    assert len(_PackageFakeSeparator.instances) == 1
+
+    vocals_dir = build_package(song_input, out_dir, title="song", target="vocals")
+    assert len(_PackageFakeSeparator.instances) == 2
+    assert (vocals_dir / "song.vocals.wav").exists()
+    html = (vocals_dir / "song.vocals.player.html").read_text(encoding="utf-8")
+    assert "ボーカル" in html
+    # The vocals build must have added its own files, not clobbered guitar's.
+    assert (vocals_dir / "song.guitar.backing.wav").exists()
+    assert (vocals_dir / "song.vocals.backing.wav").exists()
+    assert (vocals_dir / "song.guitar.player.html").exists()
+
+    build_package(song_input, out_dir, title="song")  # guitar again
+    assert len(_PackageFakeSeparator.instances) == 2, (
+        "returning to a previously separated target must be a cache hit"
     )
 
 

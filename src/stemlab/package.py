@@ -111,15 +111,20 @@ def build_package(
         "target": spec.target,
         "stems": [spec.target, "backing"],
     }
+    # Step name and stem files are target-scoped so different --target runs of
+    # the same song coexist in one cache dir instead of invalidating each
+    # other (a shared "separate" meta would flip-flop on every target switch,
+    # re-running a minutes-long separation each time).
+    separate_step = f"separate:{spec.target}"
     target_wav = cache_dir / f"{spec.target}.wav"
-    backing_wav = cache_dir / "backing.wav"
+    backing_wav = cache_dir / f"{spec.target}.backing.wav"
     outputs = [target_wav, backing_wav]
 
     # normalize_ran forces a re-separation: if the upstream step re-ran, this
     # step's cached stems were built against an input.wav that may no longer
     # match what's on disk (tab-maker pipeline.run's force cascade).
     if not no_cache and not normalize_ran and cache.stage_is_fresh(
-        cache_dir, "separate", _SEPARATE_VERSION, separate_params, outputs
+        cache_dir, separate_step, _SEPARATE_VERSION, separate_params, outputs
     ):
         console.print("[dim]∙ separate: cached[/dim]")
     else:
@@ -142,7 +147,7 @@ def build_package(
         # the digest-exempt extra field.
         cache.write_stage_meta(
             cache_dir,
-            "separate",
+            separate_step,
             _SEPARATE_VERSION,
             separate_params,
             extra={"model_used": result.model_used},
@@ -152,22 +157,27 @@ def build_package(
     package_dir = out_dir / safe
     package_dir.mkdir(parents=True, exist_ok=True)
 
+    # Backing and player are target-scoped like the stem itself: guitar's
+    # backing (has vocals) and vocals' backing (karaoke) are different mixes,
+    # so building a second target for the same song must add files to the
+    # folder, not silently overwrite the first target's. Only original.mp3 is
+    # shared -- it's the same audio whichever target produced it.
     _export(target_wav, package_dir / f"{safe}.{spec.target}.wav")
-    _export(backing_wav, package_dir / f"{safe}.backing.wav")
+    _export(backing_wav, package_dir / f"{safe}.{spec.target}.backing.wav")
 
     if mp3:
         target_ref = f"{safe}.{spec.target}.mp3"
-        backing_ref = f"{safe}.backing.mp3"
+        backing_ref = f"{safe}.{spec.target}.backing.mp3"
         original_ref: str | None = f"{safe}.original.mp3"
         _export_mp3(target_wav, package_dir / target_ref)
         _export_mp3(backing_wav, package_dir / backing_ref)
         _export_mp3(input_wav, package_dir / original_ref)
     else:
         target_ref = f"{safe}.{spec.target}.wav"
-        backing_ref = f"{safe}.backing.wav"
+        backing_ref = f"{safe}.{spec.target}.backing.wav"
         original_ref = None
 
-    player_dest = package_dir / f"{safe}.player.html"
+    player_dest = package_dir / f"{safe}.{spec.target}.player.html"
     player_dest.write_text(
         render_player(
             song_title,

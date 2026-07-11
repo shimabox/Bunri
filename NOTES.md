@@ -315,3 +315,41 @@ VM のディスク(このマシンでは 58.4GB)が満杯になると、`apt-get
 `docker builder prune` / 不要イメージ削除で解消する。また
 `docker rmi` でタグを消してもビルドキャッシュがレイヤを掴んでいる間は
 実容量が戻らない(`docker builder prune` まで必要)ことにも注意。
+
+---
+
+## Phase 2(多楽器ターゲット)のモデル選定
+
+### vocals: vocals_mel_band_roformer.ckpt
+
+audio-separator 0.44.3 のカタログ(`Separator.list_supported_model_files()` の
+`scores`、公表 SDR 実測値)を vocals SDR でランキングした結果から選定:
+
+| SDR | モデル | stems |
+|---|---|---|
+| **12.60** | **vocals_mel_band_roformer.ckpt**(採用) | vocals/other |
+| 12.52 | melband_roformer_big_beta4.ckpt | vocals/other |
+| 12.44 | mel_band_roformer_kim_ft_unwa.ckpt | vocals/other |
+| 12.10 | model_bs_roformer_ep_368_sdr_12.9628.ckpt | vocals/instrumental |
+| 10.79 | htdemucs_ft.yaml | 4-stem Demucs |
+
+- カタログ組み込みモデルなので audio-separator 自身がダウンロードできる
+  (becruily のようなブートストラップは不要)
+- 2-stem(vocals/other)なので backing = other stem がそのままカラオケ音源になる
+- フォールバックは htdemucs_6s.yaml(Vocals stem あり、guitar と共通)
+- 品質はユーザー試聴ゲートで確認(SDR はあくまで序列の目安)
+
+### bass / drums / piano: htdemucs_6s.yaml の stem 流用
+
+カタログにこれらの単独特化モデルで htdemucs_6s を上回る実測スコアのものが
+無いため、6-stem Demucs から該当 stem を抽出する。デフォルト=フォールバック
+候補と同一になるので fallback_model は None(自分自身への再試行は無意味)。
+
+### キャッシュのターゲット別スコープ化
+
+多楽器化に伴い、分離ステップの meta 名を `separate:<target>`、バッキングを
+`<target>.backing.wav` に変更した。共有 meta のままだと同じ曲で --target を
+切り替えるたびに params 不一致で全再分離(数分〜数十分)が走り、バッキングも
+上書きされるため。パッケージ側の出力も同様に `<曲名>.<target>.backing.*` /
+`<曲名>.<target>.player.html` とし、1フォルダに複数ターゲットが共存できる
+(original.mp3 のみ全ターゲット共通なので共有)。

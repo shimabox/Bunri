@@ -337,7 +337,11 @@ def separate(
     if not input_wav.exists():
         raise RuntimeError(f"separate requires {input_wav} to exist")
     target_wav = work_dir / f"{spec.target}.wav"
-    backing_wav = work_dir / "backing.wav"
+    # Target-scoped name: each --target's backing is a different mix (guitar's
+    # backing contains vocals, vocals' backing doesn't), so sharing one
+    # backing.wav across targets in the same work_dir would let a later
+    # --target run silently overwrite an earlier one's cached backing.
+    backing_wav = work_dir / f"{spec.target}.backing.wav"
 
     # audio-separator pulls in torch/onnxruntime; import lazily so callers that
     # don't need it stay fast to load.

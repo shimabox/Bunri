@@ -241,7 +241,7 @@ def test_run_returns_expected_result_paths(tmp_path, monkeypatch):
 
     assert isinstance(result, SeparationResult)
     assert result.target_wav == work_dir / "guitar.wav"
-    assert result.backing_wav == work_dir / "backing.wav"
+    assert result.backing_wav == work_dir / "guitar.backing.wav"
     assert result.model_used == "htdemucs_6s.yaml"
 
 
@@ -301,7 +301,7 @@ def test_run_backing_is_sum_of_other_stems(tmp_path, monkeypatch):
 
     separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
 
-    backing = work_dir / "backing.wav"
+    backing = work_dir / "guitar.backing.wav"
     assert backing.exists()
     data, sr = sf.read(str(backing), dtype="float32", always_2d=True)
     assert sr == _SR
@@ -320,7 +320,7 @@ def test_run_cleans_up_intermediate_stem_files(tmp_path, monkeypatch):
     assert not (work_dir / "mix_(Bass)_htdemucs_6s.wav").exists()
     assert not (work_dir / "mix_(Vocals)_htdemucs_6s.wav").exists()
     assert sorted(p.name for p in work_dir.glob("*.wav")) == [
-        "backing.wav",
+        "guitar.backing.wav",
         "guitar.wav",
         "input.wav",
     ]
@@ -332,7 +332,7 @@ def test_run_two_stem_model_backing_equals_the_other_stem(tmp_path, monkeypatch)
 
     separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
 
-    backing = work_dir / "backing.wav"
+    backing = work_dir / "guitar.backing.wav"
     data, _ = sf.read(str(backing), dtype="float32", always_2d=True)
     assert np.allclose(data, 0.30, atol=1e-3)
 
@@ -343,7 +343,7 @@ def test_run_backing_gain_normalizes_when_sum_clips(tmp_path, monkeypatch):
 
     separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
 
-    backing = work_dir / "backing.wav"
+    backing = work_dir / "guitar.backing.wav"
     data, _ = sf.read(str(backing), dtype="float32", always_2d=True)
     peak = float(np.abs(data).max())
     # Raw sum would be 0.90 + 0.85 = 1.75 (well past full scale); normalized

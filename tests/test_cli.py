@@ -32,7 +32,7 @@ def test_help_shows_usage():
 
 
 def test_unknown_target_is_rejected(audio):
-    result = _run(audio, "--target", "drums")
+    result = _run(audio, "--target", "theremin")
     assert result.exit_code != 0
     assert "unknown target" in result.output
 

@@ -29,13 +29,18 @@ stemlab song.mp3
 
 ```
 out/song/
-├── song.guitar.wav / .mp3     # ギターのみ
-├── song.backing.wav / .mp3    # ギターなし(それ以外全部)
-├── song.original.mp3          # 原曲
-└── song.player.html           # オフライン練習プレイヤー
-                                #  (原曲/ギターのみ/ギターなし切替・ABループ・
-                                #   ピッチ維持スロー再生)
+├── song.guitar.wav / .mp3            # ギターのみ
+├── song.guitar.backing.wav / .mp3    # ギターなし(それ以外全部)
+├── song.original.mp3                 # 原曲
+└── song.guitar.player.html           # オフライン練習プレイヤー
+                                      #  (原曲/ギターのみ/ギターなし切替・
+                                      #   ABループ・ピッチ維持スロー再生)
 ```
+
+ファイル名に抽出対象(`guitar` など)が入っているのは、同じ曲を別の
+`--target` で追加ビルドしたとき(例: `--target vocals` でカラオケ音源を作る)
+に、同じフォルダへ共存できるようにするためです。`song.original.mp3` だけは
+どの対象でも同一内容なので共有されます。
 
 中間生成物(正規化済み音声・分離済み stem)は `out/.cache/<入力ファイルの
 ダイジェスト>/` にキャッシュされ、同じ入力・同じオプションでの再実行はスキップ
@@ -44,13 +49,24 @@ out/song/
 ### 主なオプション
 
 ```bash
-stemlab song.mp3 --target guitar             # 抽出対象(既定: guitar。現状 guitar のみ登録)
+stemlab song.mp3 --target vocals             # 抽出対象(既定: guitar)
 stemlab song.mp3 --model htdemucs_6s.yaml     # 分離モデルを明示指定(失敗時のフォールバックなし)
 stemlab song.mp3 --device cpu                 # auto(既定) | cpu | mps
 stemlab song.mp3 --no-mp3                     # wav のみ出力(mp3 変換をスキップ)
 stemlab song.mp3 --no-cache                   # キャッシュを無視して全段再計算
 stemlab song.mp3 -o path/to/out               # 出力先ディレクトリ
 ```
+
+### 抽出対象(--target)
+
+| target | 既定モデル | 備考 |
+|---|---|---|
+| `guitar`(既定) | ギター特化 Mel-Band Roformer(becruily) | 実測比較で選定(ボーカル混入が htdemucs_6s の 1/3) |
+| `vocals` | vocals_mel_band_roformer | カタログ実測 SDR 首位(12.60)。「ボーカルなし」はそのままカラオケ音源 |
+| `bass` / `drums` / `piano` | htdemucs_6s(6-stem Demucs) | 専用モデルなし。6 stem 分離から該当パートを抽出 |
+
+同じ曲でも `--target` ごとに分離キャッシュは独立しているため、対象を
+切り替えても過去の分離結果はそのまま再利用されます。
 
 `--model` を省略した場合、対象楽器ごとに登録されたデフォルトモデルが失敗した
 ときだけ自動でフォールバックモデルに切り替わります(ギターの場合
