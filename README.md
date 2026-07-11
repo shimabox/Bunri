@@ -148,7 +148,8 @@ pytest・playwright(Chromium 込み)を含む開発用イメージです。CI �
 
 ## ステータス
 
-Phase 1(コア移植: guitar)・Phase 1.5(Docker 第一級対応: cpu/dev/cuda
-イメージ、compose.yaml)完了。`stemlab` CLI で実際にギター抽出パッケージを
-生成できます。今後の展開(vocals など他楽器への対応、プレイヤー機能拡張)は
-`.claude/plans/stemlab-founding-plan.md` を参照してください。
+Phase 1(コア移植: guitar)・Phase 1.5(Docker 対応)・Phase 2(多楽器:
+vocals/bass/drums/piano)完了。プレイヤー拡張(音量ミキサー・ループ書き出し)は
+試作したがユーザー試用の結果見送り(経緯は NOTES.md)。今後の展開(波形表示、
+compare コマンド、バッチ処理など)は `.claude/plans/` のプラン各種を参照して
+ください。

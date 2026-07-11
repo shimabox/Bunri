@@ -353,3 +353,60 @@ audio-separator 0.44.3 のカタログ(`Separator.list_supported_model_files()` 
 上書きされるため。パッケージ側の出力も同様に `<曲名>.<target>.backing.*` /
 `<曲名>.<target>.player.html` とし、1フォルダに複数ターゲットが共存できる
 (original.mp3 のみ全ターゲット共通なので共有)。
+
+## Phase 3(プレイヤー 2.0)の技術的知見
+
+**結論(2026-07-12): 音量ミキサーとループ書き出しは実装・全テスト通過まで
+到達したが、ユーザー試用の結果「微妙」で不採用となり、プレイヤーは従来の姿に
+戻した(commit 前に差し戻したためコードは履歴に残っていない)。**
+以下の file:// 制約の実測結果は、将来プレイヤーに音声処理系の機能(波形表示・
+書き出し等)を再検討する際の一次資料としてそのまま残す。
+
+### ループ書き出しの経路検証(候補 A / B を file:// + headless Chromium で実測)
+
+「AB 区間を音声ファイルに書き出す」機能で、2 つの技術経路を実際に headless
+Chromium + `file://` で走らせて採否を決めた(spike スクリプトで実挙動を確認)。
+
+**候補 A: `<audio>.captureStream()` + MediaRecorder(実時間録音)→ 却下**
+
+- 根拠ログ:
+  `SecurityError: Failed to execute 'captureStream' on 'HTMLMediaElement':
+  Cannot capture from element with cross-origin data`
+- `file://` から読み込んだメディアは opaque origin 扱いになり、`captureStream()`
+  は呼んだ瞬間に例外を投げる(readyState=4 まで完全ロード済みでも同じ)。
+  無音になるどころか、そもそもストリームが取れない。
+- 「現在のミックスを実時間で録れる」という利点は魅力的だったが、この経路は
+  `file://` プレイヤーの存在理由(オフライン完全動作)と両立しない。
+
+**候補 B: file 選択 → decodeAudioData(ArrayBuffer)→ 区間切り出し → WAV → 却下せず採用**
+
+- 根拠ログ(同じ tone.mp3 で):
+  `decodeAudioData` 成功 → `decoded ch=1 sr=48000 len=144000`(3 秒 mp3 を
+  正しくデコード)。`AudioContext.decodeAudioData` は **ArrayBuffer 渡し**なら
+  `file://` でも動く(URL 経由・fetch 経由は死ぬが、バイト列を直接渡す分には
+  origin 制約に触れない)。
+- ただし `fetch('tone.mp3')` / `XMLHttpRequest` はどちらも `file://` で失敗
+  (`Failed to fetch` / `onerror`)。よって**同フォルダの音声を JS 側から自動
+  ロードすることはできず**、`<input type="file">` でユーザーに選ばせるしかない
+  (ユーザー選択ファイルは FileReader/`file.arrayBuffer()` で origin 制約なく
+  読める)。これが「A が理想だが B を採る」判断の核心。
+- Blob download の発火も検証済み: `<a download href="blob:...">` の
+  プログラム的 `click()` は headless Chromium + `file://` でも Playwright の
+  download イベントを発火し、実ファイルが保存される(spike で size=1000 を確認)。
+
+**採用: 候補 B。** UX は「書き出し時に音声ファイルを選び直す」一手間が増えるが、
+`file://` で確実に動く唯一の経路。実データ(斜陽 224.6 秒の実 mp3)で 2 秒区間を
+書き出し、48kHz ステレオ PCM の正しい WAV(2.00 秒・384KB)が得られることまで
+確認した。
+
+**B で A の理想(ミックス反映)をどこまで拾ったか:** `<input multiple>` で複数
+ファイルを選べるようにし、選ばれた各ファイル名を `TRACK_SRC`(各トラックの
+ファイル名)と突き合わせて、一致したトラックの**現在のミキサー音量**をゲインと
+して掛けてから合算 → WAV 化する。これで「ギターなし 100% + ギターのみ 30%」の
+ようなミックスもそのまま書き出せる(A が本来売りにしていた利点を、file 選択の
+一手間と引き換えに回収)。名前が一致しないファイルはフル音量で書き出す。
+
+WAV エンコードは 16bit PCM の手書き(~40 行、ヘッダ 44 バイト + インターリーブ)。
+出力サンプルレートはデコード結果(`AudioBuffer.sampleRate`)に従う。Chromium は
+44.1kHz ソースでも AudioContext 既定の 48kHz にリサンプルしてデコードするが、
+書き出し WAV はその sampleRate をそのまま使うので破綻しない。
