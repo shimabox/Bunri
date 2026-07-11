@@ -16,6 +16,9 @@ dependencies = [
     "typer",
 ]
 
+[project.scripts]
+stemlab = "stemlab.cli:app"
+
 [build-system]
 requires = ["uv_build>=0.11.14,<0.12.0"]
 build-backend = "uv_build"
@@ -30,5 +33,6 @@ environments = [
 
 [dependency-groups]
 dev = [
+    "playwright>=1.61.0",
     "pytest",
 ]

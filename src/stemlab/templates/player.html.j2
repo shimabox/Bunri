@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} - 練習プレイヤー</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #ffffff;
+    color: #1a1a1a;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans",
+      "Yu Gothic", Arial, sans-serif;
+  }
+  header.tm-header {
+    padding: 16px 24px;
+    border-bottom: 1px solid #ddd;
+  }
+  h1.tm-title {
+    margin: 0 0 4px;
+    font-size: 1.4rem;
+    font-weight: 600;
+  }
+  .tm-sub { margin: 0; color: #888; font-size: 0.8rem; }
+  main.tm-main {
+    padding: 20px 24px 40px;
+    max-width: 760px;
+  }
+  .tm-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 18px;
+  }
+  .tm-row > .tm-label {
+    min-width: 4.5em;
+    color: #444;
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+  button.tm-btn {
+    font: inherit;
+    font-size: 0.9rem;
+    padding: 6px 16px;
+    border: 1px solid #999;
+    background: #f5f5f5;
+    border-radius: 4px;
+    cursor: pointer;
+    color: #1a1a1a;
+  }
+  button.tm-btn:hover:not(:disabled) { background: #e8e8e8; }
+  button.tm-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  button.tm-trk.is-active {
+    background: #1a1a1a;
+    border-color: #1a1a1a;
+    color: #ffffff;
+    font-weight: 600;
+  }
+  button.tm-play {
+    min-width: 8em;
+    font-weight: 600;
+  }
+  .tm-seek-wrap {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+  }
+  input.tm-seek {
+    flex: 1 1 auto;
+    min-width: 160px;
+    height: 22px;
+    cursor: pointer;
+    accent-color: #1a1a1a;
+  }
+  .tm-time {
+    font-variant-numeric: tabular-nums;
+    color: #333;
+    font-size: 0.9rem;
+    white-space: nowrap;
+  }
+  .tm-loop-info, .tm-rate-val {
+    font-variant-numeric: tabular-nums;
+    color: #333;
+    font-size: 0.9rem;
+  }
+  .tm-loop-info.is-on { color: #0a7d2c; font-weight: 600; }
+  .tm-rate-val { min-width: 3.5em; text-align: center; font-weight: 600; }
+  .tm-help {
+    margin: 8px 0 0;
+    color: #777;
+    font-size: 0.78rem;
+    line-height: 1.7;
+  }
+  .tm-help kbd {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #f0f0f0;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    padding: 0 5px;
+    font-size: 0.72rem;
+  }
+  .tm-offline-note {
+    margin: 18px 0 0;
+    color: #888;
+    font-size: 0.78rem;
+  }
+  footer.tm-footer {
+    padding: 8px 24px 28px;
+    color: #999;
+    font-size: 0.75rem;
+  }
+</style>
+</head>
+<body>
+<header class="tm-header">
+  <h1 class="tm-title">{{ title }}</h1>
+  <p class="tm-sub">{{ instrument_label }}練習用プレイヤー</p>
+</header>
+
+<main class="tm-main">
+  <!-- Audio elements: one per track that the caller supplied. Missing tracks
+       (None) render no element at all and a disabled button below. Sources are
+       plain relative URLs on a <audio src> attribute (Jinja-autoescaped), which
+       load fine under file:// — unlike fetch()/decodeAudioData, which the null
+       file:// origin blocks. -->
+  {% if original_src %}<audio id="tm-audio-original" data-track="original" preload="auto" src="{{ original_src }}"></audio>{% endif %}
+  {% if target_src %}<audio id="tm-audio-target" data-track="target" preload="auto" src="{{ target_src }}"></audio>{% endif %}
+  {% if backing_src %}<audio id="tm-audio-backing" data-track="backing" preload="auto" src="{{ backing_src }}"></audio>{% endif %}
+
+  <div class="tm-row">
+    <span class="tm-label">トラック</span>
+    <button type="button" class="tm-btn tm-trk" data-track="original"{% if not original_src %} disabled{% endif %}>原曲{% if not original_src %}（無し）{% endif %}</button>
+    <button type="button" class="tm-btn tm-trk" data-track="target"{% if not target_src %} disabled{% endif %}>{{ instrument_label }}のみ{% if not target_src %}（無し）{% endif %}</button>
+    <button type="button" class="tm-btn tm-trk" data-track="backing"{% if not backing_src %} disabled{% endif %}>{{ instrument_label }}なし{% if not backing_src %}（無し）{% endif %}</button>
+  </div>
+
+  <div class="tm-row">
+    <button type="button" id="tm-play" class="tm-btn tm-play">再生</button>
+    <div class="tm-seek-wrap">
+      <input type="range" id="tm-seek" class="tm-seek" min="0" max="1" step="0.01" value="0" aria-label="シークバー">
+      <span class="tm-time"><span id="tm-cur">0:00</span> / <span id="tm-dur">0:00</span></span>
+    </div>
+  </div>
+
+  <div class="tm-row">
+    <span class="tm-label">ループ</span>
+    <button type="button" id="tm-a" class="tm-btn">A点</button>
+    <button type="button" id="tm-b" class="tm-btn">B点</button>
+    <button type="button" id="tm-loop-clear" class="tm-btn">ループ解除</button>
+    <span id="tm-loop-info" class="tm-loop-info">A: --:-- / B: --:--</span>
+  </div>
+
+  <div class="tm-row">
+    <span class="tm-label">速度</span>
+    <button type="button" id="tm-rate-down" class="tm-btn">−</button>
+    <span id="tm-rate-val" class="tm-rate-val">1.00x</span>
+    <button type="button" id="tm-rate-up" class="tm-btn">＋</button>
+  </div>
+
+  <p class="tm-help">
+    キーボード:
+    <kbd>Space</kbd> 再生/停止 &middot;
+    <kbd>A</kbd>/<kbd>B</kbd> A点/B点 &middot;
+    <kbd>C</kbd> ループ解除 &middot;
+    <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> &plusmn;3秒 &middot;
+    <kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> トラック切替 &middot;
+    <kbd>+</kbd>/<kbd>-</kbd> 速度
+  </p>
+
+  <p class="tm-offline-note">
+    このプレイヤーはオフラインで動作します。音声ファイル
+    (原曲 / {{ instrument_label }}のみ / {{ instrument_label }}なし) は、この HTML と同じフォルダに置いてください。
+  </p>
+</main>
+
+<footer class="tm-footer">
+  Generated {{ generated_at }}
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- Test/automation hook -------------------------------------------
+  // Published on window like the PDF viewer's __tabReady/__tabApi: exposes a
+  // read-only state() snapshot plus imperative controls so a headless test can
+  // drive playback and assert behaviour without depending on DOM ids. Safe to
+  // ship in production (it only wraps the same actions the buttons trigger).
+  window.__player = { state: function () { return { ready: false }; } };
+
+  var TRACKS = ["original", "target", "backing"];
+  var LABELS = { original: "原曲", target: "{{ instrument_label }}のみ", backing: "{{ instrument_label }}なし" };
+
+  // Muted background tracks drifting from the active track's clock by more than
+  // this (seconds) get nudged back onto it, so switching to one is heard within
+  // this bound of the true position. resyncOthers() only ever seeks the *muted*
+  // tracks — never the audible one — so we can run it every animation frame with
+  // no audible cost; the deadband means a corrected track then stays put (no
+  // thrash). This is what keeps the cold-start play-start stagger from surviving
+  // to the first track switch.
+  var RESYNC_THRESHOLD = 0.02;
+  var RATE_MIN = 0.5;
+  var RATE_MAX = 1.0;
+  var RATE_STEP = 0.05;
+
+  var els = {};      // name -> HTMLAudioElement | null
+  var btns = {};     // name -> HTMLButtonElement | null
+  var status = {};   // name -> "absent" | "pending" | "ready" | "unavailable"
+
+  var activeName = null;
+  var isPlaying = false;
+  var rate = 1.0;
+  var loopA = null;
+  var loopB = null;
+  var readyFlag = false;
+  var seeking = false;
+  var lastSwitchDrift = 0;
+  var rafId = null;
+  var ppInfo = { supported: false, property: null, value: true };
+
+  var playBtn = document.getElementById("tm-play");
+  var seekEl = document.getElementById("tm-seek");
+  var curEl = document.getElementById("tm-cur");
+  var durEl = document.getElementById("tm-dur");
+  var loopInfoEl = document.getElementById("tm-loop-info");
+  var rateValEl = document.getElementById("tm-rate-val");
+
+  function setPreservesPitch(el, val) {
+    // The standard property is `preservesPitch`; older engines used the
+    // `webkitPreservesPitch` / `mozPreservesPitch` vendor-prefixed spellings.
+    // Set every spelling the element actually exposes and remember which one
+    // took, so state() can report the browser's real support as a fact.
+    var props = ["preservesPitch", "webkitPreservesPitch", "mozPreservesPitch"];
+    for (var i = 0; i < props.length; i++) {
+      if (props[i] in el) {
+        el[props[i]] = val;
+        if (!ppInfo.supported) { ppInfo.supported = true; ppInfo.property = props[i]; }
+        ppInfo.value = val;
+      }
+    }
+  }
+
+  function usable(name) {
+    return status[name] === "ready" || status[name] === "pending";
+  }
+
+  function activeEl() { return activeName ? els[activeName] : null; }
+
+  function duration() {
+    var el = activeEl();
+    return el && isFinite(el.duration) ? el.duration : 0;
+  }
+
+  function fmt(sec) {
+    if (!isFinite(sec) || sec < 0) sec = 0;
+    var m = Math.floor(sec / 60);
+    var s = Math.floor(sec % 60);
+    return m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  function firstUsable() {
+    for (var i = 0; i < TRACKS.length; i++) {
+      if (usable(TRACKS[i])) return TRACKS[i];
+    }
+    return null;
+  }
+
+  // ---- track availability ---------------------------------------------
+  function onMeta(name) {
+    if (status[name] === "unavailable") return;
+    status[name] = "ready";
+    if (btns[name]) btns[name].disabled = false;
+    if (!activeName) { activeName = name; applyActive(); }
+    if (!readyFlag) readyFlag = true;
+    updateUI();
+  }
+
+  function onErr(name) {
+    // A named-but-missing file (or an undecodable one) errors at runtime: drop
+    // it to "unavailable", disable its button and label it 無し, and hand the
+    // active slot to another track if this was it — never throw.
+    status[name] = "unavailable";
+    var btn = btns[name];
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = LABELS[name] + "（無し）";
+      btn.classList.remove("is-active");
+    }
+    if (activeName === name) {
+      activeName = firstUsable();
+      applyActive();
+    }
+    updateUI();
+  }
+
+  function applyActive() {
+    // Exactly the active track is audible; the rest keep playing muted so a
+    // later switch is instant (no seek/buffer gap).
+    TRACKS.forEach(function (name) {
+      var el = els[name];
+      if (el) el.muted = (name !== activeName);
+      var btn = btns[name];
+      if (btn) btn.classList.toggle("is-active", name === activeName && usable(name));
+    });
+  }
+
+  // ---- transport -------------------------------------------------------
+  function playAll() {
+    if (!activeName) return;
+    TRACKS.forEach(function (name) {
+      var el = els[name];
+      if (el && usable(name)) {
+        var p = el.play();
+        if (p && p.catch) p.catch(function () {});
+      }
+    });
+    isPlaying = true;
+    startTick();
+    updatePlayBtn();
+  }
+
+  function pauseAll() {
+    TRACKS.forEach(function (name) {
+      var el = els[name];
+      if (el) el.pause();
+    });
+    isPlaying = false;
+    stopTick();
+    updatePlayBtn();
+  }
+
+  function toggle() { if (isPlaying) pauseAll(); else playAll(); }
+
+  function seekAll(t) {
+    var dur = duration();
+    if (dur > 0) t = Math.max(0, Math.min(t, dur));
+    else t = Math.max(0, t);
+    TRACKS.forEach(function (name) {
+      var el = els[name];
+      if (el && usable(name)) { try { el.currentTime = t; } catch (e) {} }
+    });
+    updateUI();
+  }
+
+  function nudge(delta) {
+    var el = activeEl();
+    if (el) seekAll(el.currentTime + delta);
+  }
+
+  function resyncOthers() {
+    var master = activeEl();
+    if (!master) return;
+    var t = master.currentTime;
+    TRACKS.forEach(function (name) {
+      var el = els[name];
+      if (el && el !== master && usable(name)) {
+        if (Math.abs(el.currentTime - t) > RESYNC_THRESHOLD) {
+          try { el.currentTime = t; } catch (e) {}
+        }
+      }
+    });
+  }
+
+  function maxDrift() {
+    var master = activeEl();
+    if (!master) return 0;
+    var t = master.currentTime, d = 0;
+    TRACKS.forEach(function (name) {
+      var el = els[name];
+      if (el && el !== master && usable(name)) {
+        d = Math.max(d, Math.abs(el.currentTime - t));
+      }
+    });
+    return d;
+  }
+
+  // ---- track switch ----------------------------------------------------
+  function switchTrack(name) {
+    if (!usable(name) || name === activeName) return;
+    var oldEl = activeEl();
+    var newEl = els[name];
+    // The audible position jumps by exactly the gap between the outgoing and
+    // incoming clocks; capture it before we touch anything so tests can assert
+    // it is tiny. Then flip audibility (no seek => gapless) and re-tighten.
+    lastSwitchDrift = (oldEl && newEl) ? Math.abs(newEl.currentTime - oldEl.currentTime) : 0;
+    activeName = name;
+    applyActive();
+    resyncOthers();
+    updateUI();
+  }
+
+  // ---- speed -----------------------------------------------------------
+  function setRate(r) {
+    r = Math.round(Math.max(RATE_MIN, Math.min(RATE_MAX, r)) * 100) / 100;
+    rate = r;
+    TRACKS.forEach(function (name) {
+      var el = els[name];
+      if (el) { el.playbackRate = r; setPreservesPitch(el, true); }
+    });
+    updateRateUI();
+  }
+
+  function stepRate(delta) { setRate(rate + delta); }
+
+  // ---- AB loop ---------------------------------------------------------
+  function loopActive() { return loopA !== null && loopB !== null && loopB > loopA; }
+
+  function setA() {
+    var el = activeEl();
+    if (!el) return;
+    loopA = el.currentTime;
+    if (loopB !== null && loopB <= loopA) loopB = null;
+    updateLoopUI();
+  }
+
+  function setB() {
+    var el = activeEl();
+    if (!el) return;
+    var t = el.currentTime;
+    if (loopA !== null && t <= loopA) return; // B must sit after A
+    loopB = t;
+    updateLoopUI();
+  }
+
+  function clearLoop() { loopA = null; loopB = null; updateLoopUI(); }
+
+  function handleLoop() {
+    if (!loopActive()) return;
+    var el = activeEl();
+    if (el && el.currentTime >= loopB) seekAll(loopA);
+  }
+
+  // ---- render loop / UI ------------------------------------------------
+  function startTick() { if (rafId === null) rafId = requestAnimationFrame(tick); }
+  function stopTick() { if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; } }
+
+  function tick() {
+    rafId = null;
+    if (!isPlaying) return;
+    handleLoop();
+    resyncOthers();
+    updateUI();
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function updateUI() {
+    var el = activeEl();
+    var cur = el ? el.currentTime : 0;
+    var dur = duration();
+    curEl.textContent = fmt(cur);
+    durEl.textContent = fmt(dur);
+    if (dur > 0) seekEl.max = dur;
+    if (!seeking) seekEl.value = cur;
+  }
+
+  function updatePlayBtn() {
+    playBtn.textContent = isPlaying ? "一時停止" : "再生";
+    playBtn.disabled = !activeName;
+  }
+
+  function updateLoopUI() {
+    loopInfoEl.textContent =
+      "A: " + (loopA === null ? "--:--" : fmt(loopA)) +
+      " / B: " + (loopB === null ? "--:--" : fmt(loopB)) +
+      (loopActive() ? " ループ中" : "");
+    loopInfoEl.classList.toggle("is-on", loopActive());
+  }
+
+  function updateRateUI() { rateValEl.textContent = rate.toFixed(2) + "x"; }
+
+  // ---- wiring ----------------------------------------------------------
+  TRACKS.forEach(function (name) {
+    var el = document.getElementById("tm-audio-" + name);
+    var btn = document.querySelector('button.tm-trk[data-track="' + name + '"]');
+    els[name] = el || null;
+    btns[name] = btn || null;
+
+    if (!el) {
+      status[name] = "absent";
+      if (btn) btn.disabled = true;
+    } else {
+      status[name] = "pending";
+      el.muted = true;
+      el.playbackRate = rate;
+      setPreservesPitch(el, true);
+      el.addEventListener("loadedmetadata", function () { onMeta(name); });
+      el.addEventListener("error", function () { onErr(name); });
+      el.addEventListener("ended", function () {
+        if (name === activeName && !loopActive()) pauseAll();
+      });
+      // Metadata may already be present if the file loaded synchronously.
+      if (el.readyState >= 1) onMeta(name);
+      if (el.error) onErr(name);
+    }
+
+    if (btn) {
+      btn.addEventListener("click", function () { switchTrack(name); });
+    }
+  });
+
+  activeName = firstUsable();
+  applyActive();
+  updatePlayBtn();
+  updateLoopUI();
+  updateRateUI();
+  updateUI();
+
+  playBtn.addEventListener("click", toggle);
+  document.getElementById("tm-a").addEventListener("click", setA);
+  document.getElementById("tm-b").addEventListener("click", setB);
+  document.getElementById("tm-loop-clear").addEventListener("click", clearLoop);
+  document.getElementById("tm-rate-down").addEventListener("click", function () { stepRate(-RATE_STEP); });
+  document.getElementById("tm-rate-up").addEventListener("click", function () { stepRate(RATE_STEP); });
+
+  seekEl.addEventListener("input", function () { seeking = true; seekAll(parseFloat(seekEl.value)); });
+  seekEl.addEventListener("change", function () { seeking = false; });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    var tag = e.target && e.target.tagName;
+    if (tag === "INPUT" && e.key !== "Escape") {
+      // Let the range slider keep its own arrow-key behaviour when focused.
+      if (e.target.type === "range") return;
+    }
+    switch (e.key) {
+      case " ": case "Spacebar": e.preventDefault(); toggle(); break;
+      case "a": case "A": setA(); break;
+      case "b": case "B": setB(); break;
+      case "c": case "C": clearLoop(); break;
+      case "ArrowLeft": e.preventDefault(); nudge(-3); break;
+      case "ArrowRight": e.preventDefault(); nudge(3); break;
+      case "1": switchTrack("original"); break;
+      case "2": switchTrack("target"); break;
+      case "3": switchTrack("backing"); break;
+      case "+": case "=": e.preventDefault(); stepRate(RATE_STEP); break;
+      case "-": case "_": e.preventDefault(); stepRate(-RATE_STEP); break;
+      default: break;
+    }
+  });
+
+  // ---- publish real hook ----------------------------------------------
+  function trackInfo() {
+    var out = {};
+    TRACKS.forEach(function (name) {
+      out[name] = { status: status[name], available: usable(name) };
+    });
+    return out;
+  }
+
+  window.__player = {
+    state: function () {
+      var el = activeEl();
+      return {
+        ready: readyFlag,
+        activeTrack: activeName,
+        playing: isPlaying,
+        currentTime: el ? el.currentTime : 0,
+        duration: duration(),
+        rate: rate,
+        preservesPitch: { supported: ppInfo.supported, property: ppInfo.property, value: ppInfo.value },
+        loop: { a: loopA, b: loopB, active: loopActive() },
+        lastSwitchDrift: lastSwitchDrift,
+        maxDrift: maxDrift(),
+        tracks: trackInfo()
+      };
+    },
+    play: playAll,
+    pause: pauseAll,
+    toggle: toggle,
+    switchTrack: switchTrack,
+    setRate: setRate,
+    stepRate: stepRate,
+    seek: seekAll,
+    nudge: nudge,
+    setA: setA,
+    setB: setB,
+    clearLoop: clearLoop
+  };
+})();
+</script>
+</body>
+</html>
