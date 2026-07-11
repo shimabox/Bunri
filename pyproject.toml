@@ -1,0 +1,34 @@
+[project]
+name = "stemlab"
+version = "0.1.0"
+description = "Instrument stem extraction and practice package generator for songs"
+readme = "README.md"
+authors = [
+    { name = "shimabox", email = "shimabox@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "audio-separator[cpu]==0.44.3",
+    "jinja2>=3.1",
+    "numpy<2.5",
+    "rich",
+    "soundfile",
+    "typer",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+# audio-separator==0.44.3 depends on onnx-weekly, which only publishes pre-releases.
+prerelease = "if-necessary"
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux'",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
