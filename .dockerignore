@@ -1,0 +1,17 @@
+.git/
+.github/
+.claude/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+out/
+songs/
+.DS_Store
+Dockerfile
+compose.yaml
+.dockerignore

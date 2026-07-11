@@ -13,6 +13,8 @@ dependencies = [
     "numpy<2.5",
     "rich",
     "soundfile",
+    "torch>=2.3",
+    "torchvision",
     "typer",
 ]
 
@@ -30,6 +32,23 @@ environments = [
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
     "sys_platform == 'linux'",
 ]
+
+[tool.uv.sources]
+# PyPI's default linux torch/torchvision wheels bundle CUDA (nvidia-* deps,
+# multi-GB). The cpu Docker image never uses a GPU, so route linux resolution
+# to the official CPU-only wheel index instead. macOS keeps resolving from
+# PyPI as before (MPS-capable wheels live there, not on this CPU index).
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [dependency-groups]
 dev = [

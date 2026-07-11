@@ -1,0 +1,17 @@
+services:
+  stemlab:
+    build:
+      context: .
+      target: cpu
+    image: stemlab:cpu
+    volumes:
+      - ./songs:/in:ro
+      - ./out:/out
+      - stemlab-models:/root/.cache/stemlab/models
+    # Usage:
+    #   docker compose run --rm stemlab /in/song.mp3 -o /out
+    # (entrypoint is `stemlab`; args after the service name are passed straight
+    # through to the CLI)
+
+volumes:
+  stemlab-models:

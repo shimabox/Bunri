@@ -152,3 +152,166 @@ becruily/mel-band-roformer-guitar は audio-separator のビルトインカタ�
 `--model` で明示的にモデルを指定した場合は、そのモデルの失敗はそのまま
 `RuntimeError` として送出され、フォールバックは一切行わない
 (呼び出し側の意図を上書きしないため)。
+
+---
+
+## Phase 1.5(Docker 第一級対応)の技術的知見
+
+### torch/torchvision を linux だけ CPU ホイールにする(`tool.uv.sources` + marker)
+
+PyPI の linux 向け torch デフォルトホイールは CUDA 同梱で、`nvidia-cudnn-cu13`
+/ `nvidia-nccl-cu13` などの依存を巻き込んで数 GB に膨れる。`cpu` Docker
+イメージは GPU を一切使わないので、linux 解決時だけ
+https://download.pytorch.org/whl/cpu の CPU 専用ホイールに向けたい。
+
+```toml
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+```
+
+**罠**: `tool.uv.sources` はプロジェクトの**直接依存**にしか効かない。
+torch/torchvision はもともと `audio-separator` 経由の**推移依存**(直接
+`[project.dependencies]` には書かれていない)だったため、この設定を追加
+しても `uv lock` の結果は無反応(相変わらず PyPI の CUDA 同梱版が解決され
+続けた)。`uv lock -v` で確認したところ、pytorch-cpu インデックスへは
+一度もリクエストが飛んでいなかった。
+
+**対処**: `torch>=2.3` と `torchvision` を `[project.dependencies]` に
+**直接依存として明示的に追加**した。これで `tool.uv.sources` の marker が
+効くようになり、`uv lock -v` のログで
+`https://download.pytorch.org/whl/cpu/torch/` への実際のリクエストを確認
+できた。結果として linux 解決は `torch==2.13.0+cpu` /
+`torchvision==0.28.0+cpu`(`nvidia-*` 系パッケージ0個)、darwin (arm64)
+解決は従来どおり PyPI の `torch==2.13.0`(無印、MPS 対応ビルド)のまま
+分岐している。
+
+もともと torch はコード上で直接 import している(`separate.py` が
+`torch.cuda.is_available` 等を触る)ので、直接依存への昇格自体は自然な
+判断だが、「`tool.uv.sources` は直接依存にしか効かない」という制約を
+把握していないと、`uv lock` が黙って何も変えない(かつエラーも出さない)
+という分かりにくい失敗の仕方をするので明記しておく。
+
+ホスト側の完了条件確認:
+- `uv sync`: 問題なく成功(darwin arm64 は無印 torch のまま、追加の
+  ダウンロードは stemlab 自体の再ビルドのみ)
+- `uv run pytest -q`: 60 件全件グリーン(変更前と同じ)
+
+### diffq==0.2.4 のインストールには gcc が要る(cp313 wheel が存在しない)
+
+`audio-separator` の依存 `diffq==0.2.4` は cp310 までの wheel しか PyPI に
+置いておらず、Python 3.13 ではプラットフォームを問わず sdist からの
+C 拡張ビルドになる。`uv sync` はこの sdist をビルドしようとし、`gcc` が
+無いと `error: command 'gcc' failed: No such file or directory` で失敗する。
+`python:3.13-slim` には最初から入っていないため、`build-essential` を
+入れる専用ステージ(`build-base`)を挟んだ(下記参照)。
+
+### Dockerfile: レイヤ構成と最終イメージの軽量化
+
+`cpu` ターゲットの最終イメージに `gcc` 一式(数百MB)を残したくないので、
+「ビルド専用ステージ」と「出荷用の薄いステージ」を分けた:
+
+```
+uv-base ─┬─> build-base(+ build-essential)─> deps(依存のみ)─> app-build(+ src, プロジェクト本体)
+         │                                                         │
+         └────────────────────────> cpu(app-build から .venv と src だけ COPY)
+```
+
+- `deps` は `pyproject.toml`/`uv.lock` だけを COPY して `uv sync --frozen
+  --no-install-project --no-dev` を実行 → 依存関係だけのレイヤとしてキャッシュ
+  され、`src/` 配下の変更ではこのレイヤは再ビルドされない。
+- `app-build` で `src/` を追加してプロジェクト自体をインストール(pure
+  Python の `uv_build` バックエンドなのでこの段階では gcc は不要)。
+- 最終 `cpu` ステージは `build-essential` を入れていない `uv-base` から
+  分岐し、`app-build` から `.venv` と `src` だけを `COPY --from=` する。
+  `uv sync` を最終ステージで再実行しないので gcc も uv のダウンロード
+  キャッシュも最終イメージには残らない。
+- `dev` ターゲットはテスト実行用(出荷しない)なので、この軽量化は行わず
+  `build-base` 系列のまま playwright/chromium を追加している。
+
+### cuda イメージ: base / torch / onnxruntime の選定根拠
+
+このマシン(macOS arm64)では GPU 付きコンテナを実行できない
+(Docker Desktop の VM に GPU パススルーが無い)ため、`cuda` ターゲットは
+**ビルドが通ることまで**を目標とし、**GPU での実行(実分離)は未検証**。
+ビルド自体は `--platform linux/amd64`(QEMU)で一度成功している
+(2026-07-11: 27分、イメージ 8.83GB、torch 2.13.0+cu130 /
+onnxruntime-gpu 1.27.0 が解決・インストールされ、QEMU 上で `stemlab
+--help` の起動まで確認)。生成イメージはディスク逼迫のためローカルには
+残していない(定義から再ビルド可能)。NVIDIA GPU 環境で使う前に必ず
+動作確認すること。
+
+- **linux/amd64 専用**: `onnxruntime-gpu` は PyPI に **x86_64 wheel しか
+  公開していない**(1.27.0 で確認: manylinux x86_64 と win_amd64 のみ、
+  aarch64 なし)。そのため linux/arm64 向けには依存解決自体が不可能で、
+  arm64 ホストでは `docker build --platform linux/amd64 --target cuda`
+  (QEMU エミュレーション)でしかビルドできない。GPU 実運用環境は
+  x86_64 が普通なので実害はない。
+- **base image**: `nvidia/cuda:13.1.2-runtime-ubuntu24.04`。CUDA 13 系を
+  選んだ理由は下記 onnxruntime の項を参照(当初 12.8.1 で検討したが、
+  onnxruntime-gpu 1.27 の CUDA 13 移行に合わせて 13 系に変更)。
+- **Python 3.13 の導入方法**: Ubuntu 24.04 の apt には Python 3.13 パッケージ
+  が無い(deadsnakes 等の PPA 追加が必要になる)。代わりに `uv python
+  install 3.13` で uv 自身にスタンドアロン Python ビルドを取得させる方式
+  にした。プロジェクトで uv を既に使っているので追加の依存が増えない。
+- **torch/torchvision の CUDA ビルド選定**: `cpu`/`dev` 系列は
+  `pyproject.toml`/`uv.lock` を `uv sync --frozen` でそのまま使うが、
+  そのロックファイルは(前述の通り)linux 解決を CPU ホイールに固定して
+  いるため、`cuda` ステージでは **`uv sync --frozen` を使わず**、
+  `uv pip install` で venv を直接組み立てている。torch の CUDA 版取得には
+  uv 組み込みの `--torch-backend`(環境変数 `UV_TORCH_BACKEND=cu130`)を
+  使用 — これは uv が公式に持つ「PyTorch エコシステム専用インデックス
+  自動解決」機能で、torch/torchvision を対応する `download.pytorch.org`
+  の CUDA ビルドから自動的に取得する。uv.lock と同じ torch 2.13.0 は
+  cu126/cu129/cu130 の3系で公開されており(インデックスを直接確認)、
+  onnxruntime-gpu 1.27 の CUDA 13 移行と揃う cu130 を選んだ。
+- **onnxruntime の選定**: `audio-separator` の PyPI メタデータ
+  (`Requires-Dist`)を確認すると、`onnxruntime`(CPU版)は
+  `extra == "cpu"`、`onnxruntime-gpu` は `extra == "gpu"` の任意依存に
+  なっている。そのため `cuda` ステージでは `audio-separator[cpu]` では
+  なく **`audio-separator[gpu]`** を指定し、`onnxruntime-gpu` を入れて
+  いる(`onnxruntime` 無印は入らない)。バージョンは `>=1.17` 制約から
+  最新の 1.27.0 が解決されるが、**onnxruntime 1.27 の PyPI GPU wheel は
+  CUDA 13 ターゲット**(1.26 のリリースノートで「CUDA 12 サポートは
+  1.27.0 で削除」、1.27.0 で「CUDA 12 パッケージは deprecated」と明言)。
+  これが base image を 12.x ではなく 13 系にした決め手。
+- **build-essential が必要**: `diffq==0.2.4` は cp313 向け wheel を一切
+  公開していない(cp310 まで。arm64 に限った話ではない)ので、x86_64
+  でも sdist からの C 拡張ビルドになり gcc が要る。cuda ステージにも
+  `build-essential` を入れた。
+- **prerelease 設定**: `pyproject.toml` の `[tool.uv] prerelease =
+  "if-necessary"` は `uv sync`/`uv lock` にのみ適用され、`uv pip install`
+  という低レベル API には自動で伝播しないため、`cuda` ステージの
+  `RUN uv pip install ...` には明示的に `--prerelease=if-necessary` を
+  付けている(`onnx-weekly` がプレリリースのみ公開のため)。
+
+### `docker build --platform linux/amd64`(QEMU エミュレーション)について
+
+`--platform linux/amd64` でのビルドは QEMU エミュレーション経由になり、
+arm64 ネイティブビルドより明らかに遅い(特に `diffq` の gcc ビルドと
+apt 展開)。実測(2026-07-11、Apple Silicon / Docker Desktop VM 8GB):
+
+- `cpu` ターゲット arm64 ネイティブ: 約1分50秒(キャッシュなし、
+  イメージ 2.04GB)
+- `cpu` ターゲット amd64 (QEMU): 17分43秒(イメージ 2.17GB)。
+  ビルド成功に加え、QEMU 上で `stemlab --help` の起動も確認。
+
+### Docker Desktop VM のディスク逼迫(ビルド失敗の罠)
+
+VM のディスク(このマシンでは 58.4GB)が満杯になると、`apt-get update`
+が **GPG エラー(`At least one invalid signature was encountered`)** という
+一見無関係なエラーで失敗する(gpg の一時ファイルが書けないため)。cuda
+イメージの初回ビルドはこれで失敗した。ディスク容量不足を疑うこと:
+`docker run --rm alpine df -h /` で VM 内の使用率を確認できる。
+`docker builder prune` / 不要イメージ削除で解消する。また
+`docker rmi` でタグを消してもビルドキャッシュがレイヤを掴んでいる間は
+実容量が戻らない(`docker builder prune` まで必要)ことにも注意。
