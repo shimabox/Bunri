@@ -10,60 +10,65 @@
   html, body {
     margin: 0;
     padding: 0;
-    background: #ffffff;
-    color: #1a1a1a;
+    background: #faf6f0;
+    color: #3a322c;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans",
       "Yu Gothic", Arial, sans-serif;
   }
   header.sw-header {
-    padding: 16px 24px;
-    border-bottom: 1px solid #ddd;
+    padding: 20px 24px;
+    background: #fffdfa;
+    border-bottom: 1px solid #f1e8da;
   }
   h1.sw-title {
     margin: 0 0 4px;
-    font-size: 1.4rem;
-    font-weight: 600;
+    font-size: 1.5rem;
+    font-weight: 700;
   }
-  .sw-sub { margin: 0; color: #888; font-size: 0.85rem; }
+  .sw-sub { margin: 0; color: #8a7f74; font-size: 0.85rem; }
   main.sw-main {
-    padding: 20px 24px 40px;
+    padding: 22px 24px 40px;
     max-width: 760px;
   }
   section.sw-section { margin-bottom: 28px; }
   h2.sw-h2 {
-    font-size: 0.95rem;
-    font-weight: 600;
-    color: #444;
-    margin: 0 0 10px;
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: #6f665c;
+    margin: 0 0 12px;
   }
 
   .sw-dropzone {
-    border: 2px dashed #bbb;
-    border-radius: 8px;
-    padding: 32px 16px;
+    border: 2px dashed #e6d9c4;
+    border-radius: 16px;
+    padding: 34px 16px;
     text-align: center;
-    color: #666;
+    color: #8a7f74;
+    background: #ffffff;
+    box-shadow: 0 2px 10px rgba(120, 90, 60, 0.06);
     cursor: pointer;
-    transition: background-color 0.1s, border-color 0.1s;
+    transition: background-color 0.15s, border-color 0.15s, box-shadow 0.15s;
   }
-  .sw-dropzone:hover { background: #fafafa; }
+  .sw-dropzone:hover { background: #fffaf3; border-color: #e2674e; box-shadow: 0 4px 14px rgba(226, 103, 78, 0.12); }
   .sw-dropzone.is-dragover {
-    background: #f0f6ff;
-    border-color: #3a7bd5;
-    color: #1a1a1a;
+    background: #fdece7;
+    border-color: #e2674e;
+    color: #3a322c;
   }
   .sw-dropzone p { margin: 0; font-size: 0.95rem; }
-  .sw-dropzone .sw-dropzone-sub { margin-top: 6px; font-size: 0.78rem; color: #999; }
+  .sw-dropzone .sw-dropzone-sub { margin-top: 6px; font-size: 0.78rem; color: #b3a99c; }
 
   .sw-confirm {
-    margin-top: 14px;
-    border: 1px solid #ddd;
-    border-radius: 6px;
-    padding: 14px 16px;
+    margin-top: 16px;
+    border: 1px solid #f1e8da;
+    border-radius: 14px;
+    padding: 16px 18px;
+    background: #ffffff;
+    box-shadow: 0 2px 10px rgba(120, 90, 60, 0.06);
   }
   .sw-confirm[hidden] { display: none; }
   .sw-confirm-filename {
-    font-weight: 600;
+    font-weight: 700;
     font-size: 0.9rem;
     margin-bottom: 8px;
     word-break: break-all;
@@ -77,7 +82,7 @@
   }
   .sw-row > label {
     min-width: 4.5em;
-    color: #444;
+    color: #6f665c;
     font-size: 0.85rem;
     font-weight: 600;
   }
@@ -86,41 +91,43 @@
     min-width: 200px;
     font: inherit;
     font-size: 0.9rem;
-    padding: 6px 10px;
-    border: 1px solid #999;
-    border-radius: 4px;
+    padding: 8px 12px;
+    border: 1px solid #e6d9c4;
+    border-radius: 10px;
   }
   button.sw-btn {
     font: inherit;
     font-size: 0.9rem;
-    padding: 6px 16px;
-    border: 1px solid #999;
-    background: #f5f5f5;
-    border-radius: 4px;
+    padding: 8px 18px;
+    border: 1px solid #e6d9c4;
+    background: #ffffff;
+    border-radius: 999px;
     cursor: pointer;
-    color: #1a1a1a;
+    color: #3a322c;
   }
-  button.sw-btn:hover:not(:disabled) { background: #e8e8e8; }
-  button.sw-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.sw-btn:hover:not(:disabled) { background: #fff7ee; border-color: #e2674e; }
+  button.sw-btn:disabled { opacity: 0.45; cursor: not-allowed; }
   button.sw-btn-primary {
-    background: #1a1a1a;
-    border-color: #1a1a1a;
-    color: #fff;
-    font-weight: 600;
+    background: #e2674e;
+    border-color: #e2674e;
+    color: #fffaf6;
+    font-weight: 700;
   }
-  button.sw-btn-primary:hover:not(:disabled) { background: #333; }
+  button.sw-btn-primary:hover:not(:disabled) { background: #d1553d; border-color: #d1553d; }
   .sw-upload-error {
-    color: #b3261e;
+    color: #c0392b;
     font-size: 0.82rem;
     margin-top: 8px;
   }
 
   ul.sw-job-list { list-style: none; margin: 0; padding: 0; }
   li.sw-job {
-    border: 1px solid #e2e2e2;
-    border-radius: 6px;
-    padding: 12px 14px;
-    margin-bottom: 8px;
+    border: 1px solid #f1e8da;
+    border-radius: 14px;
+    padding: 14px 16px;
+    margin-bottom: 10px;
+    background: #ffffff;
+    box-shadow: 0 2px 10px rgba(120, 90, 60, 0.05);
   }
   .sw-job-head {
     display: flex;
@@ -128,49 +135,51 @@
     gap: 10px;
     flex-wrap: wrap;
   }
-  .sw-job-title { font-weight: 600; font-size: 0.95rem; }
+  .sw-job-title { font-weight: 700; font-size: 0.95rem; }
   .sw-badge {
     font-size: 0.78rem;
-    padding: 2px 10px;
+    padding: 3px 12px;
     border-radius: 999px;
-    background: #eee;
-    color: #444;
+    background: #f1ece3;
+    color: #8a7f74;
     white-space: nowrap;
+    font-weight: 600;
   }
-  .sw-badge-queued { background: #eee; color: #555; }
-  .sw-badge-running { background: #e6f0ff; color: #1a5fb4; }
-  .sw-badge-done { background: #e6f7ec; color: #0a7d2c; }
-  .sw-badge-error { background: #fdeceb; color: #b3261e; }
+  .sw-badge-queued { background: #f1ece3; color: #8a7f74; }
+  .sw-badge-running { background: #fdeee8; color: #c9502f; }
+  .sw-badge-done { background: #e3f3ef; color: #1f6f64; }
+  .sw-badge-error { background: #fbe9e6; color: #c0392b; }
   a.sw-open-link {
     font-size: 0.85rem;
-    color: #1a5fb4;
+    color: #2f8f83;
     text-decoration: none;
+    font-weight: 600;
   }
   a.sw-open-link:hover { text-decoration: underline; }
   details.sw-error-details {
     margin-top: 8px;
     font-size: 0.8rem;
-    color: #555;
+    color: #8a7f74;
   }
   details.sw-error-details summary {
     cursor: pointer;
-    color: #b3261e;
+    color: #c0392b;
   }
   details.sw-error-details pre {
     white-space: pre-wrap;
     word-break: break-all;
-    background: #fafafa;
-    border: 1px solid #eee;
-    border-radius: 4px;
-    padding: 8px 10px;
+    background: #fbf8f3;
+    border: 1px solid #f1e8da;
+    border-radius: 10px;
+    padding: 10px 12px;
     margin: 8px 0 0;
     font-size: 0.75rem;
   }
-  p.sw-empty { color: #999; font-size: 0.85rem; }
+  p.sw-empty { color: #b3a99c; font-size: 0.85rem; }
 
   footer.sw-footer {
-    padding: 8px 24px 28px;
-    color: #999;
+    padding: 10px 24px 28px;
+    color: #b3a99c;
     font-size: 0.75rem;
   }
 </style>
