@@ -7,3 +7,4 @@ out/
 songs/
 .pytest_cache/
 .DS_Store
+.playwright-mcp/

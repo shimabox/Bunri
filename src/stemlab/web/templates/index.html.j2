@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StemLab</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #ffffff;
+    color: #1a1a1a;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans",
+      "Yu Gothic", Arial, sans-serif;
+  }
+  header.sw-header {
+    padding: 16px 24px;
+    border-bottom: 1px solid #ddd;
+  }
+  h1.sw-title {
+    margin: 0 0 4px;
+    font-size: 1.4rem;
+    font-weight: 600;
+  }
+  .sw-sub { margin: 0; color: #888; font-size: 0.85rem; }
+  main.sw-main {
+    padding: 20px 24px 40px;
+    max-width: 760px;
+  }
+  section.sw-section { margin-bottom: 28px; }
+  h2.sw-h2 {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #444;
+    margin: 0 0 10px;
+  }
+
+  .sw-dropzone {
+    border: 2px dashed #bbb;
+    border-radius: 8px;
+    padding: 32px 16px;
+    text-align: center;
+    color: #666;
+    cursor: pointer;
+    transition: background-color 0.1s, border-color 0.1s;
+  }
+  .sw-dropzone:hover { background: #fafafa; }
+  .sw-dropzone.is-dragover {
+    background: #f0f6ff;
+    border-color: #3a7bd5;
+    color: #1a1a1a;
+  }
+  .sw-dropzone p { margin: 0; font-size: 0.95rem; }
+  .sw-dropzone .sw-dropzone-sub { margin-top: 6px; font-size: 0.78rem; color: #999; }
+
+  .sw-confirm {
+    margin-top: 14px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 14px 16px;
+  }
+  .sw-confirm[hidden] { display: none; }
+  .sw-confirm-filename {
+    font-weight: 600;
+    font-size: 0.9rem;
+    margin-bottom: 8px;
+    word-break: break-all;
+  }
+  .sw-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .sw-row > label {
+    min-width: 4.5em;
+    color: #444;
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  input.sw-title-input {
+    flex: 1 1 auto;
+    min-width: 200px;
+    font: inherit;
+    font-size: 0.9rem;
+    padding: 6px 10px;
+    border: 1px solid #999;
+    border-radius: 4px;
+  }
+  button.sw-btn {
+    font: inherit;
+    font-size: 0.9rem;
+    padding: 6px 16px;
+    border: 1px solid #999;
+    background: #f5f5f5;
+    border-radius: 4px;
+    cursor: pointer;
+    color: #1a1a1a;
+  }
+  button.sw-btn:hover:not(:disabled) { background: #e8e8e8; }
+  button.sw-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.sw-btn-primary {
+    background: #1a1a1a;
+    border-color: #1a1a1a;
+    color: #fff;
+    font-weight: 600;
+  }
+  button.sw-btn-primary:hover:not(:disabled) { background: #333; }
+  .sw-upload-error {
+    color: #b3261e;
+    font-size: 0.82rem;
+    margin-top: 8px;
+  }
+
+  ul.sw-job-list { list-style: none; margin: 0; padding: 0; }
+  li.sw-job {
+    border: 1px solid #e2e2e2;
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 8px;
+  }
+  .sw-job-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .sw-job-title { font-weight: 600; font-size: 0.95rem; }
+  .sw-badge {
+    font-size: 0.78rem;
+    padding: 2px 10px;
+    border-radius: 999px;
+    background: #eee;
+    color: #444;
+    white-space: nowrap;
+  }
+  .sw-badge-queued { background: #eee; color: #555; }
+  .sw-badge-running { background: #e6f0ff; color: #1a5fb4; }
+  .sw-badge-done { background: #e6f7ec; color: #0a7d2c; }
+  .sw-badge-error { background: #fdeceb; color: #b3261e; }
+  a.sw-open-link {
+    font-size: 0.85rem;
+    color: #1a5fb4;
+    text-decoration: none;
+  }
+  a.sw-open-link:hover { text-decoration: underline; }
+  details.sw-error-details {
+    margin-top: 8px;
+    font-size: 0.8rem;
+    color: #555;
+  }
+  details.sw-error-details summary {
+    cursor: pointer;
+    color: #b3261e;
+  }
+  details.sw-error-details pre {
+    white-space: pre-wrap;
+    word-break: break-all;
+    background: #fafafa;
+    border: 1px solid #eee;
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin: 8px 0 0;
+    font-size: 0.75rem;
+  }
+  p.sw-empty { color: #999; font-size: 0.85rem; }
+
+  footer.sw-footer {
+    padding: 8px 24px 28px;
+    color: #999;
+    font-size: 0.75rem;
+  }
+</style>
+</head>
+<body>
+<header class="sw-header">
+  <h1 class="sw-title">StemLab</h1>
+  <p class="sw-sub">音源からギター練習パッケージを作る</p>
+</header>
+
+<main class="sw-main">
+  <section class="sw-section">
+    <h2 class="sw-h2">音源をアップロード</h2>
+    <div id="sw-dropzone" class="sw-dropzone" tabindex="0" role="button"
+         aria-label="音声ファイルをドラッグ&ドロップ、またはクリックして選択">
+      <p>ここに音声ファイルをドラッグ&amp;ドロップ<br>またはクリックしてファイルを選択</p>
+      <p class="sw-dropzone-sub">mp3 / wav / m4a / flac / ogg / mp4 / mov(上限 500MB。動画は音声トラックを使います)</p>
+    </div>
+    <input id="sw-file-input" type="file" accept=".mp3,.wav,.m4a,.flac,.ogg,.mp4,.mov,audio/*,video/mp4,video/quicktime" hidden>
+
+    <div id="sw-confirm" class="sw-confirm" hidden>
+      <div id="sw-confirm-filename" class="sw-confirm-filename"></div>
+      <div class="sw-row">
+        <label for="sw-title-input">曲名</label>
+        <input id="sw-title-input" class="sw-title-input" type="text" maxlength="200">
+      </div>
+      <div class="sw-row">
+        <button type="button" id="sw-upload-btn" class="sw-btn sw-btn-primary">アップロードして分離開始</button>
+        <button type="button" id="sw-cancel-btn" class="sw-btn">キャンセル</button>
+      </div>
+      <p id="sw-upload-error" class="sw-upload-error"></p>
+    </div>
+  </section>
+
+  <section class="sw-section">
+    <h2 class="sw-h2">ジョブ一覧</h2>
+    <p id="sw-empty" class="sw-empty">まだジョブはありません。</p>
+    <ul id="sw-job-list" class="sw-job-list"></ul>
+  </section>
+</main>
+
+<footer class="sw-footer">
+  StemLab はローカル専用です(127.0.0.1 でのみ待ち受け)。
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var API_JOBS = "/api/jobs";
+  var POLL_INTERVAL_MS = 2000;
+
+  var dropzone = document.getElementById("sw-dropzone");
+  var fileInput = document.getElementById("sw-file-input");
+  var confirmPanel = document.getElementById("sw-confirm");
+  var confirmFilename = document.getElementById("sw-confirm-filename");
+  var titleInput = document.getElementById("sw-title-input");
+  var uploadBtn = document.getElementById("sw-upload-btn");
+  var cancelBtn = document.getElementById("sw-cancel-btn");
+  var uploadError = document.getElementById("sw-upload-error");
+  var jobListEl = document.getElementById("sw-job-list");
+  var emptyMsg = document.getElementById("sw-empty");
+
+  var pendingFile = null;
+  var pollTimer = null;
+  var jobsCache = [];
+
+  function stem(name) {
+    var idx = name.lastIndexOf(".");
+    return idx > 0 ? name.slice(0, idx) : name;
+  }
+
+  function showConfirm(file) {
+    pendingFile = file;
+    confirmFilename.textContent = file.name;
+    titleInput.value = stem(file.name);
+    uploadError.textContent = "";
+    confirmPanel.hidden = false;
+  }
+
+  function hideConfirm() {
+    pendingFile = null;
+    confirmPanel.hidden = true;
+    fileInput.value = "";
+  }
+
+  dropzone.addEventListener("click", function () { fileInput.click(); });
+  dropzone.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      fileInput.click();
+    }
+  });
+  fileInput.addEventListener("change", function () {
+    if (fileInput.files && fileInput.files[0]) showConfirm(fileInput.files[0]);
+  });
+
+  ["dragenter", "dragover"].forEach(function (evt) {
+    dropzone.addEventListener(evt, function (e) {
+      e.preventDefault();
+      dropzone.classList.add("is-dragover");
+    });
+  });
+  ["dragleave", "drop"].forEach(function (evt) {
+    dropzone.addEventListener(evt, function (e) {
+      e.preventDefault();
+      dropzone.classList.remove("is-dragover");
+    });
+  });
+  dropzone.addEventListener("drop", function (e) {
+    var files = e.dataTransfer && e.dataTransfer.files;
+    if (files && files[0]) showConfirm(files[0]);
+  });
+
+  cancelBtn.addEventListener("click", hideConfirm);
+
+  uploadBtn.addEventListener("click", function () {
+    if (!pendingFile) return;
+    uploadBtn.disabled = true;
+    uploadError.textContent = "";
+    var fd = new FormData();
+    fd.append("file", pendingFile);
+    fd.append("title", titleInput.value || stem(pendingFile.name));
+    fetch(API_JOBS, { method: "POST", body: fd })
+      .then(function (res) {
+        if (!res.ok) {
+          return res.json().catch(function () { return {}; }).then(function (body) {
+            throw new Error(body.detail || ("アップロードに失敗しました (" + res.status + ")"));
+          });
+        }
+        return res.json();
+      })
+      .then(function () {
+        hideConfirm();
+        return refreshJobs();
+      })
+      .catch(function (err) {
+        uploadError.textContent = err.message || "アップロードに失敗しました";
+      })
+      .finally(function () {
+        uploadBtn.disabled = false;
+      });
+  });
+
+  function fmtMMSS(totalSeconds) {
+    var s = Math.max(0, Math.floor(totalSeconds || 0));
+    var m = Math.floor(s / 60);
+    var r = s % 60;
+    return m + ":" + (r < 10 ? "0" : "") + r;
+  }
+
+  function badgeFor(job) {
+    switch (job.status) {
+      case "queued":
+        return { text: "待機中", cls: "sw-badge-queued" };
+      case "running":
+        return { text: "処理中 (" + fmtMMSS(job.elapsed_seconds) + ")", cls: "sw-badge-running" };
+      case "done":
+        return { text: "完了", cls: "sw-badge-done" };
+      case "error":
+        return { text: "失敗", cls: "sw-badge-error" };
+      default:
+        return { text: job.status, cls: "" };
+    }
+  }
+
+  function renderJobs(jobs) {
+    jobsCache = jobs;
+    jobListEl.innerHTML = "";
+    emptyMsg.hidden = jobs.length !== 0;
+
+    jobs.forEach(function (job) {
+      var li = document.createElement("li");
+      li.className = "sw-job";
+      li.dataset.jobId = job.id;
+
+      var head = document.createElement("div");
+      head.className = "sw-job-head";
+
+      var title = document.createElement("span");
+      title.className = "sw-job-title";
+      title.textContent = job.title;
+      head.appendChild(title);
+
+      var badge = badgeFor(job);
+      var badgeEl = document.createElement("span");
+      badgeEl.className = "sw-badge " + badge.cls;
+      badgeEl.textContent = badge.text;
+      head.appendChild(badgeEl);
+
+      if (job.status === "done" && job.package_url) {
+        var link = document.createElement("a");
+        link.href = job.package_url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.className = "sw-open-link";
+        link.textContent = "プレイヤーを開く";
+        head.appendChild(link);
+      }
+
+      li.appendChild(head);
+
+      if (job.status === "error" && job.error) {
+        var details = document.createElement("details");
+        details.className = "sw-error-details";
+        var summary = document.createElement("summary");
+        summary.textContent = "失敗の詳細(ログ末尾)";
+        details.appendChild(summary);
+        var pre = document.createElement("pre");
+        pre.textContent = job.error;
+        details.appendChild(pre);
+        li.appendChild(details);
+      }
+
+      jobListEl.appendChild(li);
+    });
+  }
+
+  function hasActiveJobs(jobs) {
+    return jobs.some(function (j) { return j.status === "queued" || j.status === "running"; });
+  }
+
+  function schedulePoll(jobs) {
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    if (hasActiveJobs(jobs)) {
+      pollTimer = setTimeout(function () { refreshJobs(); }, POLL_INTERVAL_MS);
+    }
+  }
+
+  function refreshJobs() {
+    return fetch(API_JOBS)
+      .then(function (res) { return res.json(); })
+      .then(function (jobs) {
+        renderJobs(jobs);
+        schedulePoll(jobs);
+        return jobs;
+      })
+      .catch(function () {
+        // Transient failure (e.g. server restarting -- exactly the
+        // running->queued recovery scenario): keep the last known list on
+        // screen and RESCHEDULE ourselves. Without this the poll chain dies
+        // on a single failed fetch and a finished job never shows its link.
+        if (pollTimer !== null) clearTimeout(pollTimer);
+        pollTimer = setTimeout(function () { refreshJobs(); }, POLL_INTERVAL_MS);
+      });
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") refreshJobs();
+  });
+
+  // Test/automation hook, same idea as the player's window.__player: exposes
+  // read-only introspection so a headless test can assert on real state
+  // (current job list, whether polling is active) instead of guessing from
+  // timing.
+  window.__stemlabWeb = {
+    getJobs: function () { return jobsCache; },
+    isPolling: function () { return pollTimer !== null; },
+    refresh: refreshJobs
+  };
+
+  refreshJobs();
+})();
+</script>
+</body>
+</html>
