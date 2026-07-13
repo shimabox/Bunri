@@ -27,7 +27,12 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/app/.venv \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    STEMLAB_MODEL_DIR=/root/.cache/stemlab/models
+# STEMLAB_MODEL_DIR pins the container's model location explicitly: on the
+# host the default is now <project>/models (delete the folder, delete
+# everything), but containers persist weights in the stemlab-models named
+# volume, whose canonical mount point stays /root/.cache/stemlab/models.
 
 # ffmpeg: required by stemlab's audio pipeline (mp3 <-> wav conversion).
 RUN apt-get update \
@@ -143,7 +148,8 @@ COPY --from=uv-dist /uv /uvx /bin/
 ENV UV_LINK_MODE=copy \
     UV_PYTHON_INSTALL_DIR=/opt/uv/python \
     UV_TORCH_BACKEND=cu130 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    STEMLAB_MODEL_DIR=/root/.cache/stemlab/models
 
 WORKDIR /app
 

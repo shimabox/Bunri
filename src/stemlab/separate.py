@@ -41,12 +41,29 @@ console = Console()
 # in the returned file list is the library's own convention, not a guess.
 _STEM_LABEL_RE = re.compile(r"_\(([^)]+)\)")
 
+def _default_model_dir() -> Path:
+    """Where model weights live when STEMLAB_MODEL_DIR isn't set.
+
+    StemLab is distributed as a folder (clone + make setup), and the user's
+    requirement is that deleting the folder removes *everything* -- so when
+    we can find the project root (the nearest ancestor with a pyproject.toml,
+    which covers both the editable install and a venv living inside the
+    folder), weights go to <project>/models. Only a genuinely external
+    install (e.g. a future PyPI package on the system python) falls back to
+    the platform cache location.
+    """
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "pyproject.toml").exists():
+            return parent / "models"
+    return Path.home() / ".cache" / "stemlab" / "models"
+
+
 # Kept outside work_dir and never cleared by this function: model weights are
 # hundreds of MB, and this directory is reused across inputs/out_dirs so they
 # are only ever downloaded once per machine. STEMLAB_MODEL_DIR lets Docker
 # images and tests point this at a different location (e.g. a mounted named
-# volume, or a throwaway dir) without touching the real user cache.
-_MODEL_DIR = Path(os.environ.get("STEMLAB_MODEL_DIR", str(Path.home() / ".cache" / "stemlab" / "models")))
+# volume, or a throwaway dir) without touching the project folder.
+_MODEL_DIR = Path(os.environ.get("STEMLAB_MODEL_DIR") or _default_model_dir())
 
 
 @dataclass(frozen=True)
