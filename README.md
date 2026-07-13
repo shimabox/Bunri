@@ -8,6 +8,7 @@
 ## クイックスタート
 
 必要なもの: macOS(Apple Silicon 推奨)または Linux。あとはスクリプトが面倒を見ます。
+Windows の方は「[Windows で使う](#windows-で使う)」を見てください(WSL2 経由で使えます)。
 
 ```bash
 # 1. このフォルダを取得して移動(git clone または zip 展開)
@@ -203,6 +204,41 @@ docker run --rm stemlab:dev            # pytest -q を実行
 
 pytest・playwright(Chromium 込み)を含む開発用イメージです。CI などで
 コンテナ内にテストを閉じ込めたい場合に使えます。
+
+## Windows で使う
+
+ネイティブの Windows には現状対応していませんが、**WSL2(Windows 標準の
+Linux 実行環境)経由でそのまま使えます**。おすすめはこちらです。
+
+### WSL2 で使う(推奨)
+
+```powershell
+# PowerShell(管理者)で初回のみ。終わったら再起動
+wsl --install -d Ubuntu
+```
+
+再起動後、スタートメニューから Ubuntu を開いて、その中で:
+
+```bash
+sudo apt update && sudo apt install -y ffmpeg make git
+git clone <このリポジトリ> && cd StemLab   # zip 展開でも可
+make setup
+make web
+```
+
+WSL2 の localhost は Windows 側に自動で転送されるので、**Windows のブラウザで
+http://127.0.0.1:8330/ がそのまま開きます**。曲もエクスプローラーから
+ブラウザへドラッグ&ドロップするだけです(WSL の中のパスを意識する必要は
+ありません)。
+
+- 処理速度の注意: GPU なし(または NVIDIA 以外)の場合は CPU 処理になり、
+  **1曲あたり 30〜40 分程度**かかります。NVIDIA GPU 搭載機では WSL2 の
+  CUDA 対応で高速化できる余地がありますが、現状は未対応です(検討中)
+- Docker Desktop をお使いなら「Docker で使う」節の手順もそのまま動きます
+  (こちらも CPU 実行)
+
+ネイティブ Windows 対応(setup.ps1・GPU 対応など)の検討状況は
+`.claude/plans/windows-support-plan.md` にまとめてあります。
 
 ## ステータス
 
