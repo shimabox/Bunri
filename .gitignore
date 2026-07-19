@@ -10,3 +10,6 @@ songs/
 .playwright-mcp/
 mockups/
 models/
+
+# Local release-planning notes (intentionally not committed)
+OSS_RELEASE_CHECKLIST.local.md
