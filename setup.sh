@@ -5,7 +5,7 @@
 #   1. uv(Python パッケージマネージャ)があるか確認。無ければ公式インストーラの
 #      実行を提案(同意したときだけ実行)
 #   2. ffmpeg があるか確認。無ければインストール方法を案内
-#   3. uv sync --extra web で依存一式(Python 3.13 含む)を導入
+#   3. uv sync --locked --extra web でロック済み依存一式(Python 3.13 含む)を導入
 #
 # 何度実行しても安全です(導入済みの項目はスキップされます)。
 
@@ -50,7 +50,12 @@ else
     read -r answer
     if [ "${answer:-}" = "y" ] || [ "${answer:-}" = "Y" ]; then
       brew install ffmpeg
-      ok "ffmpeg を導入しました"
+      command -v ffmpeg >/dev/null 2>&1 || {
+        warn "Homebrew の処理は完了しましたが、ffmpeg が PATH に見つかりません。"
+        warn "ターミナルを開き直してから再実行してください。"
+        exit 1
+      }
+      ok "ffmpeg: $(ffmpeg -version 2>/dev/null | head -1 | cut -d' ' -f1-3)"
     else
       warn "中断しました。ffmpeg を入れてから再実行してください。"
       exit 1
@@ -65,7 +70,9 @@ fi
 
 # --- 3. 依存の導入 -----------------------------------------------------------
 say "Python 3.13 と依存パッケージを導入します(初回は数分かかります)"
-uv sync --extra web
+# 公開済みの uv.lock をセットアップ中に暗黙更新しない。pyproject.toml と
+# 食い違っている場合は失敗させ、開発側で lock を更新してから配布する。
+uv sync --locked --extra web
 
 say "セットアップ完了!"
 cat <<'DONE'
