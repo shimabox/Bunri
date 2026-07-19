@@ -25,7 +25,7 @@ from stemlab.web.jobs import Job, JobStore, Runner, safe_filename
 # Audio formats plus the mp4/mov video containers, case-insensitive: the
 # pipeline normalizes through ffmpeg, which extracts the audio track from a
 # video file just as happily (verified against a real .mp4).
-ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4", ".mov"}
+ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".mp4", ".mov", ".webm"}
 # 500MB: video uploads are legitimately much larger than audio-only files
 # (a few minutes of 1080p can pass 200MB); local-only server, so be generous.
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024

@@ -206,6 +206,11 @@ def test_non_local_host_header_is_rejected(client):
     assert resp.status_code == 400
 
 
+def test_aac_upload_is_accepted(client):
+    res = _upload(client, name="song.aac", content=b"abc")
+    assert res.status_code == 202
+
+
 def test_mp4_video_upload_is_accepted(client):
     """Video containers are allowed: ffmpeg extracts the audio track during
     normalization (verified against a real .mp4), so the web whitelist must
