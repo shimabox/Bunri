@@ -40,7 +40,7 @@ def test_unknown_target_is_rejected(audio):
 def test_unknown_device_is_rejected(audio):
     result = _run(audio, "--device", "gpu")
     assert result.exit_code != 0
-    assert "must be auto, cpu or mps" in result.output
+    assert "must be auto, cpu, mps or cuda" in result.output
 
 
 def test_model_and_target_reach_build_package(audio, tmp_path, monkeypatch):

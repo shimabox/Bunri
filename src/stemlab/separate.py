@@ -11,8 +11,10 @@ block below."""
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 import re
+import secrets
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -73,6 +75,58 @@ class SeparationResult:
     model_used: str
 
 
+_ACCELERATOR_DEVICES = ("mps", "cuda")
+
+
+def _check_device_available(device: str) -> None:
+    """Raise if an explicitly requested accelerator isn't actually usable on
+    this machine. Called before construction so a bad --device fails loudly
+    up front, instead of Separator's own CUDA > MPS > CPU autodetection
+    silently landing on some *other* device than the one asked for (or on
+    CPU) once accelerator visibility is hidden below."""
+    if device not in _ACCELERATOR_DEVICES:
+        return
+    import torch
+
+    if device == "mps":
+        available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    else:
+        available = torch.cuda.is_available()
+    if not available:
+        raise RuntimeError(f"requested device {device!r} is not available on this machine")
+
+
+@contextmanager
+def _accelerator_visibility(allowed: frozenset[str]):
+    """Hide torch's CUDA/MPS availability checks except for the device(s) in
+    `allowed`, for the duration of the context; restores the real functions
+    on exit. Generalizes what was a CPU-only inline patch: Separator has no
+    constructor argument to pin its device, and setup_torch_device() always
+    re-derives it from torch.cuda.is_available()/torch.backends.mps.is_available()
+    during __init__ (CUDA > MPS > CPU priority) -- so getting Separator to
+    honor an explicit --device mps (rather than silently preferring CUDA if
+    that also happens to be visible) means hiding every *other* accelerator
+    from those checks for the instant of construction. The conclusion is
+    baked into the instance's torch_device attribute, not re-checked
+    afterwards, so this is safe even though the patch is global for that
+    instant."""
+    import torch
+
+    has_mps = hasattr(torch.backends, "mps")
+    real_cuda_available = torch.cuda.is_available
+    real_mps_available = torch.backends.mps.is_available if has_mps else None
+    if "cuda" not in allowed:
+        torch.cuda.is_available = lambda: False
+    if has_mps and "mps" not in allowed:
+        torch.backends.mps.is_available = lambda: False
+    try:
+        yield
+    finally:
+        torch.cuda.is_available = real_cuda_available
+        if has_mps:
+            torch.backends.mps.is_available = real_mps_available
+
+
 def _construct_separator(separator_cls: Any, work_dir: Path, device: str) -> Any:
     """Build a Separator that writes every stem the loaded model produces into
     work_dir. No output_single_stem: this function needs every stem so the
@@ -80,6 +134,13 @@ def _construct_separator(separator_cls: Any, work_dir: Path, device: str) -> Any
     Confirmed from source (demucs_separator.py, mdx_separator.py, vr_separator.py,
     mdxc_separator.py): all four architectures write every stem whenever
     output_single_stem is falsy, gated per-stem via `self.output_single_stem`.
+
+    device="auto" leaves the choice to Separator's own CUDA > MPS > CPU
+    autodetection entirely (no patching). Any other device is both verified
+    available (raising if not -- an explicit request must never silently fall
+    back to a different device) and actually forced by hiding every other
+    accelerator from Separator's own detection for the instant of
+    construction ("cpu" hides both; "mps"/"cuda" hide the other one).
     """
     kwargs: dict[str, Any] = {
         "model_file_dir": str(_MODEL_DIR),
@@ -87,31 +148,13 @@ def _construct_separator(separator_cls: Any, work_dir: Path, device: str) -> Any
         "output_format": "WAV",
         "output_single_stem": None,
     }
-    if device != "cpu":
-        # "auto"/"mps": leave the choice to Separator's own CUDA > MPS > CPU
-        # autodetection in setup_torch_device(), run during __init__ below.
+    if device == "auto":
         return separator_cls(**kwargs)
 
-    # Separator has no constructor argument to force CPU; setup_torch_device() always
-    # re-derives the device from torch.cuda.is_available()/torch.backends.mps.is_available()
-    # during __init__. Hide accelerators from those checks for the instant of
-    # construction so it concludes CPU-only, then restore them immediately -- the
-    # conclusion is baked into the instance's torch_device attribute, not re-checked
-    # afterwards, so this is safe even though the patch is global for that instant.
-    import torch
-
-    has_mps = hasattr(torch.backends, "mps")
-    real_cuda_available = torch.cuda.is_available
-    real_mps_available = torch.backends.mps.is_available if has_mps else None
-    torch.cuda.is_available = lambda: False
-    if has_mps:
-        torch.backends.mps.is_available = lambda: False
-    try:
+    _check_device_available(device)
+    allowed = frozenset({device} & set(_ACCELERATOR_DEVICES))
+    with _accelerator_visibility(allowed):
         return separator_cls(**kwargs)
-    finally:
-        torch.cuda.is_available = real_cuda_available
-        if has_mps:
-            torch.backends.mps.is_available = real_mps_available
 
 
 # --- becruily guitar Mel-Band Roformer bootstrap ----------------------------
@@ -145,13 +188,23 @@ def _construct_separator(separator_cls: Any, work_dir: Path, device: str) -> Any
 #      _patched_mask_estimator_mlp_expansion_factor binds the right factor in
 #      memory for the duration of model construction only; nothing on disk or
 #      in the installed package is modified.
-_BECRUILY_REPO_BASE = "https://huggingface.co/becruily/mel-band-roformer-guitar/resolve/main"
+# Pinned to a specific commit (not "main"): "main" can be force-pushed or
+# amended upstream, silently swapping the bytes served at this URL for
+# something whose SHA-256 no longer matches what's pinned below -- pinning +
+# hashing together is what makes this bootstrap actually verifiable rather
+# than "trust HuggingFace forever".
+_BECRUILY_REPO_BASE = (
+    "https://huggingface.co/becruily/mel-band-roformer-guitar/resolve/"
+    "6409e7f88754b07ef7ca3bd1b76a15f010f1672a"
+)
 _BECRUILY_CKPT_HF_NAME = "becruily_guitar.ckpt"
 _BECRUILY_YAML_HF_NAME = "config_guitar_becruily.yaml"
 _BECRUILY_CKPT_LOCAL_NAME = "mel_band_roformer_guitar_becruily.ckpt"
 _BECRUILY_YAML_LOCAL_NAME = "config_mel_band_roformer_guitar_becruily.yaml"
 _BECRUILY_CATALOG_NAME = "Roformer Model: MelBand Roformer | Guitar by becruily"
 _BECRUILY_MLP_EXPANSION_FACTOR = 1
+_BECRUILY_CKPT_SHA256 = "83472bbf125774af5282d2e0b86df89eaf2dd45e8a4ec8d68e820ebf3e42a83c"
+_BECRUILY_YAML_SHA256 = "b681c3f886251b04b666b3f06e87ce65d7ec610e40b5d75915c01782e5444b0e"
 
 
 def _is_becruily_model(model_filename: str) -> bool:
@@ -161,18 +214,54 @@ def _is_becruily_model(model_filename: str) -> bool:
     return "becruily" in model_filename.lower()
 
 
-def _download_if_missing(url: str, dest: Path) -> None:
+def _sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _download_if_missing(url: str, dest: Path, expected_sha256: str) -> None:
     """Fetch url to dest with urllib (stdlib -- no extra dependency for a
-    one-time bootstrap), skipping entirely if dest already exists. Downloads
-    to a sibling .part file and renames into place only once complete, so an
-    interrupted download can never be mistaken for a complete model file on a
-    later run."""
+    one-time bootstrap), verifying its SHA-256 against `expected_sha256`
+    either way.
+
+    - dest already exists: verify what's on disk. A mismatch means the file
+      isn't the model we expect (corrupted, tampered with, or left over from
+      a stale/different version) -- delete it and raise rather than silently
+      trusting it or silently overwriting it with a fresh download.
+    - dest missing: download to a uniquely-named sibling temp file (never a
+      fixed ".part" name -- two concurrent bootstraps, e.g. two web jobs
+      racing on a cold model cache, must not read/write the same temp file),
+      verify the download, and only then atomically move it into place. A
+      failed download or a hash mismatch never leaves a corrupt file at
+      `dest`.
+    """
     if dest.exists():
+        actual = _sha256_of(dest)
+        if actual != expected_sha256:
+            dest.unlink()
+            raise RuntimeError(
+                f"{dest} failed SHA-256 verification "
+                f"(expected {expected_sha256}, got {actual}); removed -- "
+                "re-run to re-download it"
+            )
         return
+
     dest.parent.mkdir(parents=True, exist_ok=True)
-    part = dest.with_name(dest.name + ".part")
-    urllib.request.urlretrieve(url, part)
-    part.replace(dest)
+    tmp = dest.with_name(f"{dest.name}.part-{secrets.token_hex(8)}")
+    try:
+        urllib.request.urlretrieve(url, tmp)
+        actual = _sha256_of(tmp)
+        if actual != expected_sha256:
+            raise RuntimeError(
+                f"downloaded {url} failed SHA-256 verification "
+                f"(expected {expected_sha256}, got {actual})"
+            )
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op once replace() has moved it into place
 
 
 def _inject_becruily_catalog(separator: Any) -> None:
@@ -222,10 +311,12 @@ def _bootstrap_becruily(separator: Any) -> None:
     _download_if_missing(
         f"{_BECRUILY_REPO_BASE}/{_BECRUILY_CKPT_HF_NAME}",
         _MODEL_DIR / _BECRUILY_CKPT_LOCAL_NAME,
+        _BECRUILY_CKPT_SHA256,
     )
     _download_if_missing(
         f"{_BECRUILY_REPO_BASE}/{_BECRUILY_YAML_HF_NAME}",
         _MODEL_DIR / _BECRUILY_YAML_LOCAL_NAME,
+        _BECRUILY_YAML_SHA256,
     )
     _inject_becruily_catalog(separator)
 

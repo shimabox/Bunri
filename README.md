@@ -80,11 +80,15 @@ out/song/
 ```bash
 stemlab song.mp3 --target vocals             # 抽出対象(既定: guitar)
 stemlab song.mp3 --model htdemucs_6s.yaml     # 分離モデルを明示指定(失敗時のフォールバックなし)
-stemlab song.mp3 --device cpu                 # auto(既定) | cpu | mps
+stemlab song.mp3 --device cpu                 # auto(既定) | cpu | mps | cuda
 stemlab song.mp3 --no-mp3                     # wav のみ出力(mp3 変換をスキップ)
 stemlab song.mp3 --no-cache                   # キャッシュを無視して全段再計算
 stemlab song.mp3 -o path/to/out               # 出力先ディレクトリ
 ```
+
+`--device` に `mps`/`cuda` を明示した場合、そのデバイスが実際に使えるか
+確認したうえで、使えなければ黙って CPU 等へフォールバックせずエラーに
+なります(`auto` は従来どおり利用可能な最良のデバイスを自動選択します)。
 
 ### 抽出対象(--target)
 

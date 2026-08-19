@@ -24,8 +24,8 @@ def _validate_target(name: str) -> str:
 
 
 def _validate_device(device: str) -> str:
-    if device not in ("auto", "cpu", "mps"):
-        raise typer.BadParameter("--device must be auto, cpu or mps")
+    if device not in ("auto", "cpu", "mps", "cuda"):
+        raise typer.BadParameter("--device must be auto, cpu, mps or cuda")
     return device
 
 
@@ -46,7 +46,12 @@ def main(
         "Demucs). An explicitly named model never falls back on failure",
     ),
     title: Optional[str] = typer.Option(None, help="Song title (default: file name)"),
-    device: str = typer.Option("auto", help="Separation device: auto|cpu|mps"),
+    device: str = typer.Option(
+        "auto",
+        help="Separation device: auto|cpu|mps|cuda. An explicitly named device "
+        "that isn't actually available raises rather than silently falling "
+        "back to another one",
+    ),
     mp3: bool = typer.Option(
         True, "--mp3/--no-mp3", help="Also write 192k mp3s (target/backing/original)"
     ),
