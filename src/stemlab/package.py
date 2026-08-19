@@ -25,8 +25,34 @@ _NORMALIZE_VERSION = 1
 _SEPARATE_VERSION = 1
 
 
+# `#`/`%` are stripped too: left in, they'd survive into the on-disk slug and
+# make the corresponding /packages/... URL ambiguous (# truncates a URL at the
+# fragment, % starts a percent-escape) -- see web/app.py's URL-encoding fix and
+# player.py's render_player for the other half of that story. Only the slug is
+# affected; the *displayed* title (what the player's <h1> shows) keeps these
+# characters verbatim.
+_UNSAFE_FILENAME_CHARS = re.compile(r'[/\\:*?"<>|#%]')
+
+
 def _safe_filename(title: str) -> str:
-    return re.sub(r'[/\\:*?"<>|]', "_", title).strip() or "untitled"
+    # Leading dots are stripped after substitution (not just once) so a title
+    # of ".." (or "...", "....") can never resolve to a package directory
+    # outside out_dir once package_dir.mkdir() runs (".." -> "" -> "untitled",
+    # same fallback as an empty/whitespace-only title). build_package() below
+    # still double-checks containment with Path.is_relative_to() as defense in
+    # depth, but this is what keeps a normal title from ever needing it.
+    slug = _UNSAFE_FILENAME_CHARS.sub("_", title).strip().lstrip(".")
+    if not slug:
+        return "untitled"
+    # "web" is StemLab's own private subdirectory (uploads/job records/logs --
+    # see web/app.py's _block_private_package_paths); a package titled "web"
+    # would otherwise land at out/web and either collide with it or, worse,
+    # get served through the same /packages/web/... path the middleware
+    # blocks, making the song unreachable. Renamed rather than rejected so a
+    # song literally titled "Web" still gets a package.
+    if slug.casefold() == "web":
+        return "web-package"
+    return slug
 
 
 def _export(src: Path, dest: Path) -> Path:
@@ -155,6 +181,14 @@ def build_package(
         console.print(f"[green]✓[/green] separate ({elapsed:.0f}s)")
 
     package_dir = out_dir / safe
+    # Defense in depth on top of _safe_filename's own sanitizing: even if a
+    # future change to that function (or a caller bypassing it) let a
+    # path-separator-bearing title through, this refuses to write outside
+    # out_dir rather than trusting the string ever looked safe.
+    # is_relative_to() on the *resolved* paths (not a string-prefix compare)
+    # so a `..`-bearing or symlinked component can't slip past the check.
+    if not package_dir.resolve().is_relative_to(out_dir.resolve()):
+        raise ValueError(f"refusing to write package outside out_dir: {package_dir}")
     package_dir.mkdir(parents=True, exist_ok=True)
 
     # Backing and player are target-scoped like the stem itself: guitar's

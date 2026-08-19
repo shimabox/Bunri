@@ -252,3 +252,64 @@ def test_build_package_normalize_rerun_forces_reseparation(tmp_path, song_input)
     assert len(_PackageFakeSeparator.instances) == 2, (
         "an upstream (normalize) re-run must force re-separation"
     )
+
+
+# ---------------------------------------------------------------------------
+# sanitizer hardening / containment (security review fixes)
+# ---------------------------------------------------------------------------
+@_NEED_FFMPEG
+def test_build_package_dot_only_title_falls_back_to_untitled(tmp_path, song_input):
+    # "--title .." must never resolve to a package folder outside out_dir.
+    out_dir = tmp_path / "out"
+
+    package_dir = build_package(song_input, out_dir, title="..")
+
+    assert package_dir == out_dir / "untitled"
+    assert package_dir.resolve().is_relative_to(out_dir.resolve())
+    assert (package_dir / "untitled.guitar.wav").exists()
+
+
+@_NEED_FFMPEG
+def test_build_package_web_title_is_renamed_to_web_package(tmp_path, song_input):
+    # "web" is the web UI's own private out_dir subfolder; a package titled
+    # "web" must not land on top of (or masquerade as) it.
+    out_dir = tmp_path / "out"
+
+    package_dir = build_package(song_input, out_dir, title="Web")
+
+    assert package_dir == out_dir / "web-package"
+    assert (package_dir / "web-package.guitar.wav").exists()
+
+
+@_NEED_FFMPEG
+def test_build_package_strips_hash_and_percent_from_slug_but_keeps_display_title(
+    tmp_path, song_input
+):
+    out_dir = tmp_path / "out"
+
+    package_dir = build_package(song_input, out_dir, title="Song #1 100%")
+
+    assert package_dir == out_dir / "Song _1 100_"
+    html = (package_dir / "Song _1 100_.guitar.player.html").read_text(encoding="utf-8")
+    # The on-disk slug is sanitized, but the *displayed* title is verbatim.
+    assert "Song #1 100%" in html
+
+
+@_NEED_FFMPEG
+def test_build_package_refuses_to_write_outside_out_dir_if_safe_filename_is_bypassed(
+    tmp_path, song_input, monkeypatch
+):
+    """Defense in depth: even if _safe_filename's own sanitizing were somehow
+    bypassed (a future regression, or some other caller), build_package must
+    still refuse to write a package directory that resolves outside out_dir.
+    Forced here by directly patching _safe_filename to hand back a
+    traversal string, isolating this check from the sanitizer itself."""
+    import stemlab.package as package_module
+
+    monkeypatch.setattr(package_module, "_safe_filename", lambda title: "../escaped")
+    out_dir = tmp_path / "out"
+
+    with pytest.raises(ValueError, match="outside out_dir"):
+        build_package(song_input, out_dir, title="whatever")
+
+    assert not (tmp_path / "escaped").exists()
