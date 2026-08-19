@@ -406,7 +406,7 @@ class JobStore:
             self._write_job(job)
             self._queue.put(job.id)
 
-    def shutdown(self, *, join_timeout: float = 15.0) -> None:
+    def shutdown(self, *, join_timeout: float = 15.0, poll_interval: float = 0.2) -> None:
         """Graceful-shutdown hook (wired to the app's lifespan): stop the
         currently running separation subprocess, if any, so a normal server
         stop doesn't orphan it or mark its job an error just because the
@@ -432,20 +432,48 @@ class JobStore:
           2. Push the sentinel so a worker idle in `queue.get()` wakes up and
              exits immediately, instead of `join()` below blocking for
              `join_timeout` for no reason.
-          3. SIGTERM (then SIGKILL if needed) the in-flight subprocess, if
-             any -- this is what makes the worker's blocking
-             `self._runner(...)` call in `_run_job` actually return.
-          4. Join the worker so this method doesn't return -- and the ASGI
-             lifespan doesn't finish tearing down -- while a job's finishing
-             touches to its record are still in flight.
+          3. Repeatedly SIGTERM (then SIGKILL if needed) the in-flight
+             subprocess, if any, interleaved with short `join()` polls, until
+             the worker exits or `join_timeout` is spent. Terminating the
+             subprocess is what makes the worker's blocking
+             `self._runner(...)` call in `_run_job` actually return; the
+             *retrying* is what closes the remaining race described below.
+          4. Joining the worker (in those same polls) is what keeps this
+             method -- and therefore the ASGI lifespan's teardown -- from
+             returning while a job's finishing touches to its record are
+             still in flight.
+
+        Why step 3 is a retry loop rather than one pass: `_run_job` releases
+        `self._lock` after flipping a job to "running" and only *then* calls
+        the runner, which spawns the subprocess and writes its pid sidecar.
+        So a job can legitimately be in the snapshot above while its sidecar
+        does not exist yet, and a single termination pass would find nothing
+        to signal, leave the subprocess to be spawned a moment later, and
+        then outlive `join_timeout` as an orphan -- the very failure the
+        lock-based snapshot was meant to prevent. Retrying until the worker
+        actually exits means the sidecar is picked up on a later iteration,
+        however late it appears. (Re-snapshotting each round is safe and
+        avoids poking at jobs that have already finished: no job can enter
+        "running" after the stop flag is set -- see `_run_job`'s gate -- so
+        the set of running jobs only ever shrinks from here.)
         """
         with self._lock:
             self._stopping.set()
             running = [j for j in self._jobs.values() if j.status == "running" and j.log]
         self._queue.put(None)
-        for job in running:
-            terminate_pid_from_sidecar(self.out_dir / job.log)
-        self._worker.join(timeout=join_timeout)
+
+        deadline = time.monotonic() + join_timeout
+        while True:
+            for job in running:
+                terminate_pid_from_sidecar(self.out_dir / job.log)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._worker.join(timeout=min(poll_interval, remaining))
+            if not self._worker.is_alive():
+                return
+            with self._lock:
+                running = [j for j in self._jobs.values() if j.status == "running" and j.log]
 
     # -- queries --------------------------------------------------------
     def list_jobs(self) -> list[Job]:

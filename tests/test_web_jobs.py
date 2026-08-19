@@ -705,6 +705,72 @@ def test_shutdown_does_not_start_jobs_still_queued_behind_the_running_one(tmp_pa
     assert len(runner.calls) == 1  # B's runner was never invoked
 
 
+def test_shutdown_retries_termination_until_a_late_pid_sidecar_appears(tmp_path):
+    """Regression for the last shutdown race: `_run_job` marks a job
+    "running" under the lock but releases it *before* calling the runner, so
+    there is a window where the job is in shutdown()'s snapshot yet its pid
+    sidecar doesn't exist yet. A shutdown that only tried to terminate once
+    would find nothing to signal, then block in join() while the subprocess
+    it missed was spawned right afterward -- leaving an orphan alive past
+    join_timeout. shutdown() must keep retrying until the worker exits, so
+    the sidecar is picked up as soon as it shows up.
+
+    The fake runner here reproduces exactly that ordering: it reports the job
+    as started, waits before publishing its (real, marker-matching) child's
+    pid, and then blocks until that child is actually killed.
+    """
+    from stemlab.web.jobs import _pid_sidecar
+
+    upload = _make_upload(tmp_path)
+    started = threading.Event()
+    spawned: dict[str, Any] = {}
+
+    def late_sidecar_runner(upload_path, out_dir, title, target, log_path):
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("late-sidecar fake runner\n", encoding="utf-8")
+        started.set()
+        # The gap between "job is running" and "pid sidecar exists" -- long
+        # enough that shutdown()'s first termination pass reliably lands
+        # inside it.
+        time.sleep(0.5)
+        proc = _spawn_marked_sleeper()
+        spawned["proc"] = proc
+        _pid_sidecar(log_path).write_text(str(proc.pid))
+        try:
+            # Mirrors default_runner: block on the child, and only clean up
+            # the sidecar once it's gone.
+            proc.wait(timeout=30)
+        finally:
+            _pid_sidecar(log_path).unlink(missing_ok=True)
+        return 1  # killed mid-run -> nonzero, no player written
+
+    store = JobStore(tmp_path, runner=late_sidecar_runner)
+    job, _ = store.create_job(upload, digest="d1", requested_title="Song")
+    assert started.wait(timeout=5.0), "runner never started"
+    _wait_until(lambda: store.get_job(job.id).status == "running")
+
+    begin = time.monotonic()
+    store.shutdown(join_timeout=15.0)
+    elapsed = time.monotonic() - begin
+
+    proc = spawned.get("proc")
+    try:
+        assert proc is not None, "runner never got to spawn its child"
+        assert proc.poll() is not None, (
+            "the subprocess whose sidecar appeared after shutdown()'s first "
+            "termination pass must still have been terminated by a retry"
+        )
+        assert elapsed < 10.0, (
+            f"shutdown() took {elapsed:.2f}s -- it waited out join_timeout "
+            "instead of retrying the termination once the sidecar appeared"
+        )
+        # Interrupted by shutdown, not a genuine failure.
+        assert store.get_job(job.id).status == "queued"
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+
+
 def test_run_job_success_stays_done_even_if_the_stop_flag_becomes_set_mid_run(tmp_path):
     """If a job's subprocess finishes successfully right as shutdown begins
     -- the stop flag flips to set *while the job is already running*, not
