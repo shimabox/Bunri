@@ -541,6 +541,92 @@ def test_terminate_pid_from_sidecar_escalates_to_sigkill_when_sigterm_is_ignored
             proc.kill()
 
 
+def test_terminate_pid_from_sidecar_keeps_sidecar_when_sigterm_raises_non_lookup_oserror(
+    tmp_path, monkeypatch
+):
+    """A PermissionError (or any OSError other than ProcessLookupError) from
+    the SIGTERM os.kill call means the process's actual fate is unknown --
+    unlike a confirmed-gone process, the sidecar must be *kept* (not
+    discarded) so the next startup's recovery gets a chance to deal with
+    whatever's actually there. Regression for a bug where the sidecar was
+    unconditionally removed on any OSError from the SIGTERM call."""
+    from stemlab.web import jobs as jobs_module
+    from stemlab.web.jobs import terminate_pid_from_sidecar
+
+    log = tmp_path / "j-perm.log"
+    proc = _spawn_marked_sleeper()
+    try:
+        (tmp_path / "j-perm.pid").write_text(str(proc.pid))
+
+        real_kill = jobs_module.os.kill
+
+        def fake_kill(pid, sig):
+            if sig == 15:  # SIGTERM
+                raise PermissionError("simulated: not permitted to signal this process")
+            return real_kill(pid, sig)
+
+        monkeypatch.setattr(jobs_module.os, "kill", fake_kill)
+
+        result = terminate_pid_from_sidecar(log)
+
+        assert result is False
+        assert (tmp_path / "j-perm.pid").exists(), (
+            "sidecar must survive a SIGTERM failure whose outcome is unknown"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_terminate_pid_from_sidecar_removes_stale_sidecar_when_sigterm_finds_process_gone(
+    tmp_path, monkeypatch
+):
+    """ProcessLookupError from the SIGTERM call (the process exited in the
+    narrow window between our liveness check and the signal) is the one
+    OSError case where the outcome *is* known -- the process is genuinely
+    gone, so the sidecar is safe (and correct) to discard immediately,
+    unlike the PermissionError case above."""
+    from stemlab.web import jobs as jobs_module
+    from stemlab.web.jobs import terminate_pid_from_sidecar
+
+    log = tmp_path / "j-gone.log"
+    proc = _spawn_marked_sleeper()
+    try:
+        (tmp_path / "j-gone.pid").write_text(str(proc.pid))
+
+        real_kill = jobs_module.os.kill
+        calls: list[tuple[int, int]] = []
+        simulated = {"done": False}
+
+        def fake_kill(pid, sig):
+            # Only the very first SIGTERM aimed at our target pid is faked
+            # as "process already gone" -- everything else (including the
+            # test's own cleanup in `finally` below) must go through to the
+            # real os.kill, or this monkeypatch would interfere with
+            # unrelated signalling for the rest of the test.
+            if not simulated["done"] and pid == proc.pid and sig == 15:
+                simulated["done"] = True
+                calls.append((pid, sig))
+                raise ProcessLookupError("simulated: process already exited")
+            calls.append((pid, sig))
+            return real_kill(pid, sig)
+
+        monkeypatch.setattr(jobs_module.os, "kill", fake_kill)
+
+        result = terminate_pid_from_sidecar(log)
+
+        assert result is False
+        assert not (tmp_path / "j-gone.pid").exists(), (
+            "a confirmed-gone process's sidecar must still be removed"
+        )
+        assert calls == [(proc.pid, 15)], (
+            "SIGKILL must never be attempted once SIGTERM already reports the process gone"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
 # ---------------------------------------------------------------------------
 # graceful shutdown
 # ---------------------------------------------------------------------------
@@ -619,23 +705,115 @@ def test_shutdown_does_not_start_jobs_still_queued_behind_the_running_one(tmp_pa
     assert len(runner.calls) == 1  # B's runner was never invoked
 
 
-def test_run_job_success_stays_done_even_if_the_stop_flag_is_already_set(tmp_path):
-    """If a job's subprocess finishes successfully right as shutdown begins,
-    it must land as done -- not get force-reverted to queued merely because
-    the stop flag happened to already be set by the time it finished."""
+def test_run_job_success_stays_done_even_if_the_stop_flag_becomes_set_mid_run(tmp_path):
+    """If a job's subprocess finishes successfully right as shutdown begins
+    -- the stop flag flips to set *while the job is already running*, not
+    before it started -- it must land as done, not get force-reverted to
+    queued merely because the flag ended up set by the time it finished.
+
+    (A flag already set *before* the job is ever handed to _run_job is a
+    different, earlier case: _run_job's own start-of-function gate refuses
+    to start such a job at all -- see
+    test_run_job_refuses_to_start_when_stopping_flag_already_set. This test
+    has to flip the flag *from inside the runner call* to actually exercise
+    the gate-passed-then-flag-set-mid-flight path, not the gate itself.)
+    """
     upload = _make_upload(tmp_path)
-    store = JobStore(tmp_path, runner=FakeRunner(write_player=True, returncode=0))
+    store = JobStore(tmp_path, runner=FakeRunner())
+    succeeding_runner = FakeRunner(write_player=True, returncode=0)
+
+    def sets_flag_mid_run_then_succeeds(upload_path, out_dir, title, target, log_path):
+        store._stopping.set()  # simulates shutdown() racing in during the run
+        return succeeding_runner(upload_path, out_dir, title, target, log_path)
+
+    store._runner = sets_flag_mid_run_then_succeeds
     job = Job(
         id="j-manual", digest="d1", title="Song", target="guitar", status="queued",
         created_at="2026-01-01T00:00:00+00:00",
         log="web/logs/j-manual.log", upload=str(upload.relative_to(tmp_path)),
     )
     store._jobs[job.id] = job
+
+    store._run_job(job)  # flag is unset when this call starts -- passes the gate
+
+    assert store.get_job(job.id).status == "done"
+
+
+def test_run_job_refuses_to_start_when_stopping_flag_already_set(tmp_path):
+    """The authoritative, TOCTOU-safe check: if the stop flag is already set
+    by the time _run_job acquires self._lock, it must not mark the job
+    "running" (or invoke the runner) at all -- it must stay "queued",
+    untouched. This is the check that closes the shutdown() race where a
+    job could otherwise flip to running just after shutdown() already took
+    its snapshot of what to SIGTERM."""
+    upload = _make_upload(tmp_path)
+    runner = FakeRunner()
+    store = JobStore(tmp_path, runner=runner)
+    job = Job(
+        id="j-race", digest="d1", title="Song", target="guitar", status="queued",
+        created_at="2026-01-01T00:00:00+00:00",
+        log="web/logs/j-race.log", upload=str(upload.relative_to(tmp_path)),
+    )
+    store._jobs[job.id] = job
+    store._write_job(job)
     store._stopping.set()
 
     store._run_job(job)
 
-    assert store.get_job(job.id).status == "done"
+    after = store.get_job(job.id)
+    assert after.status == "queued"
+    assert after.started_at is None
+    assert runner.calls == []
+
+
+def test_shutdown_race_never_lets_a_job_start_after_the_running_snapshot(tmp_path, monkeypatch):
+    """Regression for the TOCTOU race between _worker_loop pulling a job off
+    the queue and _run_job actually marking it "running": if shutdown()'s
+    flag-set + running-snapshot lands in that window, the job must never be
+    allowed to start afterward (it would then run un-terminated and outlive
+    join_timeout as an orphan for a real, long-running subprocess). Forced
+    here by hooking _run_job to pause right before it would acquire the
+    lock, firing shutdown() into that exact window from another thread, and
+    only then letting the worker proceed."""
+    upload = _make_upload(tmp_path)
+    runner = FakeRunner()
+    store = JobStore(tmp_path, runner=runner)
+
+    about_to_call_run_job = threading.Event()
+    let_worker_proceed = threading.Event()
+    real_run_job = store._run_job
+
+    def hooked_run_job(job):
+        about_to_call_run_job.set()
+        let_worker_proceed.wait(timeout=5.0)
+        return real_run_job(job)
+
+    monkeypatch.setattr(store, "_run_job", hooked_run_job)
+
+    job, _ = store.create_job(upload, digest="d1", requested_title="Song")
+    assert about_to_call_run_job.wait(timeout=5.0), "worker never reached _run_job"
+    # At this point the job is still "queued" -- the worker is parked in the
+    # hook, deliberately before _run_job's own lock/flag check.
+    assert store.get_job(job.id).status == "queued"
+
+    shutdown_thread = threading.Thread(target=store.shutdown)
+    shutdown_thread.start()
+    # Give shutdown() a real chance to set the flag and take its (empty,
+    # since the job isn't "running" yet) snapshot before releasing the
+    # worker into the race window.
+    time.sleep(0.1)
+    let_worker_proceed.set()
+    shutdown_thread.join(timeout=10.0)
+
+    final = store.get_job(job.id)
+    # With the fix, shutdown() having set the flag first means _run_job's
+    # own locked check refuses to start the job -- it never runs at all.
+    # Under the old (buggy) code, _run_job unconditionally marked it
+    # "running" and invoked the runner regardless of the flag, which is
+    # exactly the orphaned-subprocess bug this test guards against.
+    assert final.status == "queued"
+    assert final.started_at is None
+    assert runner.calls == []
 
 
 # ---------------------------------------------------------------------------

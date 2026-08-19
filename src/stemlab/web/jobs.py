@@ -135,8 +135,12 @@ def terminate_pid_from_sidecar(
     path gets another chance at it.
 
     A stale sidecar (process already gone, or its pid recycled to an
-    unrelated process) is removed immediately, same as before. Returns True
-    iff a live, marker-matching process was actually signalled.
+    unrelated process) is removed immediately, same as before. If the SIGTERM
+    itself fails with something other than "the process is already gone"
+    (e.g. PermissionError -- we don't own it), the process's actual state is
+    unknown, so the sidecar is kept rather than discarded, same as the
+    "still alive after SIGKILL" case. Returns True iff a live, marker-
+    matching process was actually signalled.
     """
     sidecar = _pid_sidecar(log_path)
     try:
@@ -157,8 +161,17 @@ def terminate_pid_from_sidecar(
 
     try:
         os.kill(pid, 15)  # SIGTERM
-    except OSError:
+    except ProcessLookupError:
+        # The process exited between our liveness check above and this
+        # signal -- genuinely gone, so the sidecar is stale now too.
         sidecar.unlink(missing_ok=True)
+        return False
+    except OSError:
+        # Some other failure (e.g. PermissionError -- we don't own the
+        # process) means we don't actually know whether it's still alive.
+        # Don't destroy the recovery information: leave the sidecar in
+        # place so the next startup's recovery gets another chance at it,
+        # same as the "still alive after SIGKILL" case below.
         return False
 
     if _wait_until_gone(time.monotonic() + grace_seconds):
@@ -402,9 +415,20 @@ class JobStore:
         the next start.
 
         Order matters here:
-          1. Set the stop flag -- checked by `_worker_loop` before it starts
-             any *other* still-queued job, and by `_run_job` to tell a
-             shutdown-induced failure apart from a genuine one.
+          1. Under `self._lock`, set the stop flag *and* snapshot which
+             job(s) are currently "running" in the same critical section.
+             This is the TOCTOU fix: `_run_job` (see below) only ever
+             transitions a job queued->running inside that same lock, after
+             checking the stop flag. So whichever of "shutdown sets the flag
+             and takes its snapshot" or "_run_job checks the flag and starts
+             the job" gets the lock first, the other sees a fully consistent
+             result of that decision -- either the job was already running
+             when the flag was set (so it's in this snapshot and gets
+             SIGTERM'd below), or the flag was already set when _run_job
+             looked (so it refuses to start the job at all, leaving it
+             "queued"). There is no window where a job starts running
+             *after* this snapshot was taken, which is what used to let a
+             job slip past shutdown() undetected and outlive join_timeout.
           2. Push the sentinel so a worker idle in `queue.get()` wakes up and
              exits immediately, instead of `join()` below blocking for
              `join_timeout` for no reason.
@@ -415,10 +439,10 @@ class JobStore:
              lifespan doesn't finish tearing down -- while a job's finishing
              touches to its record are still in flight.
         """
-        self._stopping.set()
-        self._queue.put(None)
         with self._lock:
+            self._stopping.set()
             running = [j for j in self._jobs.values() if j.status == "running" and j.log]
+        self._queue.put(None)
         for job in running:
             terminate_pid_from_sidecar(self.out_dir / job.log)
         self._worker.join(timeout=join_timeout)
@@ -520,11 +544,16 @@ class JobStore:
             if job_id is None:  # shutdown sentinel -- see shutdown()
                 return
             if self._stopping.is_set():
-                # A shutdown is underway: don't start any job still waiting
-                # in the queue ahead of the sentinel we just consumed, even
-                # though it was never itself signalled to stop. It stays
-                # "queued" on disk untouched, ready for the next startup's
-                # recovery to pick up.
+                # Cheap fast path only (unlocked read) -- skips the log-dir
+                # setup etc. below for the common case of jobs still waiting
+                # in the queue ahead of the sentinel once a shutdown is
+                # already well underway. Not load-bearing for correctness:
+                # _run_job re-checks the flag under self._lock right before
+                # it would mark the job "running", and *that* check is the
+                # one that actually closes the TOCTOU against a racing
+                # shutdown() (see shutdown()'s docstring). A job skipped
+                # here stays "queued" on disk untouched, ready for the next
+                # startup's recovery to pick up.
                 continue
             job = self.get_job(job_id)
             if job is None:
@@ -533,6 +562,19 @@ class JobStore:
 
     def _run_job(self, job: Job) -> None:
         with self._lock:
+            if self._stopping.is_set():
+                # A shutdown raced us here, between the worker pulling this
+                # job off the queue and this lock acquisition: refuse to
+                # start it. This check runs inside the same lock shutdown()
+                # holds while it sets the stop flag and snapshots which
+                # job(s) are "running" (see shutdown()'s docstring) -- that
+                # shared lock is what guarantees no job can ever flip to
+                # "running" *after* shutdown() has already taken its
+                # snapshot of what to SIGTERM, closing the race where such a
+                # job would start anyway and still be running past
+                # join_timeout. Left "queued" (its current, unmodified,
+                # on-disk state) for the next startup's recovery.
+                return
             job.status = "running"
             job.started_at = _now_iso()
             self._write_job(job)
