@@ -41,18 +41,26 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 # 2 hours: generous upper bound for a single separation + export on CPU.
 DEFAULT_TIMEOUT_SECONDS = 2 * 60 * 60
 
 # Same rule as stemlab.package._safe_filename -- see module docstring for why
 # this is duplicated rather than imported.
-_UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|]')
+_UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|#%]')
 
 
 def safe_filename(title: str) -> str:
-    return _UNSAFE_CHARS.sub("_", title).strip() or "untitled"
+    # See stemlab.package._safe_filename's comments for why leading dots are
+    # stripped after substitution and why a "web" result is renamed --
+    # identical rule, duplicated here on purpose.
+    slug = _UNSAFE_CHARS.sub("_", title).strip().lstrip(".")
+    if not slug:
+        return "untitled"
+    if slug.casefold() == "web":
+        return "web-package"
+    return slug
 
 
 def _now_iso() -> str:
@@ -98,24 +106,74 @@ def _process_command(pid: int) -> str:
         return ""
 
 
-def terminate_pid_from_sidecar(log_path: Path, *, marker: str = "stemlab.cli") -> bool:
-    """Kill the process a pid sidecar points at, but only if its command line
+def _process_alive(pid: int, marker: str) -> bool:
+    """True if `pid` is still running *and* still looks like the process we
+    signalled (marker still in its command line) -- once it exits, `ps` finds
+    nothing for that pid (or the pid may already have been recycled by an
+    unrelated process, which fails the marker check too)."""
+    return marker in _process_command(pid)
+
+
+def terminate_pid_from_sidecar(
+    log_path: Path,
+    *,
+    marker: str = "stemlab.cli",
+    grace_seconds: float = 5.0,
+    poll_interval: float = 0.1,
+) -> bool:
+    """Stop the process a pid sidecar points at, but only if its command line
     still contains `marker` -- pids get recycled, and we must never kill an
-    unrelated process that happens to have inherited the number. Returns True
-    if a process was signalled. Removes the sidecar either way."""
+    unrelated process that happens to have inherited the number.
+
+    SIGTERM first, then poll for up to `grace_seconds` for it to actually
+    exit; if it's still alive after that, escalate to SIGKILL and poll again.
+    The sidecar is only removed once the process is confirmed gone -- a job
+    resuming that pid before it has actually died would race the exiting
+    subprocess over the same cache/package files. If it *still* hasn't died
+    even after SIGKILL (a stuck zombie/defunct, essentially never in
+    practice), the sidecar is left in place so the next startup's recovery
+    path gets another chance at it.
+
+    A stale sidecar (process already gone, or its pid recycled to an
+    unrelated process) is removed immediately, same as before. Returns True
+    iff a live, marker-matching process was actually signalled.
+    """
     sidecar = _pid_sidecar(log_path)
     try:
         pid = int(sidecar.read_text().strip())
     except (OSError, ValueError):
         return False
-    finally:
+
+    if pid <= 0 or not _process_alive(pid, marker):
         sidecar.unlink(missing_ok=True)
-    if pid <= 0 or marker not in _process_command(pid):
         return False
+
+    def _wait_until_gone(deadline: float) -> bool:
+        while time.monotonic() < deadline:
+            if not _process_alive(pid, marker):
+                return True
+            time.sleep(poll_interval)
+        return not _process_alive(pid, marker)
+
     try:
         os.kill(pid, 15)  # SIGTERM
     except OSError:
+        sidecar.unlink(missing_ok=True)
         return False
+
+    if _wait_until_gone(time.monotonic() + grace_seconds):
+        sidecar.unlink(missing_ok=True)
+        return True
+
+    try:
+        os.kill(pid, 9)  # SIGKILL
+    except OSError:
+        pass  # already gone between our last check and here
+
+    if _wait_until_gone(time.monotonic() + grace_seconds):
+        sidecar.unlink(missing_ok=True)
+    # else: still alive (or un-reapable) after SIGKILL -- leave the sidecar
+    # for the next startup's recovery to retry.
     return True
 
 
@@ -140,6 +198,8 @@ def default_runner(
         str(out_dir),
         "--title",
         title,
+        "--target",
+        target,
     ]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     sidecar = _pid_sidecar(log_path)
@@ -186,6 +246,57 @@ class Job:
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
+_VALID_STATUSES = {"queued", "running", "done", "error"}
+# Must exist and be a string; every other field is Optional[str] (may be
+# absent or None).
+_REQUIRED_STR_FIELDS = ("id", "digest", "title", "target", "status", "created_at")
+_OPTIONAL_DATETIME_FIELDS = ("started_at", "finished_at")
+_OPTIONAL_STR_FIELDS = ("error", "package", "log", "upload")
+
+
+def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
+    """Check a decoded job JSON payload against Job's schema before it's
+    trusted enough to build a Job from and drive the worker with. Returns
+    None if `data` is well-formed, else a short human-readable reason it
+    isn't -- a hand-edited or truncated-write job file must never crash
+    startup or silently corrupt the in-memory job table for every *other*
+    job too.
+
+    `expected_id` is the job id implied by the filename (`<id>.json`): a
+    mismatch means the file was renamed/copied/hand-edited into
+    inconsistency with its own name, which would otherwise let it silently
+    shadow (or be shadowed by) a different job's record.
+    """
+    if not isinstance(data, dict):
+        return "not a JSON object"
+    for name in _REQUIRED_STR_FIELDS:
+        if not isinstance(data.get(name), str):
+            return f"missing or non-string required field: {name!r}"
+    if data["status"] not in _VALID_STATUSES:
+        return f"unknown status: {data['status']!r}"
+    if data["id"] != expected_id:
+        return f"id {data['id']!r} does not match filename (expected {expected_id!r})"
+    for name in _OPTIONAL_DATETIME_FIELDS:
+        value = data.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return f"non-string datetime field: {name!r}"
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            return f"unparseable ISO-8601 datetime in {name!r}: {value!r}"
+    try:
+        datetime.fromisoformat(data["created_at"])
+    except ValueError:
+        return f"unparseable ISO-8601 datetime in 'created_at': {data['created_at']!r}"
+    for name in _OPTIONAL_STR_FIELDS:
+        value = data.get(name)
+        if value is not None and not isinstance(value, str):
+            return f"non-string field: {name!r}"
+    return None
+
+
 class JobStore:
     """File-backed job queue + sequential worker.
 
@@ -207,7 +318,10 @@ class JobStore:
         self._runner = runner
         self._lock = threading.RLock()
         self._jobs: dict[str, Job] = {}
-        self._queue: "queue.Queue[str]" = queue.Queue()
+        # None is the shutdown sentinel (see shutdown()/`_worker_loop`): it's
+        # never a real job id, which always starts with "j-".
+        self._queue: "queue.Queue[str | None]" = queue.Queue()
+        self._stopping = threading.Event()
 
         self._load_and_recover()
 
@@ -224,11 +338,40 @@ class JobStore:
         tmp.write_text(json.dumps(job.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)  # atomic on the same filesystem
 
+    def _quarantine_job_file(self, path: Path, reason: str) -> None:
+        """Rename an unreadable/invalid job file out of the way so it stops
+        being picked up on every future startup, without ever clobbering an
+        earlier quarantine of a different bad file (hence the retry-on-
+        collision loop, however unlikely a collision actually is with an
+        8-hex-char random suffix)."""
+        while True:
+            dest = path.with_name(f"{path.name}.bad-{secrets.token_hex(4)}")
+            if not dest.exists():
+                break
+        try:
+            path.rename(dest)
+        except OSError as exc:
+            print(f"[stemlab-web] failed to quarantine {path.name}: {exc}", file=sys.stderr)
+            return
+        print(
+            f"[stemlab-web] quarantined invalid job file {path.name} -> {dest.name}: {reason}",
+            file=sys.stderr,
+        )
+
     def _load_and_recover(self) -> None:
         for path in sorted(self.jobs_dir.glob("j-*.json")):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as exc:
+                self._quarantine_job_file(path, f"unreadable/invalid JSON: {exc}")
+                continue
+            # The id a well-formed file for this path *should* have -- ".json"
+            # stripped from the filename, matching how _job_path/_write_job
+            # name job files.
+            expected_id = path.stem
+            reason = _validate_job_record(data, expected_id)
+            if reason is not None:
+                self._quarantine_job_file(path, reason)
                 continue
             job = Job.from_dict(data)
             self._jobs[job.id] = job
@@ -250,16 +393,35 @@ class JobStore:
             self._write_job(job)
             self._queue.put(job.id)
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, join_timeout: float = 15.0) -> None:
         """Graceful-shutdown hook (wired to the app's lifespan): stop the
         currently running separation subprocess, if any, so a normal server
-        stop doesn't orphan it. A SIGKILLed server can't run this -- that
-        case is covered by the sidecar reaping in _load_and_recover on the
-        next start."""
+        stop doesn't orphan it or mark its job an error just because the
+        process serving it went away. A SIGKILLed server can't run this --
+        that case is covered by the sidecar reaping in _load_and_recover on
+        the next start.
+
+        Order matters here:
+          1. Set the stop flag -- checked by `_worker_loop` before it starts
+             any *other* still-queued job, and by `_run_job` to tell a
+             shutdown-induced failure apart from a genuine one.
+          2. Push the sentinel so a worker idle in `queue.get()` wakes up and
+             exits immediately, instead of `join()` below blocking for
+             `join_timeout` for no reason.
+          3. SIGTERM (then SIGKILL if needed) the in-flight subprocess, if
+             any -- this is what makes the worker's blocking
+             `self._runner(...)` call in `_run_job` actually return.
+          4. Join the worker so this method doesn't return -- and the ASGI
+             lifespan doesn't finish tearing down -- while a job's finishing
+             touches to its record are still in flight.
+        """
+        self._stopping.set()
+        self._queue.put(None)
         with self._lock:
             running = [j for j in self._jobs.values() if j.status == "running" and j.log]
         for job in running:
             terminate_pid_from_sidecar(self.out_dir / job.log)
+        self._worker.join(timeout=join_timeout)
 
     # -- queries --------------------------------------------------------
     def list_jobs(self) -> list[Job]:
@@ -355,6 +517,15 @@ class JobStore:
     def _worker_loop(self) -> None:
         while True:
             job_id = self._queue.get()
+            if job_id is None:  # shutdown sentinel -- see shutdown()
+                return
+            if self._stopping.is_set():
+                # A shutdown is underway: don't start any job still waiting
+                # in the queue ahead of the sentinel we just consumed, even
+                # though it was never itself signalled to stop. It stays
+                # "queued" on disk untouched, ready for the next startup's
+                # recovery to pick up.
+                continue
             job = self.get_job(job_id)
             if job is None:
                 continue
@@ -381,10 +552,25 @@ class JobStore:
 
         safe = safe_filename(job.title)
         expected_player = self.out_dir / safe / f"{safe}.{job.target}.player.html"
+        succeeded = rc == 0 and expected_player.exists()
 
         with self._lock:
+            if not succeeded and self._stopping.is_set():
+                # A shutdown killed this job's subprocess mid-run (see
+                # shutdown()): that's not a genuine failure, so don't record
+                # one. Reset it to "queued" -- exactly the state
+                # _load_and_recover() would put a `running` job into on the
+                # next startup -- so it just re-runs then instead of showing
+                # the user a permanent error for something the server itself
+                # interrupted. (If it *did* succeed -- e.g. it finished right
+                # as shutdown began -- fall through to the normal "done"
+                # branch below instead: a completed job must stay done.)
+                job.status = "queued"
+                job.started_at = None
+                self._write_job(job)
+                return
             job.finished_at = _now_iso()
-            if rc == 0 and expected_player.exists():
+            if succeeded:
                 job.status = "done"
                 job.package = f"{safe}/{safe}.{job.target}.player.html"
                 job.error = None

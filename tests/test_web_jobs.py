@@ -400,6 +400,34 @@ def test_safe_filename_matches_package_py_rule():
     assert safe_filename("") == "untitled"
 
 
+# ---------------------------------------------------------------------------
+# sanitizer hardening: #/% stripped, leading-dot escape closed, "web" renamed
+# ---------------------------------------------------------------------------
+def test_safe_filename_strips_hash_and_percent():
+    assert safe_filename("Song #1 100%") == "Song _1 100_"
+
+
+def test_safe_filename_dot_only_title_falls_back_to_untitled():
+    # ".." (or any run of dots) must never survive into a directory name --
+    # substitution alone doesn't touch dots, so this is the leading-dot strip.
+    assert safe_filename("..") == "untitled"
+    assert safe_filename("...") == "untitled"
+    assert safe_filename(".") == "untitled"
+
+
+def test_safe_filename_strips_only_leading_dots():
+    assert safe_filename("..hidden") == "hidden"
+    assert safe_filename("a..b") == "a..b"  # dots not at the start are untouched
+
+
+def test_safe_filename_web_is_renamed_to_web_package():
+    # "web" is the private subdirectory _block_private_package_paths blocks
+    # (see web/app.py); a same-named package folder must not collide with it.
+    assert safe_filename("web") == "web-package"
+    assert safe_filename("WEB") == "web-package"
+    assert safe_filename("WeB") == "web-package"
+
+
 def test_preexisting_cli_package_folder_is_a_collision(tmp_path):
     """A package folder built by the CLI directly (no job record) must not be
     written into by a web job with the same title: build_package overwrites
@@ -477,3 +505,276 @@ def test_recovery_reaps_surviving_subprocess_before_requeueing(tmp_path):
     finally:
         if orphan.poll() is None:
             orphan.kill()
+
+
+def _spawn_sigterm_ignoring_sleeper():
+    """Like _spawn_marked_sleeper, but installs a SIGTERM handler that
+    ignores it -- only SIGKILL (which cannot be blocked) can end this
+    process, exercising terminate_pid_from_sidecar's SIGKILL escalation."""
+    import subprocess
+    import sys
+
+    code = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(60)  # stemlab.cli\n"
+    )
+    return subprocess.Popen([sys.executable, "-c", code])
+
+
+def test_terminate_pid_from_sidecar_escalates_to_sigkill_when_sigterm_is_ignored(tmp_path):
+    from stemlab.web.jobs import terminate_pid_from_sidecar
+
+    log = tmp_path / "j-y.log"
+    proc = _spawn_sigterm_ignoring_sleeper()
+    try:
+        (tmp_path / "j-y.pid").write_text(str(proc.pid))
+        # Short grace period so the SIGTERM poll window elapses quickly and
+        # SIGKILL kicks in without slowing the suite down.
+        assert terminate_pid_from_sidecar(log, grace_seconds=0.5, poll_interval=0.05) is True
+        _wait_until(lambda: proc.poll() is not None)
+        assert not (tmp_path / "j-y.pid").exists(), (
+            "sidecar must only be removed once the process is confirmed gone"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# graceful shutdown
+# ---------------------------------------------------------------------------
+def test_shutdown_from_idle_returns_promptly_without_hitting_join_timeout(tmp_path):
+    store = JobStore(tmp_path, runner=FakeRunner())
+    start = time.monotonic()
+    store.shutdown(join_timeout=15.0)
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0, (
+        f"shutdown() took {elapsed:.2f}s from idle -- the sentinel likely "
+        "didn't wake the worker out of its blocking queue.get()"
+    )
+
+
+def test_shutdown_leaves_a_completed_job_done(tmp_path):
+    upload = _make_upload(tmp_path)
+    store = JobStore(tmp_path, runner=FakeRunner())
+    job, _ = store.create_job(upload, digest="d1", requested_title="Song")
+    _wait_until(lambda: store.get_job(job.id).status == "done")
+
+    store.shutdown()
+
+    assert store.get_job(job.id).status == "done"
+
+
+def test_shutdown_reverts_a_running_job_to_queued_without_marking_it_error(tmp_path):
+    upload = _make_upload(tmp_path)
+    hold = threading.Event()
+    release = threading.Event()
+    # Simulates the runner's subprocess having been killed by shutdown()'s
+    # SIGTERM: exits nonzero, never gets to write the player.
+    runner = FakeRunner(hold=hold, release=release, returncode=1, write_player=False)
+    store = JobStore(tmp_path, runner=runner)
+
+    job, _ = store.create_job(upload, digest="d1", requested_title="Song")
+    hold.wait(timeout=5.0)
+    _wait_until(lambda: store.get_job(job.id).status == "running")
+
+    shutdown_thread = threading.Thread(target=store.shutdown)
+    shutdown_thread.start()
+    # Give shutdown() a moment to set the stop flag before letting the fake
+    # "subprocess" return, mirroring real SIGTERM-then-exit ordering.
+    time.sleep(0.1)
+    release.set()
+    shutdown_thread.join(timeout=10.0)
+
+    reverted = store.get_job(job.id)
+    assert reverted.status == "queued"
+    assert reverted.started_at is None
+    assert reverted.error is None
+
+
+def test_shutdown_does_not_start_jobs_still_queued_behind_the_running_one(tmp_path):
+    upload_a = _make_upload(tmp_path, "a.mp3")
+    upload_b = _make_upload(tmp_path, "b.mp3")
+    hold = threading.Event()
+    release = threading.Event()
+    runner = FakeRunner(hold=hold, release=release, returncode=1, write_player=False)
+    store = JobStore(tmp_path, runner=runner)
+
+    job_a, _ = store.create_job(upload_a, digest="da", requested_title="A")
+    hold.wait(timeout=5.0)
+    _wait_until(lambda: store.get_job(job_a.id).status == "running")
+
+    job_b, _ = store.create_job(upload_b, digest="db", requested_title="B")
+    assert store.get_job(job_b.id).status == "queued"
+
+    shutdown_thread = threading.Thread(target=store.shutdown)
+    shutdown_thread.start()
+    time.sleep(0.1)
+    release.set()
+    shutdown_thread.join(timeout=10.0)
+
+    assert store.get_job(job_a.id).status == "queued"
+    assert store.get_job(job_b.id).status == "queued"
+    assert len(runner.calls) == 1  # B's runner was never invoked
+
+
+def test_run_job_success_stays_done_even_if_the_stop_flag_is_already_set(tmp_path):
+    """If a job's subprocess finishes successfully right as shutdown begins,
+    it must land as done -- not get force-reverted to queued merely because
+    the stop flag happened to already be set by the time it finished."""
+    upload = _make_upload(tmp_path)
+    store = JobStore(tmp_path, runner=FakeRunner(write_player=True, returncode=0))
+    job = Job(
+        id="j-manual", digest="d1", title="Song", target="guitar", status="queued",
+        created_at="2026-01-01T00:00:00+00:00",
+        log="web/logs/j-manual.log", upload=str(upload.relative_to(tmp_path)),
+    )
+    store._jobs[job.id] = job
+    store._stopping.set()
+
+    store._run_job(job)
+
+    assert store.get_job(job.id).status == "done"
+
+
+# ---------------------------------------------------------------------------
+# job-file schema validation / quarantine
+# ---------------------------------------------------------------------------
+def _write_raw_job_file(out_dir: Path, job_id: str, payload) -> Path:
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    path = jobs_dir / f"{job_id}.json"
+    path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _valid_job_payload(**overrides) -> dict:
+    payload = {
+        "id": "j-valid-0001",
+        "digest": "d1",
+        "title": "Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:01+00:00",
+        "finished_at": "2026-01-01T00:00:02+00:00",
+        "error": None,
+        "package": "Song/Song.guitar.player.html",
+        "log": "web/logs/j-valid-0001.log",
+        "upload": "web/uploads/song.mp3",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _quarantined_names(out_dir: Path, stem: str) -> list[str]:
+    jobs_dir = out_dir / "web" / "jobs"
+    return [p.name for p in jobs_dir.iterdir() if p.name.startswith(f"{stem}.json.bad-")]
+
+
+def test_malformed_json_is_quarantined_and_startup_continues(tmp_path):
+    _write_raw_job_file(tmp_path, "j-bad-json", "{not json")
+    _write_raw_job_file(tmp_path, "j-good", _valid_job_payload(id="j-good"))
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    names = [p.name for p in (tmp_path / "web" / "jobs").iterdir()]
+    assert "j-bad-json.json" not in names
+    assert _quarantined_names(tmp_path, "j-bad-json"), names
+    assert store.get_job("j-good") is not None
+
+
+def test_wrong_type_field_is_quarantined(tmp_path):
+    _write_raw_job_file(tmp_path, "j-bad-type", _valid_job_payload(id="j-bad-type", digest=123))
+    store = JobStore(tmp_path, runner=FakeRunner())
+    assert store.get_job("j-bad-type") is None
+    assert _quarantined_names(tmp_path, "j-bad-type")
+
+
+def test_unknown_status_is_quarantined(tmp_path):
+    _write_raw_job_file(
+        tmp_path, "j-bad-status", _valid_job_payload(id="j-bad-status", status="frobnicating")
+    )
+    store = JobStore(tmp_path, runner=FakeRunner())
+    assert store.get_job("j-bad-status") is None
+    assert _quarantined_names(tmp_path, "j-bad-status")
+
+
+def test_id_filename_mismatch_is_quarantined(tmp_path):
+    # File is named j-mismatch.json but its own "id" field says something else.
+    _write_raw_job_file(tmp_path, "j-mismatch", _valid_job_payload(id="j-someone-else"))
+    store = JobStore(tmp_path, runner=FakeRunner())
+    assert store.get_job("j-someone-else") is None
+    assert store.get_job("j-mismatch") is None
+    assert _quarantined_names(tmp_path, "j-mismatch")
+
+
+def test_missing_required_field_is_quarantined(tmp_path):
+    payload = _valid_job_payload(id="j-missing-field")
+    del payload["digest"]
+    _write_raw_job_file(tmp_path, "j-missing-field", payload)
+    store = JobStore(tmp_path, runner=FakeRunner())
+    assert store.get_job("j-missing-field") is None
+    assert _quarantined_names(tmp_path, "j-missing-field")
+
+
+def test_unparseable_datetime_is_quarantined(tmp_path):
+    _write_raw_job_file(
+        tmp_path, "j-bad-date", _valid_job_payload(id="j-bad-date", created_at="not-a-date")
+    )
+    store = JobStore(tmp_path, runner=FakeRunner())
+    assert store.get_job("j-bad-date") is None
+    assert _quarantined_names(tmp_path, "j-bad-date")
+
+
+def test_quarantine_never_overwrites_an_existing_quarantine_file(tmp_path, monkeypatch):
+    from stemlab.web import jobs as jobs_module
+
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    jobs_dir.joinpath("j-dup.json").write_text("{not json", encoding="utf-8")
+    # Pre-create the exact quarantine name a forced-to-collide token would
+    # produce, so the retry loop is forced to pick a different one.
+    pre_existing = jobs_dir / "j-dup.json.bad-aaaaaaaa"
+    pre_existing.write_text("previous quarantine, must survive untouched", encoding="utf-8")
+
+    tokens = iter(["aaaaaaaa", "bbbbbbbb"])
+    monkeypatch.setattr(jobs_module.secrets, "token_hex", lambda n: next(tokens))
+
+    JobStore(tmp_path, runner=FakeRunner())
+
+    assert pre_existing.read_text(encoding="utf-8") == "previous quarantine, must survive untouched"
+    assert (jobs_dir / "j-dup.json.bad-bbbbbbbb").exists()
+
+
+# ---------------------------------------------------------------------------
+# default_runner --target passthrough
+# ---------------------------------------------------------------------------
+def test_default_runner_passes_target_to_the_cli(tmp_path, monkeypatch):
+    from stemlab.web import jobs as jobs_module
+
+    captured: dict[str, Any] = {}
+
+    class _FakeProc:
+        pid = 12345
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(jobs_module.subprocess, "Popen", fake_popen)
+
+    upload = tmp_path / "song.mp3"
+    upload.write_bytes(b"x")
+    log_path = tmp_path / "web" / "logs" / "j-x.log"
+
+    rc = jobs_module.default_runner(upload, tmp_path, "My Song", "vocals", log_path)
+
+    assert rc == 0
+    cmd = captured["cmd"]
+    assert "--target" in cmd
+    assert cmd[cmd.index("--target") + 1] == "vocals"
