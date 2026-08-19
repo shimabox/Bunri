@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # ffmpeg is required by stemlab's audio pipeline (mp3<->wav conversion,
+      # normalize step) -- without it, tests that exercise build_package()
+      # (test_package.py) silently skip instead of actually running, and CI
+      # would never catch a real regression there.
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      # Version pinned to match the Dockerfile's UV_VERSION ARG, so CI and
+      # the dev container resolve deps with the same uv release.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.14"
+          # Caches uv's downloaded wheels (torch chief among them) keyed on
+          # uv.lock -- without this, every run would re-download torch's
+          # multi-hundred-MB CPU wheel from scratch.
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      # --extra web: the test suite (tests/test_web_*.py) imports fastapi /
+      # httpx's TestClient, which only the `web` extra pulls in.
+      - name: Install dependencies
+        run: uv sync --frozen --extra web
+
+      # Needed by tests/test_player_html.py and tests/test_web_page.py's
+      # real-browser checks; skipped gracefully if unavailable, but CI should
+      # actually exercise them rather than silently skip.
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+
+      - name: Run tests
+        run: uv run pytest -q
