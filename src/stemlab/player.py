@@ -17,6 +17,7 @@ missing stem degrades gracefully instead of erroring.
 from __future__ import annotations
 
 from datetime import datetime
+from urllib.parse import quote
 
 from jinja2 import Environment, PackageLoader, select_autoescape
 
@@ -59,9 +60,17 @@ def render_player(
 
     return template.render(
         title=title or "Untitled",
-        original_src=original,
-        target_src=target,
-        backing_src=backing,
+        # Percent-encoded here (not just left to Jinja's autoescaping, which
+        # only escapes HTML syntax, not URL-reserved characters) so a
+        # filename containing a space or "#" still resolves as a single
+        # <audio src>: an unescaped space breaks the attribute value and an
+        # unescaped "#" truncates the URL at a fragment. Doing this in the
+        # renderer (rather than trusting the caller to have already
+        # sanitized the filename) also covers preexisting on-disk files that
+        # predate stricter filename sanitizing elsewhere in the app.
+        original_src=quote(original) if original is not None else None,
+        target_src=quote(target) if target is not None else None,
+        backing_src=quote(backing) if backing is not None else None,
         instrument_label=instrument_label,
         generated_at=generated_at,
     )

@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -52,7 +53,13 @@ def _serialize_job(job: Job) -> dict:
         "started_at": job.started_at,
         "finished_at": job.finished_at,
         "elapsed_seconds": _elapsed_seconds(job),
-        "package_url": f"/packages/{job.package}" if job.package else None,
+        # quote()'s default safe="/" keeps the path structure readable while
+        # percent-encoding anything that would otherwise break the URL --
+        # notably "#" (would truncate the URL at a fragment) and spaces --
+        # in job.package, which comes straight from job.title's sanitized
+        # slug (see safe_filename) and the user-controlled title can still
+        # contain those characters even though the slug itself never does.
+        "package_url": f"/packages/{quote(job.package)}" if job.package else None,
         "error": job.error,
     }
 
@@ -90,20 +97,66 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         allowed_hosts=["127.0.0.1", "localhost", "::1", "testserver"],
     )
 
+    # CSRF: this server has no auth/session cookie to steal, but a POST from a
+    # hostile page (or driven by DNS rebinding onto 127.0.0.1) could still
+    # queue jobs / burn disk & CPU on someone else's behalf. Strict same-
+    # origin enforcement on unsafe methods closes that off: the Origin header
+    # is one browsers attach to every cross-origin request and cannot be
+    # overridden by page script, so requiring it to name *this* origin
+    # exactly (scheme+host+port) is sufficient -- no CSRF token needed for a
+    # single-user local tool. Missing Origin (curl, same-origin non-CORS
+    # requests some older browsers omit it for, etc.) is allowed: that header
+    # is opt-in information a hostile *page* cannot suppress, so its absence
+    # isn't itself suspicious the way a wrong value would be.
+    _UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+    _DEFAULT_PORT_BY_SCHEME = {"http": 80, "https": 443}
+
+    def _effective_port(scheme: str, port: Optional[int]) -> Optional[int]:
+        return port if port is not None else _DEFAULT_PORT_BY_SCHEME.get(scheme)
+
+    @app.middleware("http")
+    async def _enforce_same_origin(request: Request, call_next):
+        if request.method in _UNSAFE_METHODS:
+            origin = request.headers.get("origin")
+            if origin is not None:
+                parsed = urlsplit(origin)
+                same_origin = (
+                    bool(parsed.scheme)
+                    and bool(parsed.hostname)
+                    and parsed.scheme == request.url.scheme
+                    and parsed.hostname == request.url.hostname
+                    and _effective_port(parsed.scheme, parsed.port)
+                    == _effective_port(request.url.scheme, request.url.port)
+                )
+                if not same_origin:
+                    return PlainTextResponse("Forbidden", status_code=403)
+        return await call_next(request)
+
     # /packages must expose only the practice packages. out_dir also holds
     # web/ (original uploads, job records, logs) and .cache/ (intermediate
     # stems) -- serving those would hand the uploaded source audio to anyone
     # who can make the browser fetch from us. Compare on normalized path
     # segments, not string prefixes, so "//web/..." can't slip through.
-    _BLOCKED_TOPDIRS = {"web", ".cache"}
+    # casefold() so a differently-cased alias of a blocked directory (e.g. a
+    # literal "WEB" folder -- distinct from "web" on a case-sensitive Linux
+    # filesystem, even though the two collide on macOS's default
+    # case-insensitive one) is blocked exactly like the real one; the leading
+    # "." check on every segment (not just the top one) blanket-blocks any
+    # dotfile/dotdir anywhere under a package path, ".cache" included,
+    # instead of enumerating every private dotdir by name.
+    _BLOCKED_TOPDIRS_CF = {"web", ".cache"}
 
     @app.middleware("http")
     async def _block_private_package_paths(request: Request, call_next):
         segments = [s for s in request.url.path.split("/") if s and s != "."]
-        if len(segments) >= 2 and segments[0] == "packages" and (
-            segments[1] in _BLOCKED_TOPDIRS or ".." in segments
-        ):
-            return PlainTextResponse("Not Found", status_code=404)
+        if len(segments) >= 2 and segments[0] == "packages":
+            rest = segments[1:]
+            if (
+                ".." in rest
+                or rest[0].casefold() in _BLOCKED_TOPDIRS_CF
+                or any(seg.startswith(".") for seg in rest)
+            ):
+                return PlainTextResponse("Not Found", status_code=404)
         return await call_next(request)
 
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))

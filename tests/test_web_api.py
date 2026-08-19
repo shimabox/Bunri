@@ -93,7 +93,12 @@ def test_job_reaches_done_and_package_url_is_reachable(client):
 
     _wait_until(lambda: _job_status(client, job_id) == "done")
     detail = client.get(f"/api/jobs/{job_id}").json()
-    assert detail["package_url"] == "/packages/斜陽/斜陽.guitar.player.html"
+    # package_url is percent-encoded (see _serialize_job); non-ASCII bytes
+    # are encoded too, same as any other character outside quote()'s
+    # unreserved set.
+    assert detail["package_url"] == (
+        "/packages/%E6%96%9C%E9%99%BD/%E6%96%9C%E9%99%BD.guitar.player.html"
+    )
 
     player_res = client.get(detail["package_url"])
     assert player_res.status_code == 200
@@ -197,6 +202,99 @@ def test_private_out_dir_areas_are_not_served(client):
     assert client.get(f"/packages/web/jobs/{job_id}.json").status_code == 404
     assert client.get(f"/packages/web/logs/{job_id}.log").status_code == 404
     assert client.get("/packages/.cache/anything").status_code == 404
+
+
+def test_uppercase_private_dir_aliases_are_blocked_via_casefold(client):
+    """Regression for the case-insensitivity bypass: a literal, differently-
+    cased "WEB"/".CACHE" directory must be blocked exactly like the real
+    "web"/".cache" ones -- created here with their real (uppercase) names
+    rather than relying on a lowercase directory being reachable through an
+    uppercase URL, so the bug reproduces on a case-sensitive filesystem
+    (Linux CI) too, not just on macOS's case-insensitive default."""
+    secret_web_dir = client.out_dir / "WEB"
+    secret_web_dir.mkdir(parents=True, exist_ok=True)
+    (secret_web_dir / "secret.txt").write_text("do not leak", encoding="utf-8")
+
+    secret_cache_dir = client.out_dir / ".CACHE"
+    secret_cache_dir.mkdir(parents=True, exist_ok=True)
+    (secret_cache_dir / "secret.txt").write_text("do not leak", encoding="utf-8")
+
+    assert client.get("/packages/WEB/secret.txt").status_code == 404
+    assert client.get("/packages/.CACHE/secret.txt").status_code == 404
+
+
+def test_dotfile_anywhere_under_a_package_path_is_blocked(client):
+    package_dir = client.out_dir / "Song"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / ".secret").write_text("do not leak", encoding="utf-8")
+
+    assert client.get("/packages/Song/.secret").status_code == 404
+
+
+def _write_legacy_job_file(out_dir: Path, job_id: str, **overrides) -> None:
+    """Simulates a job JSON persisted by a server version predating the
+    filename sanitizer's "#"/"%" stripping -- its package_url must still be
+    served as a valid, correctly percent-encoded URL."""
+    import json
+
+    payload = {
+        "id": job_id,
+        "digest": "d-legacy",
+        "title": "Song #1",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:01+00:00",
+        "finished_at": "2026-01-01T00:00:02+00:00",
+        "error": None,
+        "package": "Song #1/Song #1.guitar.player.html",
+        "log": f"web/logs/{job_id}.log",
+        "upload": "web/uploads/song.mp3",
+    }
+    payload.update(overrides)
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_package_url_is_percent_encoded_for_hash_and_space(tmp_path):
+    _write_legacy_job_file(tmp_path, "j-legacy-hash")
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        detail = c.get("/api/jobs/j-legacy-hash").json()
+        assert detail["package_url"] == "/packages/Song%20%231/Song%20%231.guitar.player.html"
+
+
+# ---------------------------------------------------------------------------
+# CSRF: strict same-origin enforcement on unsafe methods
+# ---------------------------------------------------------------------------
+def _post_job(client, *, origin: str | None):
+    headers = {"origin": origin} if origin is not None else {}
+    return client.post(
+        "/api/jobs",
+        files={"file": ("song.mp3", io.BytesIO(b"abc"), "audio/mpeg")},
+        headers=headers,
+    )
+
+
+def test_same_origin_post_is_allowed(client):
+    res = _post_job(client, origin="http://testserver")
+    assert res.status_code in (200, 202)
+
+
+def test_missing_origin_header_is_allowed(client):
+    res = _post_job(client, origin=None)
+    assert res.status_code in (200, 202)
+
+
+def test_cross_port_origin_is_rejected_with_403(client):
+    res = _post_job(client, origin="http://testserver:9999")
+    assert res.status_code == 403
+
+
+def test_hostile_origin_is_rejected_with_403(client):
+    res = _post_job(client, origin="http://evil.example.com")
+    assert res.status_code == 403
 
 
 def test_non_local_host_header_is_rejected(client):
