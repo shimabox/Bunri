@@ -191,13 +191,16 @@ def test_tail_of_a_normal_multi_line_log_is_unchanged_by_the_byte_cap(tmp_path):
 
     log = tmp_path / "small.log"
     log.write_text("\n".join(f"line {i}" for i in range(1, 21)) + "\n", encoding="utf-8")
-    assert _tail(log, 8).splitlines() == [f"line {i}" for i in range(13, 21)]
+    assert _tail(log, 8, expected_logs_dir=tmp_path.resolve()).splitlines() == [f"line {i}" for i in range(13, 21)]
 
     empty = tmp_path / "empty.log"
     empty.write_text("", encoding="utf-8")
-    assert _tail(empty, 8) == "(empty log)"
+    assert _tail(empty, 8, expected_logs_dir=tmp_path.resolve()) == "(empty log)"
 
-    assert _tail(tmp_path / "does-not-exist.log", 8) == "(log file unavailable)"
+    assert (
+        _tail(tmp_path / "does-not-exist.log", 8, expected_logs_dir=tmp_path.resolve())
+        == "(log file unavailable)"
+    )
 
 
 def test_tail_drops_the_partial_first_line_when_it_reads_from_an_offset(tmp_path):
@@ -210,7 +213,7 @@ def test_tail_drops_the_partial_first_line_when_it_reads_from_an_offset(tmp_path
     filler = "F" * (LOG_TAIL_READ_BYTES * 2)  # pushes the window past the start
     log.write_text(f"{filler}\ncomplete line A\ncomplete line B\n", encoding="utf-8")
 
-    result = _tail(log, 8)
+    result = _tail(log, 8, expected_logs_dir=tmp_path.resolve())
 
     assert result.splitlines() == ["complete line A", "complete line B"]
     assert "F" not in result, "the fragment of the truncated line must be dropped"
@@ -567,7 +570,7 @@ def test_terminate_pid_from_sidecar_kills_only_matching_processes(tmp_path):
     proc = _spawn_marked_sleeper()
     try:
         (tmp_path / "j-x.pid").write_text(str(proc.pid))
-        assert terminate_pid_from_sidecar(log) is TerminationOutcome.STOPPED
+        assert terminate_pid_from_sidecar(log, expected_logs_dir=tmp_path.resolve()) is TerminationOutcome.STOPPED
         _wait_until(lambda: proc.poll() is not None)
         assert not (tmp_path / "j-x.pid").exists(), "sidecar must be consumed"
     finally:
@@ -580,7 +583,7 @@ def test_terminate_pid_from_sidecar_kills_only_matching_processes(tmp_path):
     other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
         (tmp_path / "j-x.pid").write_text(str(other.pid))
-        assert terminate_pid_from_sidecar(log) is TerminationOutcome.NOTHING_TO_STOP
+        assert terminate_pid_from_sidecar(log, expected_logs_dir=tmp_path.resolve()) is TerminationOutcome.NOTHING_TO_STOP
         assert other.poll() is None, "unrelated process must be left alone"
     finally:
         other.kill()
@@ -641,7 +644,9 @@ def test_terminate_pid_from_sidecar_escalates_to_sigkill_when_sigterm_is_ignored
         # Short grace period so the SIGTERM poll window elapses quickly and
         # SIGKILL kicks in without slowing the suite down.
         assert (
-            terminate_pid_from_sidecar(log, grace_seconds=0.5, poll_interval=0.05)
+            terminate_pid_from_sidecar(
+                log, expected_logs_dir=tmp_path.resolve(), grace_seconds=0.5, poll_interval=0.05
+            )
             is TerminationOutcome.STOPPED
         )
         _wait_until(lambda: proc.poll() is not None)
@@ -679,7 +684,7 @@ def test_terminate_pid_from_sidecar_keeps_sidecar_when_sigterm_raises_non_lookup
 
         monkeypatch.setattr(jobs_module.os, "killpg", fake_killpg)
 
-        result = terminate_pid_from_sidecar(log)
+        result = terminate_pid_from_sidecar(log, expected_logs_dir=tmp_path.resolve())
 
         assert result is TerminationOutcome.FAILED
         assert (tmp_path / "j-perm.pid").exists(), (
@@ -725,7 +730,7 @@ def test_terminate_pid_from_sidecar_removes_stale_sidecar_when_sigterm_finds_pro
 
         monkeypatch.setattr(jobs_module.os, "killpg", fake_killpg)
 
-        result = terminate_pid_from_sidecar(log)
+        result = terminate_pid_from_sidecar(log, expected_logs_dir=tmp_path.resolve())
 
         assert result is TerminationOutcome.NOTHING_TO_STOP
         assert not (tmp_path / "j-gone.pid").exists(), (
@@ -799,7 +804,9 @@ def test_terminate_pid_from_sidecar_kills_the_whole_process_tree(tmp_path):
         assert _pid_running(grandchild_pid), "grandchild should be alive before we stop anything"
 
         (tmp_path / "j-tree.pid").write_text(str(leader.pid))
-        outcome = terminate_pid_from_sidecar(log, grace_seconds=2.0, poll_interval=0.05)
+        outcome = terminate_pid_from_sidecar(
+            log, expected_logs_dir=tmp_path.resolve(), grace_seconds=2.0, poll_interval=0.05
+        )
 
         assert outcome is TerminationOutcome.STOPPED
         _wait_until(lambda: leader.poll() is not None)
@@ -858,7 +865,8 @@ def test_legacy_non_group_leader_sidecar_is_held_without_signalling_anything(tmp
         (logs_dir / "j-legacy.pid").write_text(str(parent.pid))
 
         outcome = terminate_pid_from_sidecar(
-            logs_dir / "j-legacy.log", grace_seconds=1.0, poll_interval=0.05
+            logs_dir / "j-legacy.log", expected_logs_dir=logs_dir.resolve(),
+            grace_seconds=1.0, poll_interval=0.05,
         )
 
         assert outcome is TerminationOutcome.FAILED
@@ -944,7 +952,9 @@ def test_unverifiable_liveness_holds_the_job_instead_of_assuming_the_process_is_
 
         monkeypatch.setattr(jobs_module.subprocess, "run", _unhelpful_ps(failure_kind))
 
-        outcome = terminate_pid_from_sidecar(logs_dir / "j-unknown.log")
+        outcome = terminate_pid_from_sidecar(
+        logs_dir / "j-unknown.log", expected_logs_dir=logs_dir.resolve()
+    )
 
         assert outcome is TerminationOutcome.FAILED
         assert (logs_dir / "j-unknown.pid").exists(), (
@@ -974,7 +984,9 @@ def test_unreadable_sidecar_holds_the_job_but_a_missing_one_does_not(tmp_path, m
 
     # No sidecar at all -> nothing to stop.
     assert (
-        terminate_pid_from_sidecar(logs_dir / "j-absent.log") is TerminationOutcome.NOTHING_TO_STOP
+        terminate_pid_from_sidecar(
+        logs_dir / "j-absent.log", expected_logs_dir=logs_dir.resolve()
+    ) is TerminationOutcome.NOTHING_TO_STOP
     )
 
     sidecar = logs_dir / "j-unreadable.pid"
@@ -989,7 +1001,9 @@ def test_unreadable_sidecar_holds_the_job_but_a_missing_one_does_not(tmp_path, m
     monkeypatch.setattr(jobs_module.os, "open", denying_open)
 
     assert (
-        terminate_pid_from_sidecar(logs_dir / "j-unreadable.log") is TerminationOutcome.FAILED
+        terminate_pid_from_sidecar(
+        logs_dir / "j-unreadable.log", expected_logs_dir=logs_dir.resolve()
+    ) is TerminationOutcome.FAILED
     )
     assert sidecar.exists(), "an unreadable sidecar must be kept, not silently dropped"
 
@@ -1005,7 +1019,9 @@ def test_garbage_in_the_sidecar_holds_the_job_and_says_it_needs_a_human(tmp_path
     sidecar = logs_dir / "j-garbage.pid"
     sidecar.write_text("not-a-pid")
 
-    assert terminate_pid_from_sidecar(logs_dir / "j-garbage.log") is TerminationOutcome.FAILED
+    assert terminate_pid_from_sidecar(
+        logs_dir / "j-garbage.log", expected_logs_dir=logs_dir.resolve()
+    ) is TerminationOutcome.FAILED
     assert sidecar.exists()
     err = capsys.readouterr().err
     assert "j-garbage.pid" in err
@@ -1028,7 +1044,9 @@ def test_a_confirmed_dead_process_still_yields_nothing_to_stop(tmp_path):
     sidecar = logs_dir / "j-dead.pid"
     sidecar.write_text(str(dead.pid))
 
-    assert terminate_pid_from_sidecar(logs_dir / "j-dead.log") is TerminationOutcome.NOTHING_TO_STOP
+    assert terminate_pid_from_sidecar(
+        logs_dir / "j-dead.log", expected_logs_dir=logs_dir.resolve()
+    ) is TerminationOutcome.NOTHING_TO_STOP
     assert not sidecar.exists(), "a confirmed-stale sidecar is still cleaned up"
 
 
@@ -1779,6 +1797,95 @@ def test_a_symlink_standing_at_a_canonical_log_path_is_refused(
         f"the {planted} symlink was followed and {victim} overwritten"
     )
     assert refused is not None, "the runner must refuse, not silently skip the write"
+
+
+@pytest.mark.parametrize("relocated", ["web/logs", "web"])
+def test_a_relocated_logs_directory_cannot_be_used_to_write_outside_out_dir(
+    tmp_path, monkeypatch, relocated
+):
+    """A symlink at `web/logs` (or at `web`) is the case a "does the parent
+    resolve to the logs directory?" check cannot see, because it is the logs
+    directory that moved: both sides of that comparison resolve to the link's
+    target and it passes by tautology. O_NOFOLLOW does not help either -- it
+    only ever guards the last component, and the intermediate ones are
+    followed as normal.
+
+    With ordinary files waiting at the far end, a perfectly valid job then
+    truncates them: the log with O_TRUNC, the sidecar with its pid. So the
+    expected directory is built from out_dir's own resolved location plus the
+    literal components, which a relocated `web` or `logs` can never equal.
+    """
+    from stemlab.web.jobs import default_runner
+
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    out_dir.mkdir()
+
+    # Whatever is relocated, the victims sit where the job's own files would
+    # land once the link is followed.
+    victim_dir = outside if relocated == "web/logs" else outside / "logs"
+    victim_dir.mkdir(parents=True)
+    victims = {}
+    for name in ("j-x.log", "j-x.pid"):
+        victims[name] = victim_dir / name
+        victims[name].write_bytes(f"{name}: a real file, nothing to do with this server".encode())
+    originals = {name: p.read_bytes() for name, p in victims.items()}
+
+    link = out_dir / relocated
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+
+    upload = out_dir / "web" / "uploads" / "song.mp3"
+    upload.parent.mkdir(parents=True, exist_ok=True)
+    upload.write_bytes(b"fake-audio")
+    _fake_popen_factory(monkeypatch)
+
+    refused = None
+    try:
+        default_runner(upload, out_dir, "Song", "guitar", out_dir / "web" / "logs" / "j-x.log")
+    except OSError as exc:
+        refused = exc
+
+    for name, path in victims.items():
+        assert path.read_bytes() == originals[name], (
+            f"{relocated} was followed and {path} overwritten"
+        )
+    assert refused is not None, "the runner must refuse to write through a relocated logs directory"
+
+
+def test_a_relocated_logs_directory_fails_the_job_but_not_the_server(tmp_path):
+    """The same attack seen from the outside: the job fails, the log outside
+    the tree is untouched, and the server keeps running."""
+    from stemlab.web.jobs import default_runner
+
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    victim = outside / "j-reloc.log"
+    victim.write_bytes(b"a file outside the output tree")
+
+    (out_dir / "web").mkdir(parents=True)
+    (out_dir / "web" / "logs").symlink_to(outside, target_is_directory=True)
+    upload = _make_upload(out_dir)
+
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    (jobs_dir / "j-reloc.json").write_text(json.dumps({
+        "id": "j-reloc", "digest": "dx", "title": "Song", "target": "guitar",
+        "status": "queued", "created_at": "2026-07-12T00:00:00+00:00",
+        "log": "web/logs/j-reloc.log",
+        "upload": str(upload.relative_to(out_dir)),
+    }), encoding="utf-8")
+
+    store = JobStore(out_dir, runner=default_runner)
+    try:
+        _wait_until(lambda: store.get_job("j-reloc").status == "error", timeout=10.0)
+        assert victim.read_bytes() == b"a file outside the output tree"
+        # The server is still serving: another job still goes through the
+        # normal path (and fails on its own merits, not on a dead worker).
+        assert store.get_job("j-reloc").error
+    finally:
+        store.shutdown(join_timeout=5.0)
 
 
 def test_a_running_record_whose_log_path_names_no_file_is_quarantined_not_fatal(tmp_path):

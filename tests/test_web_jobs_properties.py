@@ -25,6 +25,7 @@ Hypothesis runs derandomized here -- see conftest.py.
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -873,24 +874,39 @@ def test_p5_a_job_is_re_run_exactly_when_its_old_process_is_accounted_for(
         store.shutdown(join_timeout=5.0)
 
 
+# The plant and the runner are parametrized rather than drawn. They are the
+# security-critical dimensions and between them have only fourteen values, so
+# sampling them alongside three fuzzed text fields buries them: a hundred
+# examples is not many draws per combination, and a cold run genuinely missed
+# the relocated-directory case. Exhausting them and fuzzing the record around
+# each is both faster and a stronger statement.
+@pytest.mark.parametrize(
+    "plant",
+    [
+        None,
+        "log->inside",
+        "log->outside",
+        "pid->inside",
+        "pid->outside",
+        # Not a link *at* a log path, but the log directory itself moved.
+        # O_NOFOLLOW guards only the last component, and a check that
+        # resolves both sides of "is this the logs directory?" passes by
+        # tautology when that directory *is* the link -- so the files waiting
+        # at the far end get truncated by an entirely valid job.
+        "logs-dir->outside",
+        "web-dir->outside",
+    ],
+)
+# The pid sidecar is only written by the real runner, so a fake one cannot
+# exercise that path at all.
+@pytest.mark.parametrize("real_runner", [False, True])
 @given(
     log=st.one_of(st.none(), _PATH_FIELD, _BLAST_TARGETS),
     upload=st.one_of(st.none(), _PATH_FIELD, _BLAST_TARGETS),
     package=st.one_of(st.none(), _PATH_FIELD, _BLAST_TARGETS),
     status=st.sampled_from(["queued", "running"]),
-    # What is standing at the job's own canonical paths before it starts.
-    # Deriving the log path defends against a record *naming* someone else's
-    # file; it does nothing about a symlink planted at the derived name
-    # itself, which is the more obvious attack precisely because the name is
-    # predictable.
-    plant=st.sampled_from(
-        [None, "log->inside", "log->outside", "pid->inside", "pid->outside"]
-    ),
-    # The pid sidecar is only written by the real runner, so the fake one
-    # cannot exercise that path at all.
-    real_runner=st.booleans(),
 )
-@settings(max_examples=100)
+@settings(max_examples=10)
 def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
     tmp_path_factory, monkeypatch, log, upload, package, status, plant, real_runner
 ):
@@ -931,7 +947,27 @@ def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
     logs_dir.mkdir(parents=True, exist_ok=True)
     own_log = logs_dir / "j-prop-0001.log"
 
-    if plant is not None:
+    if plant in ("logs-dir->outside", "web-dir->outside"):
+        relocated = out_dir / ("web/logs" if plant.startswith("logs") else "web")
+        # Move what is already there to the far side first, so the store
+        # finds the same tree through the link that it would have found
+        # without one -- the record, the upload, all of it. The relocation
+        # has to be invisible to everything except the safety check.
+        if relocated.is_dir() and not relocated.is_symlink():
+            for child in list(relocated.iterdir()):
+                shutil.move(str(child), str(outside / child.name))
+            relocated.rmdir()
+        relocated.parent.mkdir(parents=True, exist_ok=True)
+        relocated.symlink_to(outside, target_is_directory=True)
+        # Ordinary files waiting exactly where this job's log and sidecar
+        # land once the link is followed.
+        landing = outside if plant.startswith("logs") else outside / "logs"
+        landing.mkdir(parents=True, exist_ok=True)
+        for suffix in ("log", "pid"):
+            target = landing / f"j-prop-0001.{suffix}"
+            target.write_bytes(f"{suffix}: a file outside the output tree".encode())
+            sentinels[target] = target
+    elif plant is not None:
         which, _, where = plant.partition("->")
         victim = (
             out_dir / "Song" / "Song.original.mp3" if where == "inside"

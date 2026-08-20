@@ -131,38 +131,61 @@ class UnsafeLogPath(OSError):
     """
 
 
-def _is_the_logs_dir(candidate: Path, logs_dir: Path) -> bool:
-    """True if `candidate` really is the logs directory once symlinks are
-    followed -- not merely somewhere under out_dir, which a symlink inside
-    out_dir pointing at another part of out_dir satisfies happily."""
+def _real_subdir(out_dir: Path, *parts: str) -> Path:
+    """Where `<out_dir>/<parts...>` must *really* be: out_dir's own resolved
+    location plus the literal components.
+
+    The construction matters, and getting it wrong was a live bug. The
+    obvious check -- resolve the candidate, resolve the directory it is
+    supposed to be in, compare -- is a tautology whenever that directory is
+    itself the symlink: with `web/logs -> /outside`, both sides resolve to
+    `/outside` and the comparison passes, and the runner then truncates
+    files there. Only out_dir is resolved here, so the expected value stays
+    a real path inside the real output tree, and a `web` or `logs` that
+    points somewhere else lands the candidate somewhere this value can never
+    equal.
+
+    Resolving out_dir (rather than taking it literally) is equally
+    deliberate in the other direction: out_dir legitimately sits under a
+    symlink on plenty of systems -- /tmp on macOS is one -- and those
+    installations must keep working.
+    """
+    return out_dir.resolve().joinpath(*parts)
+
+
+def _is_really(candidate: Path, expected: Path) -> bool:
+    """True if `candidate` resolves to exactly `expected`. `expected` is used
+    as given -- it is a value built by `_real_subdir`, and resolving it again
+    is precisely the tautology described there."""
     try:
-        return candidate.resolve() == logs_dir.resolve()
+        return candidate.resolve() == expected
     except OSError:
         return False
 
 
-def _open_in_logs_dir(path: Path, *, logs_dir: Path, mode: str):
+def _open_in_logs_dir(path: Path, *, expected_logs_dir: Path, mode: str):
     """The only way anything in this module opens a file under web/logs.
 
-    Two checks, because either alone can be walked around:
+    Two checks, because each catches what the other cannot:
 
-    * `path.parent` must *resolve* to `logs_dir`, which catches web/logs
-      itself having been replaced by a symlink.
+    * `path.parent` must resolve to `expected_logs_dir` -- a value from
+      `_real_subdir`, so this catches `web` or `logs` having been replaced
+      by a symlink to somewhere else entirely.
     * the final component is opened with ``O_NOFOLLOW``, so a symlink *at*
-      the path is refused rather than followed. This is the one that
-      matters most, and the one a resolve()-based check cannot make: the
-      names here are entirely predictable (``web/logs/<id>.log`` and its
-      ``.pid``), so planting a symlink at one of them is the obvious move,
-      and "is the target inside out_dir?" says yes to a link pointing at the
-      user's own audio two directories over. `default_runner` opens the log
-      with O_TRUNC; that is all it takes to destroy the file.
+      the path is refused rather than followed. O_NOFOLLOW only ever guards
+      the last component, which is why the directory check above is not
+      redundant; and the directory check follows intermediate links, which
+      is why O_NOFOLLOW is not redundant either. The names here are entirely
+      predictable (``web/logs/<id>.log`` and its ``.pid``), so planting a
+      symlink at one of them is the obvious move, and `default_runner` opens
+      the log with O_TRUNC -- that is all it takes to destroy the target.
 
     Refusing rather than unlinking-and-replacing the symlink is deliberate:
     the whole point is to stop this server destroying things it was never
     asked to touch, and deleting the link would be one more of them.
     """
-    if not _is_the_logs_dir(path.parent, logs_dir):
-        raise UnsafeLogPath(f"{path} is not directly inside {logs_dir}")
+    if not _is_really(path.parent, expected_logs_dir):
+        raise UnsafeLogPath(f"{path} is not really inside {expected_logs_dir}")
     flags = {
         "rb": os.O_RDONLY,
         "wb": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
@@ -305,7 +328,7 @@ def _leads_own_process_group(pid: int) -> Optional[bool]:
 def terminate_pid_from_sidecar(
     log_path: Path,
     *,
-    logs_dir: Optional[Path] = None,
+    expected_logs_dir: Path,
     marker: str = "stemlab.cli",
     grace_seconds: float = 5.0,
     poll_interval: float = 0.1,
@@ -363,9 +386,7 @@ def terminate_pid_from_sidecar(
     """
     sidecar = _pid_sidecar(log_path)
     try:
-        with _open_in_logs_dir(
-            sidecar, logs_dir=logs_dir if logs_dir is not None else sidecar.parent, mode="rb"
-        ) as f:
+        with _open_in_logs_dir(sidecar, expected_logs_dir=expected_logs_dir, mode="rb") as f:
             raw = f.read().decode("utf-8", errors="replace")
     except FileNotFoundError:
         # No sidecar: the runner never got far enough to write one, or a
@@ -523,16 +544,16 @@ def default_runner(
         "--target",
         target,
     ]
-    logs_dir = Path(out_dir) / "web" / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    (Path(out_dir) / "web" / "logs").mkdir(parents=True, exist_ok=True)
+    expected_logs_dir = _real_subdir(Path(out_dir), "web", "logs")
     sidecar = _pid_sidecar(log_path)
-    with _open_in_logs_dir(log_path, logs_dir=logs_dir, mode="wb") as log_f:
+    with _open_in_logs_dir(log_path, expected_logs_dir=expected_logs_dir, mode="wb") as log_f:
         # The sidecar is opened *before* the process exists, and the spawn is
         # abandoned if that fails. A pid we cannot record is a subprocess
         # nothing can ever reap -- exactly the orphan the sidecar exists to
         # prevent -- so refusing to start is the safe direction, not a
         # best-effort write after the fact.
-        with _open_in_logs_dir(sidecar, logs_dir=logs_dir, mode="wb") as pid_f:
+        with _open_in_logs_dir(sidecar, expected_logs_dir=expected_logs_dir, mode="wb") as pid_f:
             try:
                 proc = subprocess.Popen(
                     cmd, stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True
@@ -681,17 +702,6 @@ def _upload_problem(value: str) -> Optional[str]:
     if candidate.parts[:2] != ("web", "uploads"):
         return f"field 'upload' is not under web/uploads: {value!r}"
     return None
-
-
-def _resolves_inside(base: Path, path: Path) -> bool:
-    """True if `path` really is inside `base` once every symlink on both is
-    followed. String comparison is not enough and never was: `web/logs` (or
-    any directory under out_dir) being a symlink is all it takes for a
-    perfectly innocent-looking relative path to land somewhere else."""
-    try:
-        return path.resolve().is_relative_to(base.resolve())
-    except OSError:
-        return False
 
 
 def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
@@ -965,6 +975,13 @@ class JobStore:
         self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="stemlab-web-worker")
         self._worker.start()
 
+    def _real_logs_dir(self) -> Path:
+        """Recomputed per call rather than cached in __init__: it is a
+        statement about what the filesystem looks like *now*, and a value
+        cached at startup would keep vouching for a directory that has since
+        been replaced."""
+        return _real_subdir(self.out_dir, "web", "logs")
+
     # -- persistence --------------------------------------------------
     def _job_path(self, job_id: str) -> Path:
         return self.jobs_dir / f"{job_id}.json"
@@ -1129,7 +1146,7 @@ class JobStore:
         first made sure its old subprocess is gone. See _load_and_recover."""
         if job.status == "running" and job.log:
             outcome = terminate_pid_from_sidecar(
-                self.out_dir / _log_relpath(job.id), logs_dir=self.logs_dir
+                self.out_dir / _log_relpath(job.id), expected_logs_dir=self._real_logs_dir()
             )
             if outcome is TerminationOutcome.FAILED:
                 # We could not confirm the previous run's process tree is
@@ -1214,7 +1231,7 @@ class JobStore:
         while True:
             for job in running:
                 terminate_pid_from_sidecar(
-                self.out_dir / _log_relpath(job.id), logs_dir=self.logs_dir
+                self.out_dir / _log_relpath(job.id), expected_logs_dir=self._real_logs_dir()
             )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1403,9 +1420,10 @@ class JobStore:
         job.log = _log_relpath(job.id)
         path = self.out_dir / job.log
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not _is_the_logs_dir(path.parent, self.logs_dir):
+        if not _is_really(path.parent, self._real_logs_dir()):
             raise UnsafeLogPath(
-                f"refusing to write the log for {job.id}: {path.parent} is not {self.logs_dir}"
+                f"refusing to write the log for {job.id}: {path.parent} is not really "
+                f"{self._real_logs_dir()}"
             )
         # Neither the log nor its sidecar may already be a symlink. This is
         # checked *before* the runner is called, rather than left to the
@@ -1434,7 +1452,14 @@ class JobStore:
         if not job.upload:
             return None
         candidate = self.out_dir / job.upload
-        if not _resolves_inside(self.uploads_dir, candidate):
+        # `_real_subdir` for the same reason the log path uses it: comparing
+        # against `self.uploads_dir.resolve()` passes by tautology when
+        # web/uploads is itself the symlink.
+        real_uploads = _real_subdir(self.out_dir, "web", "uploads")
+        try:
+            if not candidate.resolve().is_relative_to(real_uploads):
+                return None
+        except OSError:
             return None
         try:
             if not candidate.resolve().is_file():
@@ -1482,7 +1507,9 @@ class JobStore:
         except Exception as exc:  # runner itself blew up (not the subprocess exit code)
             rc = 1
             try:
-                with _open_in_logs_dir(log_path, logs_dir=self.logs_dir, mode="ab") as f:
+                with _open_in_logs_dir(
+                    log_path, expected_logs_dir=self._real_logs_dir(), mode="ab"
+                ) as f:
                     f.write(f"\n[stemlab-web] runner raised: {exc!r}\n".encode())
             except (OSError, ValueError) as log_exc:
                 # Reporting a failure must not itself become one: the job is
@@ -1515,7 +1542,7 @@ class JobStore:
                 job.error = None
             else:
                 job.status = "error"
-                job.error = _tail(log_path, 8, logs_dir=self.logs_dir)
+                job.error = _tail(log_path, 8, expected_logs_dir=self._real_logs_dir())
             self._write_job(job)
 
 
@@ -1550,7 +1577,7 @@ def _clamp_error(text: str) -> str:
     return _TRUNCATION_NOTE + text[-(MAX_ERROR_CHARS - len(_TRUNCATION_NOTE)):]
 
 
-def _tail(log_path: Path, n: int, *, logs_dir: Optional[Path] = None) -> str:
+def _tail(log_path: Path, n: int, *, expected_logs_dir: Path) -> str:
     """Last `n` lines of a log, for a failed job's error message.
 
     Only the final LOG_TAIL_READ_BYTES are read, and the result is clamped to
@@ -1560,9 +1587,7 @@ def _tail(log_path: Path, n: int, *, logs_dir: Optional[Path] = None) -> str:
     see the constants at the top of this module.
     """
     try:
-        with _open_in_logs_dir(
-            log_path, logs_dir=logs_dir if logs_dir is not None else log_path.parent, mode="rb"
-        ) as f:
+        with _open_in_logs_dir(log_path, expected_logs_dir=expected_logs_dir, mode="rb") as f:
             size = f.seek(0, os.SEEK_END)
             start = max(0, size - LOG_TAIL_READ_BYTES)
             f.seek(start)
