@@ -119,15 +119,25 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         if request.method in _UNSAFE_METHODS:
             origin = request.headers.get("origin")
             if origin is not None:
-                parsed = urlsplit(origin)
-                same_origin = (
-                    bool(parsed.scheme)
-                    and bool(parsed.hostname)
-                    and parsed.scheme == request.url.scheme
-                    and parsed.hostname == request.url.hostname
-                    and _effective_port(parsed.scheme, parsed.port)
-                    == _effective_port(request.url.scheme, request.url.port)
-                )
+                try:
+                    parsed = urlsplit(origin)
+                    same_origin = (
+                        bool(parsed.scheme)
+                        and bool(parsed.hostname)
+                        # .port parses lazily and raises ValueError on a
+                        # malformed port ("http://host:not-a-port"), as does
+                        # urlsplit itself on e.g. a broken IPv6 literal. An
+                        # Origin we can't even parse is certainly not this
+                        # origin, so it belongs in the 403 branch below --
+                        # letting the ValueError escape would turn a hostile
+                        # (or merely broken) header into a 500.
+                        and parsed.scheme == request.url.scheme
+                        and parsed.hostname == request.url.hostname
+                        and _effective_port(parsed.scheme, parsed.port)
+                        == _effective_port(request.url.scheme, request.url.port)
+                    )
+                except ValueError:
+                    same_origin = False
                 if not same_origin:
                     return PlainTextResponse("Forbidden", status_code=403)
         return await call_next(request)

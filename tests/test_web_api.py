@@ -297,6 +297,38 @@ def test_hostile_origin_is_rejected_with_403(client):
     assert res.status_code == 403
 
 
+def test_unparseable_origin_port_is_rejected_with_403_not_500(client):
+    """A non-numeric port makes urlsplit's .port raise ValueError. An Origin
+    we can't even parse is certainly not our origin, so it must take the 403
+    branch -- previously the ValueError escaped the middleware and turned a
+    malformed header into a server error."""
+    res = _post_job(client, origin="http://testserver:not-a-port")
+    assert res.status_code == 403
+
+
+def test_timezone_naive_job_file_does_not_break_the_job_list(tmp_path):
+    """A hand-written/legacy job record with a timezone-naive started_at and
+    no finished_at used to make _elapsed_seconds subtract a naive datetime
+    from an aware "now" -> TypeError -> GET /api/jobs 500 for *every* job.
+    Such a record is now rejected at load time (quarantined) instead."""
+    _write_legacy_job_file(
+        tmp_path,
+        "j-naive",
+        status="done",
+        started_at="2026-01-01T00:00:01",  # no UTC offset
+        finished_at=None,
+    )
+    _write_legacy_job_file(tmp_path, "j-fine")
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        res = c.get("/api/jobs")
+        assert res.status_code == 200
+        ids = [j["id"] for j in res.json()]
+        assert "j-naive" not in ids
+        assert "j-fine" in ids
+
+
 def test_non_local_host_header_is_rejected(client):
     """DNS rebinding pins an attacker domain to 127.0.0.1; the Host header is
     the one thing the browser still reports truthfully, so reject foreign ones."""

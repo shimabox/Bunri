@@ -40,6 +40,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -114,43 +115,111 @@ def _process_alive(pid: int, marker: str) -> bool:
     return marker in _process_command(pid)
 
 
+class TerminationOutcome(Enum):
+    """What `terminate_pid_from_sidecar` actually managed to do. Callers must
+    distinguish these three: "nothing was there" and "it's confirmed gone"
+    both mean the job's old subprocess can no longer touch the cache/package
+    files, but "we couldn't stop it" means it may still be running and
+    writing them, so the job must NOT be re-run yet."""
+
+    #: No sidecar, an unreadable one, or one pointing at a process that is
+    #: already gone / whose pid was recycled to something unrelated. Nothing
+    #: needed stopping; any stale sidecar has been cleaned up.
+    NOTHING_TO_STOP = "nothing_to_stop"
+    #: A live, marker-matching process was signalled and confirmed gone (its
+    #: process group swept along with it). The sidecar has been removed.
+    STOPPED = "stopped"
+    #: We tried and can't confirm success -- the signal failed with something
+    #: other than "already gone" (e.g. PermissionError), or the process was
+    #: still alive after SIGKILL. The sidecar is deliberately kept so the
+    #: next startup's recovery gets another chance at it.
+    FAILED = "failed"
+
+
+def _leads_own_process_group(pid: int) -> bool:
+    """True if `pid` is the leader of its own process group (pgid == pid),
+    which is what `default_runner`'s ``start_new_session=True`` arranges.
+
+    This distinction is a safety gate, not a nicety: `os.killpg(pid, ...)`
+    signals *the group whose id equals that number*. If the recorded pid is
+    not a group leader (a sidecar written by an older version of this code,
+    or any process launched without its own session), that number is some
+    other group's -- quite possibly our own server's -- and killpg'ing it
+    would take down the whole server, or nothing at all. So group-signalling
+    is only ever used when we know the pid leads the group.
+    """
+    try:
+        return os.getpgid(pid) == pid
+    except OSError:
+        return False
+
+
+def _signal_tree(pid: int, sig: int, *, group: bool) -> None:
+    """Send `sig` to `pid`'s whole process group (when `pid` leads it) or to
+    `pid` alone otherwise. Raises the same OSErrors os.kill/os.killpg do --
+    ProcessLookupError in particular means the target is already gone."""
+    if group:
+        os.killpg(pid, sig)
+    else:
+        os.kill(pid, sig)
+
+
 def terminate_pid_from_sidecar(
     log_path: Path,
     *,
     marker: str = "stemlab.cli",
     grace_seconds: float = 5.0,
     poll_interval: float = 0.1,
-) -> bool:
+) -> TerminationOutcome:
     """Stop the process a pid sidecar points at, but only if its command line
     still contains `marker` -- pids get recycled, and we must never kill an
     unrelated process that happens to have inherited the number.
 
-    SIGTERM first, then poll for up to `grace_seconds` for it to actually
-    exit; if it's still alive after that, escalate to SIGKILL and poll again.
+    The whole *process group* is signalled, not just the recorded pid: the
+    CLI shells out to ffmpeg (and audio_separator spawns its own helpers), so
+    signalling only the pid we recorded leaves those grandchildren running --
+    observed live, an ffmpeg outliving the CLI that was SIGTERM'd above it.
+    `default_runner` starts the CLI with ``start_new_session=True`` precisely
+    so its pid *is* its process group id and one killpg reaches the whole
+    tree. See `_leads_own_process_group` for why a pid that doesn't lead its
+    own group is signalled individually instead.
+
+    SIGTERM first, then poll for up to `grace_seconds` for the leader to
+    actually exit; if it's still alive after that, escalate to SIGKILL and
+    poll again. Once the leader is confirmed gone, one final best-effort
+    SIGKILL sweeps any group member that outlived it (an ffmpeg that ignored
+    or was slow on SIGTERM); an empty group answers ProcessLookupError, which
+    is the normal case and is ignored.
+
     The sidecar is only removed once the process is confirmed gone -- a job
     resuming that pid before it has actually died would race the exiting
     subprocess over the same cache/package files. If it *still* hasn't died
     even after SIGKILL (a stuck zombie/defunct, essentially never in
-    practice), the sidecar is left in place so the next startup's recovery
-    path gets another chance at it.
+    practice), the sidecar is left in place and FAILED is returned so the
+    next startup's recovery path gets another chance at it.
 
     A stale sidecar (process already gone, or its pid recycled to an
     unrelated process) is removed immediately, same as before. If the SIGTERM
     itself fails with something other than "the process is already gone"
     (e.g. PermissionError -- we don't own it), the process's actual state is
     unknown, so the sidecar is kept rather than discarded, same as the
-    "still alive after SIGKILL" case. Returns True iff a live, marker-
-    matching process was actually signalled.
+    "still alive after SIGKILL" case. See `TerminationOutcome` for what each
+    return value obliges the caller to do.
     """
     sidecar = _pid_sidecar(log_path)
     try:
         pid = int(sidecar.read_text().strip())
     except (OSError, ValueError):
-        return False
+        return TerminationOutcome.NOTHING_TO_STOP
 
     if pid <= 0 or not _process_alive(pid, marker):
         sidecar.unlink(missing_ok=True)
-        return False
+        return TerminationOutcome.NOTHING_TO_STOP
+
+    # Decided *before* any signal: once the leader dies its pgid can no
+    # longer be looked up, and we still need to know whether the final sweep
+    # below is allowed to address the group.
+    group = _leads_own_process_group(pid)
 
     def _wait_until_gone(deadline: float) -> bool:
         while time.monotonic() < deadline:
@@ -159,35 +228,50 @@ def terminate_pid_from_sidecar(
             time.sleep(poll_interval)
         return not _process_alive(pid, marker)
 
+    def _sweep_group() -> None:
+        """Best-effort SIGKILL of whatever is left in the group after its
+        leader is gone. Only ever runs for a group we just verified was led
+        by our marker-matching process, so it can't address a stranger's
+        group -- barring the leader's pid being reaped and immediately
+        recycled *as a new group leader* in the microseconds since the check
+        above, which pids-are-handed-out-sequentially makes vanishingly
+        unlikely and which no cheaper check can rule out."""
+        if not group:
+            return
+        try:
+            os.killpg(pid, 9)  # SIGKILL
+        except OSError:
+            pass  # empty group (the normal case), or not ours to signal
+
     try:
-        os.kill(pid, 15)  # SIGTERM
+        _signal_tree(pid, 15, group=group)  # SIGTERM
     except ProcessLookupError:
         # The process exited between our liveness check above and this
         # signal -- genuinely gone, so the sidecar is stale now too.
         sidecar.unlink(missing_ok=True)
-        return False
+        return TerminationOutcome.NOTHING_TO_STOP
     except OSError:
         # Some other failure (e.g. PermissionError -- we don't own the
         # process) means we don't actually know whether it's still alive.
         # Don't destroy the recovery information: leave the sidecar in
         # place so the next startup's recovery gets another chance at it,
         # same as the "still alive after SIGKILL" case below.
-        return False
+        return TerminationOutcome.FAILED
 
-    if _wait_until_gone(time.monotonic() + grace_seconds):
-        sidecar.unlink(missing_ok=True)
-        return True
+    if not _wait_until_gone(time.monotonic() + grace_seconds):
+        try:
+            _signal_tree(pid, 9, group=group)  # SIGKILL
+        except OSError:
+            pass  # already gone between our last check and here
+        if not _wait_until_gone(time.monotonic() + grace_seconds):
+            # Still alive (or un-reapable) after SIGKILL -- leave the sidecar
+            # for the next startup's recovery to retry, and tell the caller
+            # this job's old process is not safely gone.
+            return TerminationOutcome.FAILED
 
-    try:
-        os.kill(pid, 9)  # SIGKILL
-    except OSError:
-        pass  # already gone between our last check and here
-
-    if _wait_until_gone(time.monotonic() + grace_seconds):
-        sidecar.unlink(missing_ok=True)
-    # else: still alive (or un-reapable) after SIGKILL -- leave the sidecar
-    # for the next startup's recovery to retry.
-    return True
+    _sweep_group()
+    sidecar.unlink(missing_ok=True)
+    return TerminationOutcome.STOPPED
 
 
 def default_runner(
@@ -201,7 +285,15 @@ def default_runner(
 ) -> int:
     """Run the existing `stemlab` CLI as a subprocess (never in-process --
     see module docstring). PATH-independent: uses sys.executable -m rather
-    than relying on a `stemlab` script being on PATH."""
+    than relying on a `stemlab` script being on PATH.
+
+    ``start_new_session=True`` puts the CLI in a brand-new session, so it
+    leads its own process group and every descendant it spawns (ffmpeg,
+    audio_separator's helpers) inherits that group id. Every stop path --
+    `terminate_pid_from_sidecar` on shutdown/recovery, and the timeout
+    escalation below -- then signals the group rather than the lone pid,
+    which is what stops an ffmpeg from outliving the CLI above it and
+    writing the cache concurrently with the job's later re-run."""
     cmd = [
         sys.executable,
         "-m",
@@ -217,12 +309,22 @@ def default_runner(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     sidecar = _pid_sidecar(log_path)
     with log_path.open("wb") as log_f:
-        proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(
+            cmd, stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True
+        )
         sidecar.write_text(str(proc.pid))
         try:
             return proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            # Group-wide, for the same reason the shutdown path is: killing
+            # only the CLI would leave its ffmpeg running long past the
+            # timeout we just declared. Fall back to the lone process if the
+            # group can't be signalled (it should always be ours, given
+            # start_new_session above).
+            try:
+                os.killpg(proc.pid, 9)  # SIGKILL
+            except OSError:
+                proc.kill()
             proc.wait()
             log_f.write(
                 f"\n[stemlab-web] timed out after {timeout}s; process killed\n".encode()
@@ -267,6 +369,28 @@ _OPTIONAL_DATETIME_FIELDS = ("started_at", "finished_at")
 _OPTIONAL_STR_FIELDS = ("error", "package", "log", "upload")
 
 
+def _datetime_problem(value: str, name: str) -> Optional[str]:
+    """None if `value` is an ISO-8601 timestamp this app can actually do
+    arithmetic with, else why it isn't.
+
+    Timezone-awareness is a hard requirement, not a nicety: everything this
+    app writes is UTC-aware (`_now_iso`), and web/app.py's `_elapsed_seconds`
+    subtracts `started_at` from an aware "now" for a still-running job.
+    Python refuses to subtract an aware datetime from a naive one, so a
+    single hand-written naive timestamp in one job file used to raise
+    TypeError and turn the *entire* GET /api/jobs listing into a 500. Reject
+    it at load time (the file gets quarantined) so one bad record can't take
+    the job list down with it.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return f"unparseable ISO-8601 datetime in {name!r}: {value!r}"
+    if parsed.utcoffset() is None:
+        return f"timezone-naive datetime in {name!r} (a UTC offset is required): {value!r}"
+    return None
+
+
 def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
     """Check a decoded job JSON payload against Job's schema before it's
     trusted enough to build a Job from and drive the worker with. Returns
@@ -295,14 +419,12 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
             continue
         if not isinstance(value, str):
             return f"non-string datetime field: {name!r}"
-        try:
-            datetime.fromisoformat(value)
-        except ValueError:
-            return f"unparseable ISO-8601 datetime in {name!r}: {value!r}"
-    try:
-        datetime.fromisoformat(data["created_at"])
-    except ValueError:
-        return f"unparseable ISO-8601 datetime in 'created_at': {data['created_at']!r}"
+        problem = _datetime_problem(value, name)
+        if problem is not None:
+            return problem
+    problem = _datetime_problem(data["created_at"], "created_at")
+    if problem is not None:
+        return problem
     for name in _OPTIONAL_STR_FIELDS:
         value = data.get(name)
         if value is not None and not isinstance(value, str):
@@ -400,7 +522,26 @@ class JobStore:
         pending.sort(key=lambda j: j.created_at)
         for job in pending:
             if job.status == "running" and job.log:
-                terminate_pid_from_sidecar(self.out_dir / job.log)
+                outcome = terminate_pid_from_sidecar(self.out_dir / job.log)
+                if outcome is TerminationOutcome.FAILED:
+                    # We could not confirm the previous run's process tree is
+                    # gone (no permission to signal it, or it survived
+                    # SIGKILL). Re-queueing now is exactly the bug this
+                    # guard exists for: the surviving process keeps writing
+                    # the same cache/package files while a fresh run writes
+                    # them too. So hold the job: leave it "running" on disk,
+                    # untouched, and don't enqueue it. Next startup calls
+                    # this same path again and retries the reap -- and until
+                    # then find_reusable() treating it as in-flight is the
+                    # behaviour we want, since a duplicate upload must not
+                    # start a competing run either.
+                    print(
+                        f"[stemlab-web] job {job.id}: previous run's process could not be "
+                        f"confirmed stopped (pid sidecar kept); leaving it 'running' and "
+                        f"NOT re-running it -- will retry on the next start",
+                        file=sys.stderr,
+                    )
+                    continue
             job.status = "queued"
             job.started_at = None
             self._write_job(job)
