@@ -167,24 +167,34 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
     # source audio.
     _BLOCKED_TOPDIRS_CF = {"web", ".cache"}
 
+    def _names_something_private(parts: "tuple[str, ...] | list[str]") -> bool:
+        """The single rule for which package paths are off limits, stated
+        once and asked twice: of the URL's own segments, and -- after
+        resolving -- of the components the path really has.
+
+        Sharing it is the whole point. These were two rules before, and they
+        disagreed: the URL half casefolded, while the resolved half compared
+        against a literal `out_dir/web`. So on a case-sensitive filesystem
+        `/packages/WEB/...` was refused while `out/Alias -> WEB` served the
+        very same directory, and one asymmetry in a pair of checks that are
+        supposed to mean the same thing is all it takes. Any future rule goes
+        here, where both callers get it.
+        """
+        if not parts:
+            return False
+        return parts[0].casefold() in _BLOCKED_TOPDIRS_CF or any(
+            part.startswith(".") for part in parts
+        )
+
     def _leads_somewhere_private(rest: list[str]) -> bool:
         real_out = out_dir.resolve()
-        # Literal joins for the expected private roots, never resolves of
-        # them -- resolving both sides is the tautology web/jobs.py's
-        # _real_subdir documents at length.
-        private_roots = (real_out / "web", real_out / ".cache")
         try:
             real = real_out.joinpath(*rest).resolve()
         except OSError:
             return True  # unresolvable is not something we are willing to serve
         if not real.is_relative_to(real_out):
             return True
-        if any(real == root or real.is_relative_to(root) for root in private_roots):
-            return True
-        # The dot rule again, applied to the components the path really has:
-        # an alias can launder a dotdir out of the URL just as easily as it
-        # can launder "web".
-        return any(part.startswith(".") for part in real.relative_to(real_out).parts)
+        return _names_something_private(real.relative_to(real_out).parts)
 
     @app.middleware("http")
     async def _block_private_package_paths(request: Request, call_next):
@@ -193,8 +203,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
             rest = segments[1:]
             if (
                 ".." in rest
-                or rest[0].casefold() in _BLOCKED_TOPDIRS_CF
-                or any(seg.startswith(".") for seg in rest)
+                or _names_something_private(rest)
                 or _leads_somewhere_private(rest)
             ):
                 return PlainTextResponse("Not Found", status_code=404)

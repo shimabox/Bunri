@@ -348,6 +348,53 @@ def test_an_internal_alias_symlink_cannot_serve_the_private_directories(tmp_path
         assert c.get(url).status_code == 404
 
 
+@pytest.mark.parametrize(
+    ("real_dir", "url"),
+    [
+        # The case that was getting through: the URL rule casefolded, the
+        # resolved-path rule compared against a literal "web", so the two
+        # disagreed about a directory named WEB. On a case-sensitive
+        # filesystem that is a directory of its own; on a case-insensitive
+        # one it *is* web/, which makes the leak the user's real audio.
+        ("WEB", "/packages/Alias/secret.txt"),
+        ("Web", "/packages/Alias/secret.txt"),
+        (".CACHE", "/packages/Alias/secret.txt"),
+    ],
+)
+def test_an_alias_to_a_differently_cased_private_directory_is_refused(tmp_path, real_dir, url):
+    """Asking the same question of the URL and of the resolved path only
+    works if it really is the same question. It was two questions before, and
+    an alias to `WEB` answered "no" to one and "yes" to the other."""
+    out_dir = tmp_path
+    (out_dir / real_dir).mkdir(parents=True, exist_ok=True)
+    (out_dir / real_dir / "secret.txt").write_bytes(b"private to the server")
+    (out_dir / "Alias").symlink_to(out_dir / real_dir, target_is_directory=True)
+
+    app = create_app(out_dir, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        res = c.get(url)
+        assert res.status_code == 404, f"served {res.content!r} from {real_dir}/"
+        # Direct access stays refused too -- the URL rule was never the
+        # broken half.
+        assert c.get(f"/packages/{real_dir}/secret.txt").status_code == 404
+
+
+def test_an_alias_to_a_dot_directory_deeper_in_the_tree_is_refused(tmp_path):
+    """The dot rule applies to every component of the real path, not just its
+    first: an alias can point at a private directory nested inside an
+    otherwise ordinary package."""
+    out_dir = tmp_path
+    hidden = out_dir / "Song" / ".hidden"
+    hidden.mkdir(parents=True)
+    (hidden / "secret.txt").write_bytes(b"private to the server")
+    (out_dir / "Alias2").symlink_to(hidden, target_is_directory=True)
+
+    app = create_app(out_dir, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        assert c.get("/packages/Alias2/secret.txt").status_code == 404
+        assert c.get("/packages/Song/.hidden/secret.txt").status_code == 404
+
+
 def test_a_real_package_is_still_served_alongside_the_alias_check(tmp_path):
     """The resolve-based check must not cost the ordinary case: a genuine
     package directory still serves."""
