@@ -1640,6 +1640,100 @@ def test_a_record_that_cannot_be_saved_back_is_quarantined_on_load(tmp_path):
     assert store.get_job("j-slim") is not None
 
 
+def test_a_running_record_whose_log_path_names_no_file_is_quarantined_not_fatal(tmp_path):
+    """`log: "/"` passes every type, status and encoding check, and then the
+    recovery path derives a pid sidecar from it -- `Path("/").with_suffix()`,
+    which raises ValueError. That happens outside any per-file handler, so
+    startup died outright and the record was never quarantined: every restart
+    died the same way, and the server could not be brought up at all."""
+    upload = _make_upload(tmp_path)
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (tmp_path / "web" / "logs").mkdir(parents=True)
+    (jobs_dir / "j-rootlog.json").write_text(json.dumps({
+        "id": "j-rootlog", "digest": "dx", "title": "Song", "target": "guitar",
+        "status": "running", "created_at": "2026-07-12T00:00:00+00:00",
+        "started_at": "2026-07-12T00:00:01+00:00",
+        "log": "/",
+        "upload": str(upload.relative_to(tmp_path)),
+    }), encoding="utf-8")
+    _write_raw_job_file(tmp_path, "j-ok", _valid_job_payload(id="j-ok"))
+
+    store = JobStore(tmp_path, runner=FakeRunner())  # must not raise
+
+    assert store.get_job("j-rootlog") is None
+    assert len(_quarantined_names(tmp_path, "j-rootlog")) == 1
+    assert store.get_job("j-ok") is not None, "other jobs must still load"
+
+
+@pytest.mark.parametrize("bad_path", ["/", ".", "..", "/etc/passwd", "../../escape"])
+def test_path_fields_must_be_relative_and_name_a_file(tmp_path, bad_path):
+    """Everything in a record is resolved against out_dir, so a path field
+    that is absolute, climbs out with "..", or names no file at all is not a
+    record this server can work with -- and two of those would let it read or
+    serve files from outside the output directory."""
+    _write_raw_job_file(
+        tmp_path, "j-badpath", _valid_job_payload(id="j-badpath", log=bad_path)
+    )
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    assert store.get_job("j-badpath") is None
+    assert len(_quarantined_names(tmp_path, "j-badpath")) == 1
+
+
+def test_a_multibyte_package_path_is_reserved_in_bytes_not_characters(tmp_path):
+    """The admission check reserves room for fields a transition will
+    overwrite, and that reservation has to be measured in bytes.
+
+    Here the stored `package` has *more characters* than the one the job will
+    derive from its title on success, but far fewer bytes -- the derived one
+    is multi-byte. A character-count comparison therefore reserves nothing,
+    the record is admitted, and succeeding pushes it over the limit, so the
+    job is quarantined on the next start.
+
+    Either outcome is acceptable; what must not happen is accepting it and
+    then writing it oversized."""
+    from stemlab.web.jobs import MAX_JOB_FILE_BYTES
+
+    upload = _make_upload(tmp_path)
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (tmp_path / "web" / "logs").mkdir(parents=True)
+
+    title = "曲" * 60  # derives a ~380-byte package path from ~140 characters
+    payload = {
+        "id": "j-mb", "digest": "", "title": title, "target": "guitar",
+        "status": "queued", "created_at": "2026-07-12T00:00:00+00:00",
+        "started_at": None, "finished_at": None, "error": None,
+        "package": "x" * 150,  # more characters, a quarter of the bytes
+        "log": "web/logs/j-mb.log",
+        "upload": str(upload.relative_to(tmp_path)),
+    }
+    pad = MAX_JOB_FILE_BYTES - 200 - len(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    payload["digest"] = "d" * pad
+    (jobs_dir / "j-mb.json").write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+    )
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+    try:
+        job = store.get_job("j-mb")
+        if job is None:
+            assert len(_quarantined_names(tmp_path, "j-mb")) == 1
+            return  # refused up front: also a correct answer
+        _wait_until(lambda: store.get_job("j-mb").status in ("done", "error"), timeout=10.0)
+        written = (jobs_dir / "j-mb.json").stat().st_size
+        assert written <= MAX_JOB_FILE_BYTES, (
+            f"accepted the record, then grew it to {written} bytes by running -- "
+            "it will be quarantined on the next start"
+        )
+    finally:
+        store.shutdown(join_timeout=5.0)
+
+
 def test_an_over_long_title_is_rejected_on_load(tmp_path):
     """`package` is derived from the title at roughly twice its length, so a
     record with an unbounded title grows *after* it is admitted, the moment

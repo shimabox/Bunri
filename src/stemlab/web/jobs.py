@@ -521,6 +521,8 @@ _OPTIONAL_DATETIME_FIELDS = ("started_at", "finished_at")
 _OPTIONAL_STR_FIELDS = ("error", "package", "log", "upload")
 # Every field of Job that can hold text, for checks that apply to all of them.
 _ALL_STR_FIELDS = _REQUIRED_STR_FIELDS + _OPTIONAL_DATETIME_FIELDS + _OPTIONAL_STR_FIELDS
+# Fields resolved against out_dir, and therefore held to _path_problem's rules.
+_PATH_FIELDS = ("log", "upload", "package")
 
 
 def _datetime_problem(value: str, name: str) -> Optional[str]:
@@ -542,6 +544,32 @@ def _datetime_problem(value: str, name: str) -> Optional[str]:
         return f"unparseable ISO-8601 datetime in {name!r}: {value!r}"
     if parsed.utcoffset() is None:
         return f"timezone-naive datetime in {name!r} (a UTC offset is required): {value!r}"
+    return None
+
+
+def _path_problem(value: str, name: str) -> Optional[str]:
+    """None if `value` is usable as a path relative to `out_dir`, else why it
+    isn't.
+
+    Three rules, all of them load-bearing:
+
+    * It must be relative, and free of ".." segments. Everything in a job
+      record is resolved against `out_dir`, so an absolute path or one that
+      climbs out of it reaches files this server has no business touching --
+      and `package` is served over HTTP.
+    * It must have a name component. `"/"` and `"."` pass every other check
+      and then raise ValueError from `Path.with_suffix` when the pid sidecar
+      is derived from them -- which happens in the recovery path, outside
+      any per-file handler, so a single such record used to abort startup
+      entirely rather than being quarantined.
+    """
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return f"field {name!r} is an absolute path: {value!r}"
+    if ".." in candidate.parts:
+        return f"field {name!r} climbs above the output directory: {value!r}"
+    if not candidate.name:
+        return f"field {name!r} names no file: {value!r}"
     return None
 
 
@@ -620,6 +648,12 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
         # nothing able to clear it. Refuse it here, where it costs one file.
         if "\x00" in value:
             return f"field {name!r} contains a NUL byte"
+    for name in _PATH_FIELDS:
+        value = data.get(name)
+        if isinstance(value, str):
+            problem = _path_problem(value, name)
+            if problem is not None:
+                return problem
     return None
 
 
@@ -690,9 +724,16 @@ def _serialize_job_within_limit(job: Job) -> str:
     return encoded
 
 
+def _utf8_len(text: str) -> int:
+    """Length in bytes, which is the unit MAX_JOB_FILE_BYTES is expressed in.
+    Character counts and byte counts disagree for exactly the text most
+    likely to be near the limit, so anything sizing a record uses this."""
+    return len(text.encode("utf-8", errors="backslashreplace"))
+
+
 def _job_record_bytes(job: Job) -> int:
     """Size on disk of the record `_write_job` would write for `job`."""
-    return len(_serialize_job_within_limit(job).encode("utf-8"))
+    return _utf8_len(_serialize_job_within_limit(job))
 
 
 # The longest string `_now_iso` can produce: ISO-8601 with microseconds and a
@@ -727,14 +768,23 @@ def _fully_grown(job: Job) -> Job:
     `_serialize_job_within_limit` can trim, so it never needs headroom.
     """
     grown = Job.from_dict(job.to_dict())
-    if not grown.log:
-        grown.log = str(Path("web") / "logs" / f"{grown.id}.log")
 
     def reserve(current: Optional[str], replacement: str) -> str:
-        if current is None or len(replacement) > len(current):
+        # Compared in *bytes*, not characters: the limit this feeds is a byte
+        # count, and a multi-byte current value can be the longer of the two
+        # by character count while being the shorter on disk. Measuring
+        # characters here under-reserves for exactly the records most likely
+        # to be near the limit.
+        if current is None:
             return replacement
-        return current
+        return replacement if _utf8_len(replacement) > _utf8_len(current) else current
 
+    # `log` is reserved, not merely defaulted: `_log_path_for` replaces a
+    # value that is present but unusable -- naming a directory, say -- with
+    # the canonical path, which is typically much longer. Reserving the
+    # larger of the two covers that without this needing to know *why* a
+    # replacement might happen, which is the point of doing it structurally.
+    grown.log = reserve(grown.log, str(Path("web") / "logs" / f"{grown.id}.log"))
     grown.started_at = reserve(grown.started_at, _LONGEST_TIMESTAMP)
     grown.finished_at = reserve(grown.finished_at, _LONGEST_TIMESTAMP)
     # Exactly what _run_job builds on success.
@@ -867,7 +917,16 @@ class JobStore:
         # not enough.
         if not job.log:
             job.log = str(Path("web") / "logs" / f"{job.id}.log")
-        saved_bytes = _job_record_bytes(_fully_grown(job))
+        grown = _fully_grown(job)
+        # The package path is *derived* (from the title and the target), so
+        # validating the record's current one isn't enough: a target with a
+        # ".." in it produces an invalid package the moment the job succeeds,
+        # and the record would then be refused on the next load. Check the
+        # value this job would actually produce.
+        problem = _path_problem(grown.package, "package")
+        if problem is not None:
+            return None, f"this job would produce an unusable package path -- {problem}"
+        saved_bytes = _job_record_bytes(grown)
         if saved_bytes > MAX_JOB_FILE_BYTES:
             return None, (
                 f"record cannot be saved back: once this job's timestamps and package "
@@ -911,31 +970,49 @@ class JobStore:
         pending = [j for j in self._jobs.values() if j.status in ("running", "queued")]
         pending.sort(key=lambda j: j.created_at)
         for job in pending:
-            if job.status == "running" and job.log:
-                outcome = terminate_pid_from_sidecar(self.out_dir / job.log)
-                if outcome is TerminationOutcome.FAILED:
-                    # We could not confirm the previous run's process tree is
-                    # gone (no permission to signal it, or it survived
-                    # SIGKILL). Re-queueing now is exactly the bug this
-                    # guard exists for: the surviving process keeps writing
-                    # the same cache/package files while a fresh run writes
-                    # them too. So hold the job: leave it "running" on disk,
-                    # untouched, and don't enqueue it. Next startup calls
-                    # this same path again and retries the reap -- and until
-                    # then find_reusable() treating it as in-flight is the
-                    # behaviour we want, since a duplicate upload must not
-                    # start a competing run either.
-                    print(
-                        f"[stemlab-web] job {job.id}: previous run's process could not be "
-                        f"confirmed stopped (pid sidecar kept); leaving it 'running' and "
-                        f"NOT re-running it -- will retry on the next start",
-                        file=sys.stderr,
-                    )
-                    continue
-            job.status = "queued"
-            job.started_at = None
-            self._write_job(job)
-            self._queue.put(job.id)
+            try:
+                self._recover_pending_job(job)
+            except Exception as exc:
+                # The load phase above establishes "one broken record costs
+                # only itself"; recovery has to honour the same rule, or a
+                # record that passed every admission check and then tripped
+                # something unforeseen here would still abort startup -- and
+                # this phase touches the filesystem through paths that came
+                # out of those records. The job is left exactly as it is on
+                # disk and not enqueued, which is the same conservative hold
+                # a failed reap gets: the next start tries again.
+                _warn(
+                    f"[stemlab-web] job {job.id}: could not be recovered ({exc!r}); "
+                    "leaving it as it stands and continuing with the others"
+                )
+
+    def _recover_pending_job(self, job: Job) -> None:
+        """Re-queue one job left unfinished by the previous server, having
+        first made sure its old subprocess is gone. See _load_and_recover."""
+        if job.status == "running" and job.log:
+            outcome = terminate_pid_from_sidecar(self.out_dir / job.log)
+            if outcome is TerminationOutcome.FAILED:
+                # We could not confirm the previous run's process tree is
+                # gone (no permission to signal it, or it survived SIGKILL).
+                # Re-queueing now is exactly the bug this guard exists for:
+                # the surviving process keeps writing the same cache/package
+                # files while a fresh run writes them too. So hold the job:
+                # leave it "running" on disk, untouched, and don't enqueue
+                # it. Next startup calls this same path again and retries the
+                # reap -- and until then find_reusable() treating it as
+                # in-flight is the behaviour we want, since a duplicate
+                # upload must not start a competing run either.
+                print(
+                    f"[stemlab-web] job {job.id}: previous run's process could not be "
+                    f"confirmed stopped (pid sidecar kept); leaving it 'running' and "
+                    f"NOT re-running it -- will retry on the next start",
+                    file=sys.stderr,
+                )
+                return
+        job.status = "queued"
+        job.started_at = None
+        self._write_job(job)
+        self._queue.put(job.id)
 
     def shutdown(self, *, join_timeout: float = 15.0, poll_interval: float = 0.2) -> None:
         """Graceful-shutdown hook (wired to the app's lifespan): stop the

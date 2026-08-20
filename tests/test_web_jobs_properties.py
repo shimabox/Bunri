@@ -83,6 +83,36 @@ _NASTY = st.sampled_from(
 
 _TEXT = st.one_of(_ANY_TEXT, _NASTY, st.text(max_size=5))
 
+# Values for the fields resolved against out_dir (log / upload / package).
+# Path-shaped rather than merely textual, because what breaks on these is
+# path *semantics*: "/" and "." have no name component and blow up
+# `Path.with_suffix` when the pid sidecar is derived from them; an absolute
+# path or one with ".." escapes the output directory; a value naming an
+# existing directory is replaced at run time by a longer canonical one, which
+# grows the record after it was admitted; and multi-byte names are shorter in
+# characters than in bytes, which is the unit the record limit is in.
+_PATHISH = st.sampled_from(
+    [
+        "/",
+        ".",
+        "..",
+        "../../escape",
+        "/etc/passwd",
+        "web",  # a directory that always exists
+        "web/",
+        "web/logs",
+        "web/logs/j-prop-0001.log",
+        "web/uploads/song.mp3",
+        "曲名/曲名.guitar.player.html",
+        "🎸/🎸.guitar.player.html",
+        "a/",
+        "./x",
+        "nested/deeply/enough/file.log",
+    ]
+)
+
+_PATH_FIELD = st.one_of(st.none(), _TEXT, _PATHISH)
+
 _STATUS = st.sampled_from(["queued", "running", "done", "error"])
 
 _ISO = st.sampled_from(
@@ -110,9 +140,9 @@ def _job_payloads(draw, job_id: str = "j-prop-0001") -> dict:
         "started_at": draw(st.one_of(st.none(), _ISO)),
         "finished_at": draw(st.one_of(st.none(), _ISO)),
         "error": draw(st.one_of(st.none(), _TEXT)),
-        "package": draw(st.one_of(st.none(), _TEXT)),
-        "log": draw(st.one_of(st.none(), _TEXT)),
-        "upload": draw(st.one_of(st.none(), _TEXT)),
+        "package": draw(_PATH_FIELD),
+        "log": draw(_PATH_FIELD),
+        "upload": draw(_PATH_FIELD),
     }
 
 
@@ -359,10 +389,21 @@ def test_p2_a_record_near_the_size_limit_is_accepted_only_if_it_can_be_saved(
     slack=st.integers(min_value=-600, max_value=100),
     succeeds=st.booleans(),
     start_status=st.sampled_from(["queued", "running"]),
+    # Multi-byte titles matter here specifically: `package` is derived from
+    # the title, and a value that is shorter in characters than the one
+    # replacing it can still be longer in bytes -- the unit the limit is in.
+    title=st.sampled_from(["Song", "曲名", "🎸🎸🎸", "曲" * 60, "Ünïcödé Tïtlé"]),
+    # A `log` that is present but unusable (a directory, say) is replaced at
+    # run time by the canonical path, which is longer: growth after
+    # admission, and invisible to a check that only fills in missing fields.
+    log=st.sampled_from(
+        ["web/logs/j-prop-0001.log", "web", "web/logs", "曲.log", "n/d/e/file.log"]
+    ),
+    package=st.one_of(st.none(), st.sampled_from(["x/y.html", "曲名/曲名.guitar.player.html"])),
 )
-@settings(max_examples=60)
+@settings(max_examples=80)
 def test_p2_an_accepted_record_still_fits_after_the_job_actually_runs(
-    tmp_path_factory, slack, succeeds, start_status
+    tmp_path_factory, slack, succeeds, start_status, title, log, package
 ):
     """Admission is a promise about the job's whole life, not about the
     moment it was read.
@@ -383,21 +424,24 @@ def test_p2_an_accepted_record_still_fits_after_the_job_actually_runs(
     upload = _make_upload(tmp_path)
 
     base = {
-        "id": "j-prop-0001", "digest": "", "title": "Song", "target": "guitar",
+        "id": "j-prop-0001", "digest": "", "title": title, "target": "guitar",
         "status": start_status, "created_at": "2026-01-01T00:00:00+00:00",
+        # A stored timestamp without microseconds is seven characters shorter
+        # than the one a re-run writes over it -- more growth to reserve for.
         "started_at": "2026-01-01T00:00:01+00:00" if start_status == "running" else None,
-        "finished_at": None, "error": None, "package": None,
-        "log": "web/logs/j-prop-0001.log",
+        "finished_at": None, "error": None, "package": package,
+        "log": log,
         "upload": str(upload.relative_to(tmp_path)),
     }
     # Padding in `digest`: uncapped and untrimmable, so it puts the record
-    # near the boundary without tripping a different rule first.
-    filler = MAX_JOB_FILE_BYTES + slack - len(json.dumps(base, separators=(",", ":")))
+    # near the boundary without tripping a different rule first. Measured in
+    # bytes, since that is what the limit counts.
+    encoded_len = len(json.dumps(base, separators=(",", ":")).encode("utf-8"))
+    filler = MAX_JOB_FILE_BYTES + slack - encoded_len
     assume(filler > 0)
     base["digest"] = "d" * filler
-    (jobs_dir / "j-prop-0001.json").write_text(
-        json.dumps(base, separators=(",", ":")), encoding="utf-8"
-    )
+    text = json.dumps(base, separators=(",", ":"))
+    (jobs_dir / "j-prop-0001.json").write_text(text, encoding="utf-8")
 
     runner = FakeRunner(returncode=0 if succeeds else 1, write_player=succeeds)
     store = JobStore(tmp_path, runner=runner)
@@ -415,9 +459,8 @@ def test_p2_an_accepted_record_still_fits_after_the_job_actually_runs(
 
         written = (jobs_dir / "j-prop-0001.json").stat().st_size
         assert written <= MAX_JOB_FILE_BYTES, (
-            f"a record accepted at {len(json.dumps(base, separators=(',', ':')))} bytes grew "
-            f"to {written} by running -- over the limit, so the job will be quarantined "
-            "on the next start"
+            f"a record accepted at {len(text.encode('utf-8'))} bytes grew to {written} "
+            "by running -- over the limit, so the job will be quarantined on the next start"
         )
     finally:
         store.shutdown(join_timeout=5.0)
