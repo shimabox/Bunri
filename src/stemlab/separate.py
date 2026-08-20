@@ -15,6 +15,7 @@ import hashlib
 import os
 import re
 import secrets
+import shutil
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -322,6 +323,31 @@ def _bootstrap_becruily(separator: Any) -> None:
     _inject_becruily_catalog(separator)
 
 
+def _new_staging_dir(work_dir: Path) -> Path:
+    """A fresh directory for one separation attempt's raw output.
+
+    audio-separator writes its stems itself, so those writes cannot be routed
+    through `safepath.replace_into` the way ours are -- and the names it
+    picks are predictable ("input_(Guitar)_<model>.wav", or whatever
+    custom_output_names asked for). Dropping them straight into the cache
+    directory therefore left a symlink planted at one of those names free to
+    be followed, and the separation would overwrite whatever it pointed at.
+
+    The defence is the name: the library writes into a directory whose name
+    was chosen at random a moment earlier, so there is nothing to plant a
+    link *in* ahead of time. `mkdir` without exist_ok, so this can only ever
+    be a directory this call created -- it can never adopt something that was
+    already sitting there.
+
+    The results are moved out of here into the cache directory afterwards, by
+    the same replace-the-name mechanics everything else uses, and the staging
+    directory is removed either way.
+    """
+    stage_dir = work_dir / f".sep-tmp-{secrets.token_hex(8)}"
+    stage_dir.mkdir()
+    return stage_dir
+
+
 def _run_separation(
     separator_cls: Any,
     work_dir: Path,
@@ -465,79 +491,91 @@ def separate(
     # (_partition_stems).
     is_default = model is None
     model_name = model if model is not None else spec.default_model
+    # Everything from here to the `finally` runs against a staging directory
+    # rather than work_dir itself -- see _new_staging_dir for why.
+    stage_dir = _new_staging_dir(work_dir)
     try:
-        output_files = _run_separation(
-            Separator, work_dir, device, model_name, input_wav, target_wav, spec.stem_name
-        )
-    except RuntimeError as exc:
-        # Only fall back when the caller didn't override the model (i.e. the
-        # default was used) and a fallback is actually registered and
-        # distinct from the default. A model the caller picked explicitly
-        # must fail loudly, not be silently swapped out from under them, and
-        # the fallback target itself must never retry against itself.
-        can_fall_back = (
-            is_default
-            and spec.fallback_model is not None
-            and spec.default_model != spec.fallback_model
-        )
-        if not can_fall_back:
-            raise
-        assert spec.fallback_model is not None
-        console.print(
-            f"[yellow]separate: default model {model_name!r} failed ({exc}); "
-            f"falling back to {spec.fallback_model!r}[/yellow]"
-        )
         try:
             output_files = _run_separation(
-                Separator, work_dir, device, spec.fallback_model, input_wav, target_wav,
-                spec.stem_name,
+                Separator, stage_dir, device, model_name, input_wav, target_wav, spec.stem_name
             )
-        except RuntimeError as fallback_exc:
+        except RuntimeError as exc:
+            # Only fall back when the caller didn't override the model (i.e. the
+            # default was used) and a fallback is actually registered and
+            # distinct from the default. A model the caller picked explicitly
+            # must fail loudly, not be silently swapped out from under them, and
+            # the fallback target itself must never retry against itself.
+            can_fall_back = (
+                is_default
+                and spec.fallback_model is not None
+                and spec.default_model != spec.fallback_model
+            )
+            if not can_fall_back:
+                raise
+            assert spec.fallback_model is not None
+            console.print(
+                f"[yellow]separate: default model {model_name!r} failed ({exc}); "
+                f"falling back to {spec.fallback_model!r}[/yellow]"
+            )
+            # A fresh staging directory for the retry: the failed attempt may
+            # have left partial stems behind, and they must not be mistaken for
+            # the fallback model's output.
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            stage_dir = _new_staging_dir(work_dir)
+            try:
+                output_files = _run_separation(
+                    Separator, stage_dir, device, spec.fallback_model, input_wav, target_wav,
+                    spec.stem_name,
+                )
+            except RuntimeError as fallback_exc:
+                raise RuntimeError(
+                    f"separation failed with both the default model ({exc}) and "
+                    f"the {spec.fallback_model!r} fallback ({fallback_exc})"
+                ) from fallback_exc
+            model_name = spec.fallback_model
+
+        if not output_files:
             raise RuntimeError(
-                f"separation failed with both the default model ({exc}) and "
-                f"the {spec.fallback_model!r} fallback ({fallback_exc})"
-            ) from fallback_exc
-        model_name = spec.fallback_model
+                f"audio-separator produced no stems for {input_wav} with model "
+                f"{model_name!r}"
+            )
 
-    if not output_files:
-        raise RuntimeError(
-            f"audio-separator produced no stems for {input_wav} with model "
-            f"{model_name!r}"
+        # Separator.separate() returns filenames relative to output_dir, not
+        # full paths.
+        produced: list[Path] = []
+        for f in output_files:
+            p = Path(f)
+            if not p.is_absolute():
+                p = stage_dir / p
+            if not p.exists():
+                raise RuntimeError(f"expected separated stem at {p} but it is missing")
+            produced.append(p)
+
+        target_path, other_paths = _partition_stems(produced, target_wav, spec.stem_name)
+        if target_path is None:
+            raise RuntimeError(
+                f"audio-separator produced no '{spec.stem_name}' stem for {input_wav} "
+                f"with model {model_name!r} "
+                f"(stems produced: {[p.name for p in produced]}; "
+                f"does this model have a '{spec.stem_name}' stem?)"
+            )
+        if not other_paths:
+            raise RuntimeError(
+                f"model {model_name!r} produced only a '{spec.stem_name}' "
+                "stem; a backing track needs at least one other stem to combine"
+            )
+
+        # os.replace, so a symlink planted at target_wav is replaced rather
+        # than written through -- the same reason safepath.replace_into
+        # exists, and why the backing track below goes through it.
+        os.replace(target_path, target_wav)
+        _write_backing_track(other_paths, backing_wav)
+
+        # The per-stem files folded into backing.wav aren't part of
+        # separate()'s contract (target_wav + backing_wav), and they never
+        # leave the staging directory that the `finally` below removes.
+        return SeparationResult(
+            target_wav=target_wav, backing_wav=backing_wav, model_used=model_name
         )
-
-    # Separator.separate() returns filenames relative to output_dir, not full paths.
-    produced: list[Path] = []
-    for f in output_files:
-        p = Path(f)
-        if not p.is_absolute():
-            p = work_dir / p
-        if not p.exists():
-            raise RuntimeError(f"expected separated stem at {p} but it is missing")
-        produced.append(p)
-
-    target_path, other_paths = _partition_stems(produced, target_wav, spec.stem_name)
-    if target_path is None:
-        raise RuntimeError(
-            f"audio-separator produced no '{spec.stem_name}' stem for {input_wav} "
-            f"with model {model_name!r} "
-            f"(stems produced: {[p.name for p in produced]}; "
-            f"does this model have a '{spec.stem_name}' stem?)"
-        )
-    if not other_paths:
-        raise RuntimeError(
-            f"model {model_name!r} produced only a '{spec.stem_name}' "
-            "stem; a backing track needs at least one other stem to combine"
-        )
-
-    if target_path != target_wav:
-        target_path.replace(target_wav)
-
-    _write_backing_track(other_paths, backing_wav)
-
-    # The per-stem files folded into backing.wav aren't part of separate()'s
-    # contract (target_wav + backing_wav); drop them so they don't sit around
-    # as dead weight in work_dir.
-    for p in other_paths:
-        p.unlink(missing_ok=True)
-
-    return SeparationResult(target_wav=target_wav, backing_wav=backing_wav, model_used=model_name)
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)

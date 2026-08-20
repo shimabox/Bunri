@@ -264,7 +264,13 @@ def test_run_builds_separator_and_calls_api_correctly(tmp_path, monkeypatch):
     fake = FakeSeparator.instances[0]
 
     assert fake.init_kwargs["model_file_dir"] == str(separate_module._MODEL_DIR)
-    assert fake.init_kwargs["output_dir"] == str(work_dir)
+    # Not work_dir itself: the library writes into a freshly-created,
+    # randomly-named staging directory under it, so there is no predictable
+    # name for a symlink to be planted at (see _new_staging_dir). The results
+    # are moved into work_dir afterwards.
+    output_dir = Path(fake.init_kwargs["output_dir"])
+    assert output_dir.parent == work_dir
+    assert output_dir.name.startswith(".sep-tmp-")
     # No output_single_stem: every stem must come back so the non-guitar ones
     # can be combined into backing.wav.
     assert fake.init_kwargs["output_single_stem"] is None
@@ -710,3 +716,65 @@ def test_run_system_exit_from_load_model_becomes_runtime_error(tmp_path, monkeyp
         separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
 
     assert len(SystemExitOnLoadFakeSeparator.instances) == 1
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        "guitar.wav",  # the custom_output_names rename the target stem asks for
+        "mix_(Guitar)_htdemucs_6s.wav",  # audio-separator's own default name
+        "mix_(Bass)_htdemucs_6s.wav",  # a non-target stem, folded into backing
+        "guitar.backing.wav",
+    ],
+)
+def test_separate_never_writes_through_a_symlink_planted_in_work_dir(
+    tmp_path, monkeypatch, planted
+):
+    """audio-separator writes its stems itself, so those writes cannot be
+    routed through safepath.replace_into the way ours are -- and every name it
+    picks is predictable. Pointing it at the cache directory therefore left a
+    symlink planted at one of those names free to be followed, and the
+    separation overwrote whatever it pointed at.
+
+    The library now writes into a randomly-named staging directory instead,
+    where nothing can be planted ahead of time, and the results are moved out
+    by name afterwards.
+    """
+    monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
+    input_wav, work_dir = _prepare(tmp_path)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "precious.dat"
+    victim.write_bytes(b"a file with nothing to do with this separation")
+    original = victim.read_bytes()
+
+    (work_dir / planted).symlink_to(victim)
+
+    result = separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
+
+    assert victim.read_bytes() == original, f"writing {planted} followed the symlink"
+    for produced in (result.target_wav, result.backing_wav):
+        assert produced.exists() and not produced.is_symlink()
+        assert produced.stat().st_size > 0
+
+
+def test_separate_leaves_no_staging_directory_behind(tmp_path, monkeypatch):
+    """On the way out, either way. A staging directory per attempt is only
+    acceptable if they do not accumulate in the user's cache."""
+    monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
+    input_wav, work_dir = _prepare(tmp_path)
+
+    separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
+    assert [p.name for p in work_dir.glob(".sep-tmp-*")] == []
+
+    # And on the failing path: an explicit model never falls back, so this
+    # raises straight out of the attempt.
+    class _FailingSeparator(FakeSeparator):
+        def separate(self, audio_file_path, custom_output_names=None):
+            raise RuntimeError("simulated: the model blew up")
+
+    monkeypatch.setattr(separator_module, "Separator", _FailingSeparator)
+    with pytest.raises(RuntimeError):
+        separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
+    assert [p.name for p in work_dir.glob(".sep-tmp-*")] == []
