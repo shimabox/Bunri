@@ -605,7 +605,15 @@ class JobStore:
         for path in sorted(self.jobs_dir.glob("j-*.json")):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+            except (OSError, ValueError) as exc:
+                # ValueError rather than json.JSONDecodeError: decoding runs
+                # before parsing, and a file with bytes that aren't valid
+                # UTF-8 raises UnicodeDecodeError. Both are ValueError
+                # subclasses, and both mean the same thing here -- this file
+                # is not a job record we can read -- so catching the base
+                # class keeps a truncated/corrupted write from taking the
+                # whole server's startup down instead of just quarantining
+                # the one bad file.
                 self._quarantine_job_file(path, f"unreadable/invalid JSON: {exc}")
                 continue
             # The id a well-formed file for this path *should* have -- ".json"

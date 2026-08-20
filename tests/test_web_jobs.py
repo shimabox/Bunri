@@ -1355,6 +1355,29 @@ def test_malformed_json_is_quarantined_and_startup_continues(tmp_path):
     assert store.get_job("j-good") is not None
 
 
+def test_invalid_utf8_bytes_are_quarantined_and_startup_continues(tmp_path):
+    """A job file whose *bytes* aren't valid UTF-8 fails during decoding,
+    before JSON parsing ever gets a look -- a UnicodeDecodeError, not a
+    JSONDecodeError. Catching only the latter let one corrupted file abort
+    JobStore construction outright, taking the whole server's startup with
+    it instead of quarantining the file and carrying on."""
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (jobs_dir / "j-bad-bytes.json").write_bytes(b"\xff\xfe{\"id\": \"j-bad-bytes\"}")
+    _write_raw_job_file(tmp_path, "j-readable", _valid_job_payload(id="j-readable"))
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    names = [p.name for p in jobs_dir.iterdir()]
+    assert "j-bad-bytes.json" not in names, "the undecodable file must be moved aside"
+    quarantined = _quarantined_names(tmp_path, "j-bad-bytes")
+    assert len(quarantined) == 1, names
+    # Quarantine keeps the original bytes intact for anyone who wants to
+    # inspect them, under a name that can't collide with another bad file.
+    assert (jobs_dir / quarantined[0]).read_bytes().startswith(b"\xff\xfe")
+    assert store.get_job("j-readable") is not None, "other jobs must still load"
+
+
 def test_wrong_type_field_is_quarantined(tmp_path):
     _write_raw_job_file(tmp_path, "j-bad-type", _valid_job_payload(id="j-bad-type", digest=123))
     store = JobStore(tmp_path, runner=FakeRunner())
