@@ -1422,21 +1422,57 @@ def test_oversized_job_file_is_quarantined_without_being_parsed(tmp_path):
     assert store.get_job("j-small") is not None
 
 
-def test_a_job_file_just_under_the_size_limit_still_loads(tmp_path):
-    """The size cap must not become a new way to lose good records: a
-    legitimately chatty job (a long error tail, a multi-byte title) is
-    nowhere near the limit and has to keep loading."""
+def test_a_job_file_at_exactly_the_size_limit_still_loads(tmp_path):
+    """Pins the boundary itself: the cap rejects files *over* the limit, so
+    a record of exactly MAX_JOB_FILE_BYTES must still load. Sized to the byte
+    (ASCII padding only, so len(json) == st_size) -- a comfortably smaller
+    fixture would pass even if the check regressed to `>=`, which is exactly
+    the mistake this guards against.
+    """
     from stemlab.web.jobs import MAX_JOB_FILE_BYTES
 
-    payload = _valid_job_payload(id="j-chatty", status="error", error="ffmpeg said no. " * 500)
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    path = jobs_dir / "j-chatty.json"
+
+    # Grow the (ASCII) error tail until the encoded record lands exactly on
+    # the limit. json.dumps adds no surprises here: every padding byte costs
+    # exactly one byte in the output.
+    payload = _valid_job_payload(id="j-chatty", status="error", error="")
+    padding = MAX_JOB_FILE_BYTES - len(json.dumps(payload))
+    assert padding > 0, "the limit must leave room for a real record"
+    payload["error"] = "x" * padding
     encoded = json.dumps(payload)
-    assert len(encoded) < MAX_JOB_FILE_BYTES
-    _write_raw_job_file(tmp_path, "j-chatty", payload)
+    assert len(encoded) == MAX_JOB_FILE_BYTES
+
+    path.write_text(encoded, encoding="utf-8")
+    assert path.stat().st_size == MAX_JOB_FILE_BYTES, "fixture must sit exactly on the boundary"
 
     store = JobStore(tmp_path, runner=FakeRunner())
 
-    assert store.get_job("j-chatty") is not None
+    assert store.get_job("j-chatty") is not None, "a file *at* the limit is not over it"
     assert _quarantined_names(tmp_path, "j-chatty") == []
+
+
+def test_a_job_file_one_byte_over_the_size_limit_is_quarantined(tmp_path):
+    """The other half of the boundary: one byte past the limit is rejected.
+    Together with the test above this pins the comparison exactly, so
+    neither loosening nor tightening it by one can slip through."""
+    from stemlab.web.jobs import MAX_JOB_FILE_BYTES
+
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    path = jobs_dir / "j-onebyte.json"
+
+    payload = _valid_job_payload(id="j-onebyte", status="error", error="")
+    payload["error"] = "x" * (MAX_JOB_FILE_BYTES - len(json.dumps(payload)) + 1)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert path.stat().st_size == MAX_JOB_FILE_BYTES + 1
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    assert store.get_job("j-onebyte") is None
+    assert len(_quarantined_names(tmp_path, "j-onebyte")) == 1
 
 
 def test_wrong_type_field_is_quarantined(tmp_path):
