@@ -44,6 +44,7 @@ from stemlab.web.jobs import (
     _job_record_bytes,
     _serialize_job_within_limit,
     _validate_job_record,
+    default_runner,
     safe_filename,
 )
 
@@ -165,6 +166,20 @@ def _plant_sentinels(out_dir: Path, outside: Path) -> dict[Path, Path]:
     ]]
     watched.append(outside / "secret.txt")
     return {p: p for p in watched}
+
+
+def _neuter_spawn(monkeypatch) -> None:
+    """Let `default_runner` run its real file handling without launching the
+    separation CLI (and torch) behind it."""
+    from stemlab.web import jobs as jobs_module
+
+    class _InstantProc:
+        pid = 4242
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(jobs_module.subprocess, "Popen", lambda *a, **kw: _InstantProc())
 
 
 def _fingerprint(paths: dict[Path, Path]) -> dict[Path, object]:
@@ -863,10 +878,21 @@ def test_p5_a_job_is_re_run_exactly_when_its_old_process_is_accounted_for(
     upload=st.one_of(st.none(), _PATH_FIELD, _BLAST_TARGETS),
     package=st.one_of(st.none(), _PATH_FIELD, _BLAST_TARGETS),
     status=st.sampled_from(["queued", "running"]),
+    # What is standing at the job's own canonical paths before it starts.
+    # Deriving the log path defends against a record *naming* someone else's
+    # file; it does nothing about a symlink planted at the derived name
+    # itself, which is the more obvious attack precisely because the name is
+    # predictable.
+    plant=st.sampled_from(
+        [None, "log->inside", "log->outside", "pid->inside", "pid->outside"]
+    ),
+    # The pid sidecar is only written by the real runner, so the fake one
+    # cannot exercise that path at all.
+    real_runner=st.booleans(),
 )
-@settings(max_examples=80)
+@settings(max_examples=100)
 def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
-    tmp_path_factory, log, upload, package, status
+    tmp_path_factory, monkeypatch, log, upload, package, status, plant, real_runner
 ):
     """A job record says what a job *is*, not what files the server may
     write. Nothing a record can say may cause anything outside that job's own
@@ -901,13 +927,31 @@ def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
         "upload": upload if upload is not None else str(upload_file.relative_to(out_dir)),
     }
     (jobs_dir / "j-prop-0001.json").write_text(json.dumps(record), encoding="utf-8")
-    own_log = out_dir / "web" / "logs" / "j-prop-0001.log"
+    logs_dir = out_dir / "web" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    own_log = logs_dir / "j-prop-0001.log"
+
+    if plant is not None:
+        which, _, where = plant.partition("->")
+        victim = (
+            out_dir / "Song" / "Song.original.mp3" if where == "inside"
+            else outside / "secret.txt"
+        )
+        (logs_dir / f"j-prop-0001.{which}").symlink_to(victim)
 
     before = _fingerprint(sentinels)
-    # A runner that writes no player, so the *only* write this job is entitled
-    # to make is its own log. (A successful job legitimately creates its
-    # package; allowing that here would blunt the assertion below.)
-    store = JobStore(out_dir, runner=FakeRunner(returncode=1, write_player=False))
+    if real_runner:
+        # default_runner for real, minus the separation subprocess: its file
+        # operations (the truncating log open, the sidecar write) are the
+        # dangerous ones and they run exactly as they do in production.
+        _neuter_spawn(monkeypatch)
+        runner = default_runner
+    else:
+        # A runner that writes no player, so the *only* write this job is
+        # entitled to make is its own log. (A successful job legitimately
+        # creates its package; allowing that would blunt the assertion.)
+        runner = FakeRunner(returncode=1, write_player=False)
+    store = JobStore(out_dir, runner=runner)
     try:
         # Let the worker get as far as it is ever going to.
         _wait_until(

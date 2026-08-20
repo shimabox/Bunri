@@ -979,14 +979,14 @@ def test_unreadable_sidecar_holds_the_job_but_a_missing_one_does_not(tmp_path, m
 
     sidecar = logs_dir / "j-unreadable.pid"
     sidecar.write_text("12345")
-    real_read_text = jobs_module.Path.read_text
+    real_open = jobs_module.os.open
 
-    def denying_read_text(self, *args, **kwargs):
-        if self.name == "j-unreadable.pid":
+    def denying_open(path, *args, **kwargs):
+        if str(path).endswith("j-unreadable.pid"):
             raise PermissionError("simulated: sidecar not readable")
-        return real_read_text(self, *args, **kwargs)
+        return real_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(jobs_module.Path, "read_text", denying_read_text)
+    monkeypatch.setattr(jobs_module.os, "open", denying_open)
 
     assert (
         terminate_pid_from_sidecar(logs_dir / "j-unreadable.log") is TerminationOutcome.FAILED
@@ -1711,6 +1711,74 @@ def test_a_symlinked_log_directory_cannot_be_used_to_write_outside_out_dir(tmp_p
         assert len(_quarantined_names(out_dir, "j-escape")) == 1
     finally:
         store.shutdown(join_timeout=5.0)
+
+
+def _fake_popen_factory(monkeypatch, pid: int = 4242):
+    """Make default_runner's spawn a no-op, so its *file* operations -- the
+    truncating log open and the pid sidecar write, which are the dangerous
+    ones -- run for real without launching the separation CLI (and torch)."""
+    from stemlab.web import jobs as jobs_module
+
+    class _InstantProc:
+        def __init__(self):
+            self.pid = pid
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(jobs_module.subprocess, "Popen", lambda *a, **kw: _InstantProc())
+
+
+@pytest.mark.parametrize("planted", ["log", "pid"])
+@pytest.mark.parametrize("target", ["inside", "outside"])
+def test_a_symlink_standing_at_a_canonical_log_path_is_refused(
+    tmp_path, monkeypatch, planted, target
+):
+    """Deriving the log path is not enough on its own: the derived names are
+    entirely predictable, so a symlink planted *at* `web/logs/<id>.log` (or
+    at its `.pid`) is followed by an ordinary open, and `default_runner`
+    opens the log with O_TRUNC. "Does it resolve inside out_dir?" says yes to
+    a link pointing at the user's own audio two directories over, so the
+    final component is opened with O_NOFOLLOW instead.
+
+    The `.pid` half matters just as much and had no check at all: the sidecar
+    is written with the process id, so a link there overwrites its target
+    with a number.
+    """
+    from stemlab.web.jobs import default_runner
+
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    logs_dir = out_dir / "web" / "logs"
+    logs_dir.mkdir(parents=True)
+
+    if target == "inside":
+        victim = out_dir / "Song" / "Song.original.mp3"
+        victim.parent.mkdir(parents=True)
+    else:
+        victim = outside / "secret.txt"
+    victim.write_bytes(b"a file this server was never asked to touch")
+    original = victim.read_bytes()
+
+    log_path = logs_dir / "j-plant.log"
+    (logs_dir / f"j-plant.{'log' if planted == 'log' else 'pid'}").symlink_to(victim)
+
+    upload = _make_upload(out_dir)
+    _fake_popen_factory(monkeypatch)
+
+    refused = None
+    try:
+        default_runner(upload, out_dir, "Song", "guitar", log_path)
+    except OSError as exc:
+        refused = exc
+
+    # The damage first: that is what actually matters, and it makes the
+    # failure message say what was destroyed rather than what wasn't raised.
+    assert victim.read_bytes() == original, (
+        f"the {planted} symlink was followed and {victim} overwritten"
+    )
+    assert refused is not None, "the runner must refuse, not silently skip the write"
 
 
 def test_a_running_record_whose_log_path_names_no_file_is_quarantined_not_fatal(tmp_path):

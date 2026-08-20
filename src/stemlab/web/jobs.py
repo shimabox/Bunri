@@ -122,6 +122,67 @@ def new_job_id() -> str:
 Runner = Callable[[Path, Path, str, str, Path], int]
 
 
+class UnsafeLogPath(OSError):
+    """Refusal to open something under web/logs that is not what it claims.
+
+    Deliberately an OSError: every caller of log I/O in this module already
+    handles OSError from a missing or unreadable file, so a refusal degrades
+    along a path that already exists instead of needing a new one.
+    """
+
+
+def _is_the_logs_dir(candidate: Path, logs_dir: Path) -> bool:
+    """True if `candidate` really is the logs directory once symlinks are
+    followed -- not merely somewhere under out_dir, which a symlink inside
+    out_dir pointing at another part of out_dir satisfies happily."""
+    try:
+        return candidate.resolve() == logs_dir.resolve()
+    except OSError:
+        return False
+
+
+def _open_in_logs_dir(path: Path, *, logs_dir: Path, mode: str):
+    """The only way anything in this module opens a file under web/logs.
+
+    Two checks, because either alone can be walked around:
+
+    * `path.parent` must *resolve* to `logs_dir`, which catches web/logs
+      itself having been replaced by a symlink.
+    * the final component is opened with ``O_NOFOLLOW``, so a symlink *at*
+      the path is refused rather than followed. This is the one that
+      matters most, and the one a resolve()-based check cannot make: the
+      names here are entirely predictable (``web/logs/<id>.log`` and its
+      ``.pid``), so planting a symlink at one of them is the obvious move,
+      and "is the target inside out_dir?" says yes to a link pointing at the
+      user's own audio two directories over. `default_runner` opens the log
+      with O_TRUNC; that is all it takes to destroy the file.
+
+    Refusing rather than unlinking-and-replacing the symlink is deliberate:
+    the whole point is to stop this server destroying things it was never
+    asked to touch, and deleting the link would be one more of them.
+    """
+    if not _is_the_logs_dir(path.parent, logs_dir):
+        raise UnsafeLogPath(f"{path} is not directly inside {logs_dir}")
+    flags = {
+        "rb": os.O_RDONLY,
+        "wb": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        "ab": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+    }[mode] | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o644)
+    except FileNotFoundError:
+        # "There is no such file" is an ordinary answer, not a refusal --
+        # a job with no pid sidecar is the common, healthy case, and callers
+        # distinguish it from "we could not find out". Let it through as-is.
+        raise
+    except OSError as exc:
+        # ELOOP here means "it is a symlink", which is what this exists for;
+        # anything else unexpected is reported the same way so callers keep
+        # their single OSError path.
+        raise UnsafeLogPath(f"refusing to open {path}: {exc}") from exc
+    return os.fdopen(fd, mode)
+
+
 def _pid_sidecar(log_path: Path) -> Path:
     """Where the runner advertises its live child's pid. The recovery path
     (and the server's shutdown hook) use this to find and stop a separation
@@ -244,6 +305,7 @@ def _leads_own_process_group(pid: int) -> Optional[bool]:
 def terminate_pid_from_sidecar(
     log_path: Path,
     *,
+    logs_dir: Optional[Path] = None,
     marker: str = "stemlab.cli",
     grace_seconds: float = 5.0,
     poll_interval: float = 0.1,
@@ -301,7 +363,10 @@ def terminate_pid_from_sidecar(
     """
     sidecar = _pid_sidecar(log_path)
     try:
-        raw = sidecar.read_text()
+        with _open_in_logs_dir(
+            sidecar, logs_dir=logs_dir if logs_dir is not None else sidecar.parent, mode="rb"
+        ) as f:
+            raw = f.read().decode("utf-8", errors="replace")
     except FileNotFoundError:
         # No sidecar: the runner never got far enough to write one, or a
         # previous reap already consumed it. Nothing to stop.
@@ -458,13 +523,25 @@ def default_runner(
         "--target",
         target,
     ]
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logs_dir = Path(out_dir) / "web" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
     sidecar = _pid_sidecar(log_path)
-    with log_path.open("wb") as log_f:
-        proc = subprocess.Popen(
-            cmd, stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True
-        )
-        sidecar.write_text(str(proc.pid))
+    with _open_in_logs_dir(log_path, logs_dir=logs_dir, mode="wb") as log_f:
+        # The sidecar is opened *before* the process exists, and the spawn is
+        # abandoned if that fails. A pid we cannot record is a subprocess
+        # nothing can ever reap -- exactly the orphan the sidecar exists to
+        # prevent -- so refusing to start is the safe direction, not a
+        # best-effort write after the fact.
+        with _open_in_logs_dir(sidecar, logs_dir=logs_dir, mode="wb") as pid_f:
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True
+                )
+            except Exception:
+                sidecar.unlink(missing_ok=True)
+                raise
+            pid_f.write(str(proc.pid).encode())
+            pid_f.flush()
         try:
             return proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1051,7 +1128,9 @@ class JobStore:
         """Re-queue one job left unfinished by the previous server, having
         first made sure its old subprocess is gone. See _load_and_recover."""
         if job.status == "running" and job.log:
-            outcome = terminate_pid_from_sidecar(self.out_dir / _log_relpath(job.id))
+            outcome = terminate_pid_from_sidecar(
+                self.out_dir / _log_relpath(job.id), logs_dir=self.logs_dir
+            )
             if outcome is TerminationOutcome.FAILED:
                 # We could not confirm the previous run's process tree is
                 # gone (no permission to signal it, or it survived SIGKILL).
@@ -1134,7 +1213,9 @@ class JobStore:
         deadline = time.monotonic() + join_timeout
         while True:
             for job in running:
-                terminate_pid_from_sidecar(self.out_dir / _log_relpath(job.id))
+                terminate_pid_from_sidecar(
+                self.out_dir / _log_relpath(job.id), logs_dir=self.logs_dir
+            )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
@@ -1312,19 +1393,32 @@ class JobStore:
         taking it). The record's `log` field is refreshed to match, so it
         stays a truthful cache of where the log really is.
 
-        Raises RuntimeError if that location does not resolve to somewhere
-        inside out_dir -- `web/logs` being a symlink is the case that matters,
-        and the runner truncates whatever it opens, so refusing to write at
-        all is the only safe answer. The caller turns that into a failed job;
-        the server carries on.
+        Raises UnsafeLogPath if the directory that path lands in is not the
+        logs directory -- `web/logs` having been replaced by a symlink. That
+        is a fail-fast courtesy only: every actual write goes through
+        `_open_in_logs_dir`, which re-checks this *and* refuses to follow a
+        symlink standing at the log file itself. The caller turns either
+        refusal into a failed job; the server carries on.
         """
         job.log = _log_relpath(job.id)
         path = self.out_dir / job.log
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not _resolves_inside(self.out_dir, path):
-            raise RuntimeError(
-                f"refusing to write the log for {job.id}: {path} resolves outside {self.out_dir}"
+        if not _is_the_logs_dir(path.parent, self.logs_dir):
+            raise UnsafeLogPath(
+                f"refusing to write the log for {job.id}: {path.parent} is not {self.logs_dir}"
             )
+        # Neither the log nor its sidecar may already be a symlink. This is
+        # checked *before* the runner is called, rather than left to the
+        # runner's own O_NOFOLLOW, because the runner is injectable: the path
+        # handed out here is a path something else will open, and it should
+        # never be one that points somewhere else. lstat, so the check does
+        # not follow what it is checking.
+        for candidate in (path, _pid_sidecar(path)):
+            if candidate.is_symlink():
+                raise UnsafeLogPath(
+                    f"refusing to run {job.id}: {candidate} is a symlink, and writing "
+                    f"through it would overwrite {os.readlink(candidate)!r}"
+                )
         return path
 
     def _resolved_upload(self, job: Job) -> Optional[Path]:
@@ -1388,8 +1482,8 @@ class JobStore:
         except Exception as exc:  # runner itself blew up (not the subprocess exit code)
             rc = 1
             try:
-                with log_path.open("a", encoding="utf-8") as f:
-                    f.write(f"\n[stemlab-web] runner raised: {exc!r}\n")
+                with _open_in_logs_dir(log_path, logs_dir=self.logs_dir, mode="ab") as f:
+                    f.write(f"\n[stemlab-web] runner raised: {exc!r}\n".encode())
             except (OSError, ValueError) as log_exc:
                 # Reporting a failure must not itself become one: the job is
                 # already failing, and the error tail below will just say the
@@ -1421,7 +1515,7 @@ class JobStore:
                 job.error = None
             else:
                 job.status = "error"
-                job.error = _tail(log_path, 8)
+                job.error = _tail(log_path, 8, logs_dir=self.logs_dir)
             self._write_job(job)
 
 
@@ -1456,7 +1550,7 @@ def _clamp_error(text: str) -> str:
     return _TRUNCATION_NOTE + text[-(MAX_ERROR_CHARS - len(_TRUNCATION_NOTE)):]
 
 
-def _tail(log_path: Path, n: int) -> str:
+def _tail(log_path: Path, n: int, *, logs_dir: Optional[Path] = None) -> str:
     """Last `n` lines of a log, for a failed job's error message.
 
     Only the final LOG_TAIL_READ_BYTES are read, and the result is clamped to
@@ -1466,7 +1560,9 @@ def _tail(log_path: Path, n: int) -> str:
     see the constants at the top of this module.
     """
     try:
-        with log_path.open("rb") as f:
+        with _open_in_logs_dir(
+            log_path, logs_dir=logs_dir if logs_dir is not None else log_path.parent, mode="rb"
+        ) as f:
             size = f.seek(0, os.SEEK_END)
             start = max(0, size - LOG_TAIL_READ_BYTES)
             f.seek(start)
