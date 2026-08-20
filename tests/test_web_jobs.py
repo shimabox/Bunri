@@ -784,7 +784,38 @@ def test_legacy_non_group_leader_sidecar_is_held_without_signalling_anything(tmp
             _os.kill(child_pid, 9)
 
 
-@pytest.mark.parametrize("failure_kind", ["ps-unavailable", "ps-timeout"])
+def _unhelpful_ps(kind: str):
+    """A stand-in for `subprocess.run` that reproduces one way `ps` can fail
+    to answer the "is this pid alive?" question. None of these mean "the
+    process is gone", and all of them produce empty stdout -- which is
+    exactly why the verdict cannot be based on stdout alone."""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        if kind == "ps-unavailable":
+            raise OSError("simulated: cannot exec ps")
+        if kind == "ps-timeout":
+            raise subprocess.TimeoutExpired(cmd="ps", timeout=10)
+        if kind == "ps-rejected-the-request":
+            # macOS, verbatim shape: ps exits 1 like it does for a genuinely
+            # absent pid, but complains on stderr instead of answering.
+            return subprocess.CompletedProcess(
+                args=["ps"], returncode=1, stdout="",
+                stderr="ps: process id too large: 999999999\n",
+            )
+        if kind == "ps-unexpected-status":
+            return subprocess.CompletedProcess(
+                args=["ps"], returncode=2, stdout="", stderr="",
+            )
+        raise AssertionError(f"unknown ps failure kind: {kind}")
+
+    return fake_run
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["ps-unavailable", "ps-timeout", "ps-rejected-the-request", "ps-unexpected-status"],
+)
 def test_unverifiable_liveness_holds_the_job_instead_of_assuming_the_process_is_gone(
     tmp_path, monkeypatch, failure_kind
 ):
@@ -793,17 +824,14 @@ def test_unverifiable_liveness_holds_the_job_instead_of_assuming_the_process_is_
     so the recovery path cheerfully re-ran a job whose previous process was
     demonstrably still alive (the user saw rerun_started=True with
     old_process_alive=True and the sidecar deleted). An unverifiable check
-    must fail closed -- FAILED, sidecar kept, job held."""
-    import subprocess
+    must fail closed -- FAILED, sidecar kept, job held.
 
+    The two non-exception cases matter just as much as the two exceptional
+    ones: a `ps` that launches and then exits unsuccessfully prints nothing
+    on stdout either, so judging by output alone reads it as "no such
+    process" -- the same fail-open, just further along."""
     from stemlab.web import jobs as jobs_module
     from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
-
-    failure: Exception = (
-        OSError("simulated: cannot exec ps")
-        if failure_kind == "ps-unavailable"
-        else subprocess.TimeoutExpired(cmd="ps", timeout=10)
-    )
 
     upload = _make_upload(tmp_path)
     _write_running_job_file(tmp_path, "j-unknown", upload)
@@ -813,10 +841,7 @@ def test_unverifiable_liveness_holds_the_job_instead_of_assuming_the_process_is_
     try:
         (logs_dir / "j-unknown.pid").write_text(str(orphan.pid))
 
-        def broken_ps(*args, **kwargs):
-            raise failure
-
-        monkeypatch.setattr(jobs_module.subprocess, "run", broken_ps)
+        monkeypatch.setattr(jobs_module.subprocess, "run", _unhelpful_ps(failure_kind))
 
         outcome = terminate_pid_from_sidecar(logs_dir / "j-unknown.log")
 
@@ -904,6 +929,37 @@ def test_a_confirmed_dead_process_still_yields_nothing_to_stop(tmp_path):
 
     assert terminate_pid_from_sidecar(logs_dir / "j-dead.log") is TerminationOutcome.NOTHING_TO_STOP
     assert not sidecar.exists(), "a confirmed-stale sidecar is still cleaned up"
+
+
+def test_ps_exit_status_decides_alive_vs_gone_vs_unknown(tmp_path, monkeypatch):
+    """Pins the exact `ps` contract the reaper reads, since every branch
+    above hangs off it and only one of the three produces non-empty stdout.
+    rc 1 with a silent stderr is the real "no such process" answer on both
+    macOS and Linux; anything noisier or stranger is no answer at all."""
+    import subprocess
+
+    from stemlab.web import jobs as jobs_module
+
+    def _ps_returning(returncode, stdout, stderr):
+        return lambda *a, **kw: subprocess.CompletedProcess(
+            args=["ps"], returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+    monkeypatch.setattr(
+        jobs_module.subprocess, "run", _ps_returning(0, "python -m stemlab.cli x\n", "")
+    )
+    assert jobs_module._process_command(4242) == "python -m stemlab.cli x"
+
+    monkeypatch.setattr(jobs_module.subprocess, "run", _ps_returning(1, "", ""))
+    assert jobs_module._process_command(4242) == "", "rc 1 with a quiet stderr means gone"
+
+    monkeypatch.setattr(
+        jobs_module.subprocess, "run", _ps_returning(1, "", "ps: process id too large: 1\n")
+    )
+    assert jobs_module._process_command(4242) is None, "a complaining ps answered nothing"
+
+    monkeypatch.setattr(jobs_module.subprocess, "run", _ps_returning(2, "", ""))
+    assert jobs_module._process_command(4242) is None, "an unexpected status answered nothing"
 
 
 def test_recovery_holds_a_job_whose_previous_process_could_not_be_stopped(

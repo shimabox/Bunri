@@ -110,24 +110,44 @@ def _warn(message: str) -> None:
 
 
 def _process_command(pid: int) -> Optional[str]:
-    """Command line of `pid`, or "" if `ps` ran fine and found no such
-    process. Returns **None when we could not find out at all** -- `ps` itself
-    failed to launch or timed out.
+    """Command line of `pid`, or "" if `ps` ran fine and reported no such
+    process. Returns **None when we could not find out at all**.
 
     That third case must not be flattened into "": "the process is gone" and
     "we have no idea whether the process is gone" lead to opposite decisions
     (drop the sidecar and re-run the job vs. hold the job back), and
     collapsing them is what let a job be re-queued while its previous run was
-    demonstrably still alive. `ps` is fine here: this project only targets
-    macOS and Linux."""
+    demonstrably still alive. So the exit status is part of the verdict, not
+    just whether the command produced output -- a `ps` that ran but failed
+    prints nothing on stdout too, and reading that as "gone" is the same
+    fail-open bug wearing a different hat.
+
+    `ps` is fine here: this project only targets macOS and Linux, and the two
+    agree on the statuses that matter (verified on both):
+
+    * rc 0 -- found it; stdout is the command line.
+    * rc 1 with empty stderr -- ran correctly, no process with that pid.
+      This is the ordinary "already exited" answer.
+    * rc 1 with something on stderr -- `ps` rejected the request rather than
+      answering it (macOS says e.g. "ps: process id too large: 999999999"
+      for an out-of-range pid). Nothing was learned about the process.
+    * anything else (rc > 1, or any status we didn't anticipate) -- likewise
+      no answer.
+
+    The last two are None, which every caller turns into FAILED.
+    """
     try:
         out = subprocess.run(
             ["ps", "-p", str(pid), "-o", "command="],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
-    return out.stdout.strip()
+        return None  # ps couldn't be launched, or never came back
+    if out.returncode == 0:
+        return out.stdout.strip()
+    if out.returncode == 1 and not (out.stderr or "").strip():
+        return ""  # ran fine, no such process
+    return None  # ps complained, or exited in a way we can't interpret
 
 
 def _process_liveness(pid: int, marker: str) -> Optional[bool]:
