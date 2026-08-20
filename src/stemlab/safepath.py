@@ -96,6 +96,30 @@ def verified_mkdir(base: Path, *parts: str) -> Path:
     return path
 
 
+def is_real_file_in(path: Path, expected_dir: Path) -> bool:
+    """True if `path` is an ordinary file sitting directly in `expected_dir`.
+
+    Guarding writes is only half the job, and the missing half was a real
+    hole: a cache that answers "already done" for a symlink hands the link's
+    target to whatever reads the cache next, and here that means copying it
+    into a package the user shares. `exists()` follows links and says yes to
+    all of it. So the read side asks the same questions the write side does
+    -- is this a link, is it even a regular file, is it where it claims to be.
+
+    `expected_dir` is used as given: a value the caller built (see
+    `real_subdir`), never a resolve of `path`'s own parent, which would make
+    the last comparison a tautology.
+    """
+    try:
+        if path.is_symlink():  # lstat, so it does not follow what it is testing
+            return False
+        if not path.is_file():  # not a directory, a fifo, a device
+            return False
+        return path.resolve().parent == expected_dir
+    except OSError:
+        return False
+
+
 def replace_into(dest: Path, write: Callable[[Path], None]) -> Path:
     """Produce `dest` by writing a uniquely-named temporary beside it and
     renaming that into place.

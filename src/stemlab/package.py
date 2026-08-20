@@ -84,6 +84,11 @@ def _normalize_step(
     ):
         console.print("[dim]∙ normalize: cached[/dim]")
         return False
+    # The old meta goes before the work starts, not after it succeeds: from
+    # here until write_stage_meta below, this stage's artifacts are being
+    # replaced, and a meta that survives an interruption vouches for a
+    # half-updated set. See cache.clear_stage_meta.
+    cache.clear_stage_meta(cache_dir, "normalize")
     with console.status("[bold]normalize[/bold] running…"):
         audio.normalize_to_wav(
             input_path,
@@ -170,6 +175,13 @@ def build_package(
     ):
         console.print("[dim]∙ separate: cached[/dim]")
     else:
+        # Same discipline as normalize above, and this stage is where it
+        # actually bit: separate() moves the target stem into the cache
+        # before writing the backing track, so a failure between the two
+        # leaves a new target beside an old backing. Clearing the meta first
+        # means such a run is simply not cached, and the next one re-separates
+        # instead of packaging the mismatched pair.
+        cache.clear_stage_meta(cache_dir, separate_step)
         # Separation can run for minutes with no other output. Print the model
         # name up front -- outside console.status's own live region, so it
         # can't clash with the spinner -- so something visibly happens even

@@ -437,3 +437,126 @@ def test_build_package_never_writes_through_a_planted_cache_symlink(
     produced = cache_dir / planted
     assert not produced.is_symlink(), "the write must have replaced the link, not followed it"
     assert produced.stat().st_size > 0
+
+
+@_NEED_FFMPEG
+@pytest.mark.parametrize("swapped", ["guitar.wav", "guitar.backing.wav", "input.wav"])
+def test_build_package_does_not_trust_a_cached_artifact_that_is_a_symlink(
+    tmp_path, song_input, swapped
+):
+    """Guarding what the cache *writes* does nothing if what it *reads* trusts
+    whatever is sitting there. `exists()` follows symlinks, so leaving a valid
+    meta in place and swapping a cached artifact for a link elsewhere read as
+    "cached" -- and the link's target was copied into the package the user
+    shares."""
+    from stemlab.cache import file_digest
+
+    out_dir = tmp_path / "out"
+    build_package(song_input, out_dir, title="song")
+    assert len(_PackageFakeSeparator.instances) == 1
+
+    # Real audio, so the pre-fix path runs all the way through and the leak
+    # shows up as the outsider's audio inside the user's package -- rather
+    # than as ffmpeg choking on a file of nonsense.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.wav"
+    sf.write(str(victim), np.full((44100, 2), 0.77, dtype=np.float32), 44100)
+    original = victim.read_bytes()
+
+    cache_dir = out_dir / ".cache" / file_digest(song_input)
+    (cache_dir / swapped).unlink()
+    (cache_dir / swapped).symlink_to(victim)
+
+    build_package(song_input, out_dir, title="song")
+
+    # The harm first: what ends up in the package the user shares.
+    package_dir = out_dir / "song"
+    for produced in package_dir.glob("*.wav"):
+        assert produced.read_bytes() != original, (
+            f"the link's target was published as {produced.name}"
+        )
+    assert victim.read_bytes() == original, "and the link's target must be left alone"
+    assert len(_PackageFakeSeparator.instances) == 2, (
+        f"a symlinked {swapped} must not count as a cached artifact"
+    )
+
+
+@_NEED_FFMPEG
+def test_build_package_does_not_trust_a_cache_meta_that_is_a_symlink(tmp_path, song_input):
+    """The meta is read for the same reason and gets the same treatment: a
+    link standing where it belongs cannot be what decides a stage is fresh."""
+    from stemlab.cache import file_digest
+
+    out_dir = tmp_path / "out"
+    build_package(song_input, out_dir, title="song")
+    assert len(_PackageFakeSeparator.instances) == 1
+
+    cache_dir = out_dir / ".cache" / file_digest(song_input)
+    meta = cache_dir / "separate:guitar.meta.json"
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_bytes(meta.read_bytes())
+    meta.unlink()
+    meta.symlink_to(elsewhere)
+
+    build_package(song_input, out_dir, title="song")
+
+    assert len(_PackageFakeSeparator.instances) == 2, (
+        "a symlinked meta must not be what says the stage is fresh"
+    )
+
+
+@_NEED_FFMPEG
+def test_build_package_reseparates_after_a_run_that_died_between_the_two_stems(
+    tmp_path, song_input
+):
+    """separate() moves the target stem into the cache before it writes the
+    backing track, so a failure between the two leaves a *new* target beside
+    an *old* backing. Both exist, so the old meta called the pair fresh and
+    the next run packaged one stem from each separation.
+
+    The meta is cleared before a stage recomputes, so an interrupted run
+    leaves nothing claiming to be cached."""
+    from stemlab.cache import file_digest
+
+    out_dir = tmp_path / "out"
+    build_package(song_input, out_dir, title="song")
+    cache_dir = out_dir / ".cache" / file_digest(song_input)
+    meta = cache_dir / "separate:guitar.meta.json"
+    assert meta.exists()
+
+    class _DiesAfterTargetSeparator(_PackageFakeSeparator):
+        """Writes its stems, then fails the way a crash between the target
+        move and the backing write does -- by leaving separate() to blow up
+        after the target has already landed in the cache."""
+
+        def separate(self, audio_file_path, custom_output_names=None):
+            written = super().separate(audio_file_path, custom_output_names)
+            # Remove every non-target stem: separate() then moves the target
+            # into place and raises on the missing backing material.
+            for name in list(written):
+                if "Other" in name:
+                    (self.output_dir / name).unlink()
+                    written.remove(name)
+            return written
+
+    from audio_separator import separator as separator_module
+
+    original_cls = separator_module.Separator
+    separator_module.Separator = _DiesAfterTargetSeparator
+    try:
+        with pytest.raises(Exception):
+            build_package(song_input, out_dir, title="song", no_cache=True)
+    finally:
+        separator_module.Separator = original_cls
+
+    assert not meta.exists(), (
+        "an interrupted stage must not leave a meta vouching for its artifacts"
+    )
+
+    before = len(_PackageFakeSeparator.instances)
+    build_package(song_input, out_dir, title="song")
+    assert len(_PackageFakeSeparator.instances) == before + 1, (
+        "the next run must re-separate rather than package a mismatched pair"
+    )
+    assert (cache_dir / "guitar.backing.wav").stat().st_size > 0
