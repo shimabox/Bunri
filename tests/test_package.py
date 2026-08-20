@@ -381,3 +381,59 @@ def test_build_package_refuses_a_package_directory_that_is_a_symlink(tmp_path, s
     )
     assert kept.read_bytes() == original
     assert refused is not None and "symlink" in str(refused)
+
+
+@_NEED_FFMPEG
+def test_build_package_refuses_a_symlinked_cache_directory(tmp_path, song_input):
+    """The cache layer runs before any package output, so protecting the
+    package files was only half the job. `out/.cache -> outside` had
+    mkdir(parents=True) follow the link and put the normalized input, the
+    separated stems and every meta file out there -- none of it ever passing
+    through the write-time protections, because it never got that far."""
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    out_dir.mkdir(parents=True)
+    (out_dir / ".cache").symlink_to(outside, target_is_directory=True)
+
+    refused = None
+    try:
+        build_package(song_input, out_dir, title="song")
+    except OSError as exc:
+        refused = exc
+
+    # Damage first, so a failure names what was written rather than what was
+    # not raised.
+    assert sorted(p.name for p in outside.rglob("*")) == [], (
+        f"created {sorted(p.name for p in outside.rglob('*'))} outside the output tree"
+    )
+    assert refused is not None and "symlink" in str(refused)
+
+
+@_NEED_FFMPEG
+@pytest.mark.parametrize("planted", ["normalize.meta.json", "input.wav"])
+def test_build_package_never_writes_through_a_planted_cache_symlink(
+    tmp_path, song_input, planted
+):
+    """Same rule as the package exports, applied to the cache: every name in
+    there is derivable from the input digest, so a symlink can be waiting at
+    one, and write_text (the meta) or ffmpeg (input.wav) would follow it."""
+    from stemlab.cache import file_digest
+
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    victim = outside / "victim.txt"
+    victim.write_bytes(b"a file with nothing to do with this cache")
+    original = victim.read_bytes()
+
+    cache_dir = out_dir / ".cache" / file_digest(song_input)
+    cache_dir.mkdir(parents=True)
+    (cache_dir / planted).symlink_to(victim)
+
+    build_package(song_input, out_dir, title="song")
+
+    assert victim.read_bytes() == original, f"writing {planted} followed the symlink"
+    produced = cache_dir / planted
+    assert not produced.is_symlink(), "the write must have replaced the link, not followed it"
+    assert produced.stat().st_size > 0

@@ -26,6 +26,7 @@ import soundfile as sf
 from rich.console import Console
 
 from stemlab.registry import TargetSpec
+from stemlab.safepath import replace_into
 
 console = Console()
 
@@ -423,7 +424,10 @@ def _write_backing_track(stem_paths: list[Path], dest: Path) -> None:
     peak = float(np.abs(total).max()) if total.size else 0.0
     if peak > 1.0:
         total = total / peak
-    sf.write(str(dest), total, samplerate, subtype="PCM_16")
+    # Renamed into place rather than written directly: soundfile follows a
+    # symlink at `dest` like everything else does, and the backing track's
+    # name is derivable from the target. See stemlab/safepath.py.
+    replace_into(dest, lambda tmp: sf.write(str(tmp), total, samplerate, subtype="PCM_16"))
 
 
 def separate(

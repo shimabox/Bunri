@@ -44,6 +44,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from stemlab.safepath import (
+    UnsafeOutputPath,
+    is_really as _is_really,
+    real_subdir as _real_subdir,
+    replace_into as _replace_into,
+    verified_mkdir as _verified_mkdir,
+)
+
 # 2 hours: generous upper bound for a single separation + export on CPU.
 DEFAULT_TIMEOUT_SECONDS = 2 * 60 * 60
 
@@ -120,84 +128,6 @@ def new_job_id() -> str:
 # the process's exit code (0 == success). Real jobs use `default_runner`;
 # tests inject fakes (see tests/test_web_jobs.py).
 Runner = Callable[[Path, Path, str, str, Path], int]
-
-
-class UnsafeOutputPath(OSError):
-    """Refusal to touch something under out_dir that is not what it claims.
-
-    Raised for all three of the directories this app writes into -- web/logs,
-    web/jobs, web/uploads -- because they have the same weakness: the names
-    are fixed and predictable, so replacing one with a symlink redirects
-    every write that follows it.
-
-    Deliberately an OSError: every caller of file I/O in this module already
-    handles OSError from a missing or unreadable file, so a refusal degrades
-    along a path that already exists instead of needing a new one.
-    """
-
-
-def _real_subdir(out_dir: Path, *parts: str) -> Path:
-    """Where `<out_dir>/<parts...>` must *really* be: out_dir's own resolved
-    location plus the literal components.
-
-    The construction matters, and getting it wrong was a live bug. The
-    obvious check -- resolve the candidate, resolve the directory it is
-    supposed to be in, compare -- is a tautology whenever that directory is
-    itself the symlink: with `web/logs -> /outside`, both sides resolve to
-    `/outside` and the comparison passes, and the runner then truncates
-    files there. Only out_dir is resolved here, so the expected value stays
-    a real path inside the real output tree, and a `web` or `logs` that
-    points somewhere else lands the candidate somewhere this value can never
-    equal.
-
-    Resolving out_dir (rather than taking it literally) is equally
-    deliberate in the other direction: out_dir legitimately sits under a
-    symlink on plenty of systems -- /tmp on macOS is one -- and those
-    installations must keep working.
-    """
-    return out_dir.resolve().joinpath(*parts)
-
-
-def _verified_mkdir(out_dir: Path, *parts: str) -> Path:
-    """`<out_dir>/<parts...>`, created if missing, with every component
-    checked as it is walked.
-
-    Splitting the walk matters: `mkdir(parents=True)` on the whole path
-    follows any symlink it meets and happily creates the rest of the tree on
-    the far side, so a check afterwards is too late -- with `web -> /outside`
-    and nothing at the other end, the server made `/outside/uploads` and
-    `/outside/logs` before deciding it did not like them. Nothing outside
-    out_dir may be created, not even an empty directory.
-
-    Each component is either created here (so it cannot be a link) or
-    verified with `is_symlink()` -- an lstat, which does not follow what it
-    is testing. The base is out_dir resolved, so an out_dir that itself lives
-    under a symlink keeps working; see `_real_subdir`.
-    """
-    path = out_dir.resolve()
-    if not path.is_dir():
-        raise UnsafeOutputPath(f"{out_dir} is not a directory")
-    for part in parts:
-        path = path / part
-        if path.is_symlink():
-            raise UnsafeOutputPath(f"{path} is a symlink; refusing to use it")
-        try:
-            path.mkdir(exist_ok=True)
-        except OSError as exc:
-            raise UnsafeOutputPath(f"cannot use {path}: {exc}") from exc
-        if not path.is_dir():
-            raise UnsafeOutputPath(f"{path} is not a directory")
-    return path
-
-
-def _is_really(candidate: Path, expected: Path) -> bool:
-    """True if `candidate` resolves to exactly `expected`. `expected` is used
-    as given -- it is a value built by `_real_subdir`, and resolving it again
-    is precisely the tautology described there."""
-    try:
-        return candidate.resolve() == expected
-    except OSError:
-        return False
 
 
 def _open_in_logs_dir(path: Path, *, expected_logs_dir: Path, mode: str):

@@ -7,19 +7,17 @@ StemLab has no downstream (transcription/tab) stages to sequence.
 
 from __future__ import annotations
 
-import os
 import re
-import secrets
 import shutil
 import time
 from pathlib import Path
-from typing import Callable
 
 from rich.console import Console
 
 from stemlab import audio, cache
 from stemlab.player import render_player
 from stemlab.registry import get_target
+from stemlab.safepath import replace_into, verified_mkdir
 from stemlab.separate import separate
 
 console = Console()
@@ -58,43 +56,16 @@ def _safe_filename(title: str) -> str:
     return slug
 
 
-def _replace_into(dest: Path, write: Callable[[Path], None]) -> Path:
-    """Produce `dest` by writing a uniquely-named temporary beside it and
-    renaming that into place.
-
-    Every export goes through this, and the reason is symlinks. Writing
-    straight to `dest` -- copyfile, ffmpeg's output file, write_text -- all
-    follow a link sitting there and clobber whatever it points at, which for
-    a package path is a name an attacker (or a careless `ln -s`) can predict
-    exactly. `os.replace` does not follow: it swaps the *name*, so a planted
-    link is what gets replaced, not its target. Containment checks on the
-    package directory cannot help here, because the link is the final
-    component and resolves wherever it likes.
-
-    Atomicity comes free with it -- a reader never sees a half-copied export
-    -- and it is the same write-then-rename shape the model download and the
-    job records already use.
-
-    The temporary keeps `dest`'s suffix: ffmpeg picks its muxer from the
-    output extension, so ".../x.tmp-ab12" would leave it guessing.
-    """
-    tmp = dest.with_name(f".{dest.stem}.tmp-{secrets.token_hex(4)}{dest.suffix}")
-    try:
-        write(tmp)
-        os.replace(tmp, dest)
-    finally:
-        tmp.unlink(missing_ok=True)  # no-op after a successful replace
-    return dest
-
-
 def _export(src: Path, dest: Path) -> Path:
-    _replace_into(dest, lambda tmp: shutil.copyfile(src, tmp))
+    replace_into(dest, lambda tmp: shutil.copyfile(src, tmp))
     console.print(f"→ [cyan]{dest}[/cyan]")
     return dest
 
 
 def _export_mp3(src: Path, dest: Path) -> Path:
-    _replace_into(dest, lambda tmp: audio.encode_mp3(src, tmp))
+    # No replace_into here: audio.encode_mp3 does its own, so that a caller
+    # reaching for it directly is protected too.
+    audio.encode_mp3(src, dest)
     console.print(f"→ [cyan]{dest}[/cyan]")
     return dest
 
@@ -152,8 +123,21 @@ def build_package(
     safe = _safe_filename(song_title)
 
     digest = cache.file_digest(input_path)
-    cache_dir = out_dir / ".cache" / digest
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    # The output root itself is the user's own `-o`, so creating it (symlink
+    # and all, if that is what they pointed at) is doing as asked. Everything
+    # below it is a different matter.
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # `mkdir(parents=True)` here followed `out/.cache` if it was a symlink and
+    # built the tree on the far side, putting the normalized input, the
+    # separated stems and every meta file outside out_dir -- before a single
+    # one of the write-time protections got a say. Created a component at a
+    # time instead, refusing any that is a link. See stemlab/safepath.py.
+    #
+    # This is also what keeps audio-separator's own writes in bounds: the
+    # files that library creates inside the directory are not ours to route
+    # through replace_into, so the guarantee they rest on is that the
+    # directory they land in is genuinely inside out_dir.
+    cache_dir = verified_mkdir(out_dir, ".cache", digest)
 
     input_wav = cache_dir / "input.wav"
     normalize_ran = _normalize_step(input_path, input_wav, cache_dir, no_cache=no_cache)
@@ -259,7 +243,7 @@ def build_package(
         backing=backing_ref,
         instrument_label=spec.label_ja,
     )
-    _replace_into(player_dest, lambda tmp: tmp.write_text(player_html, encoding="utf-8"))
+    replace_into(player_dest, lambda tmp: tmp.write_text(player_html, encoding="utf-8"))
     console.print(f"→ [cyan]{player_dest}[/cyan]")
 
     return package_dir

@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from stemlab.safepath import replace_into
+
 
 def file_digest(path: Path) -> str:
     h = hashlib.sha1()
@@ -60,6 +62,12 @@ def write_stage_meta(
     meta file for humans/debugging but never part of the freshness comparison
     (stage_is_fresh reads only "version" and "params"), so recording e.g. which
     model was actually used after a fallback can't invalidate the cache."""
-    _meta_path(cache_dir, stage_name).write_text(
-        json.dumps({"version": version, "params": params_digest(params), **(extra or {})})
+    payload = json.dumps({"version": version, "params": params_digest(params), **(extra or {})})
+    # Written through replace_into like every other file this app produces:
+    # the name is derivable from the input digest and the stage, so a symlink
+    # can be waiting at it, and write_text would follow the link and overwrite
+    # whatever it points at. See stemlab/safepath.py.
+    replace_into(
+        _meta_path(cache_dir, stage_name),
+        lambda tmp: tmp.write_text(payload, encoding="utf-8"),
     )
