@@ -115,6 +115,107 @@ def test_nonzero_exit_code_becomes_error_with_log_tail(tmp_path):
     assert failed.error.splitlines() == [f"line {i}" for i in range(13, 21)]
 
 
+def test_a_huge_single_line_log_still_produces_a_loadable_job_record(tmp_path):
+    """Regression for the app writing a record it would then refuse to read:
+    _tail read the whole log and stored the last 8 lines verbatim, so a
+    runner emitting one multi-megabyte line (a progress bar with no newlines,
+    a dumped payload) put that whole line in job.error and pushed the job
+    JSON past MAX_JOB_FILE_BYTES. The failure looked normal at the time --
+    and then the job vanished on the next start, quarantined by its own
+    size check."""
+    from stemlab.web.jobs import MAX_ERROR_CHARS, MAX_JOB_FILE_BYTES
+
+    upload = _make_upload(tmp_path)
+    monster = "boom " * 250_000  # ~1.25 MB, not a single newline in it
+    assert len(monster) > MAX_JOB_FILE_BYTES
+    runner = FakeRunner(returncode=1, write_player=False, log_text=monster)
+    store = JobStore(tmp_path, runner=runner)
+
+    job, _ = store.create_job(upload, digest="d1", requested_title="Song")
+    _wait_until(lambda: store.get_job(job.id).status == "error")
+
+    failed = store.get_job(job.id)
+    assert failed.error, "the failure must still be reported, just bounded"
+    assert len(failed.error) <= MAX_ERROR_CHARS
+    assert failed.error.endswith("boom "), "the informative end of the log is what's kept"
+
+    record = tmp_path / "web" / "jobs" / f"{job.id}.json"
+    written = record.stat().st_size
+    assert written <= MAX_JOB_FILE_BYTES, f"wrote a record of {written} bytes"
+
+    # The real point: a restart must still find the job, not quarantine it.
+    reloaded = JobStore(tmp_path, runner=FakeRunner())
+    survivor = reloaded.get_job(job.id)
+    assert survivor is not None, "the job must survive a restart, not vanish"
+    assert survivor.status == "error"
+    assert _quarantined_names(tmp_path, job.id) == []
+
+
+def test_an_over_long_title_is_truncated(tmp_path):
+    from stemlab.web.jobs import MAX_TITLE_CHARS
+
+    upload = _make_upload(tmp_path)
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    job, _ = store.create_job(upload, digest="d1", requested_title="T" * (MAX_TITLE_CHARS * 3))
+
+    assert len(job.title) == MAX_TITLE_CHARS
+    assert job.title == "T" * MAX_TITLE_CHARS
+
+
+def test_serializing_a_job_never_exceeds_the_record_limit(tmp_path):
+    """The belt behind _tail's braces: even handed an error field no code
+    path should ever produce, the writer must emit something the loader will
+    accept -- and must not mutate the caller's job to get there."""
+    from stemlab.web.jobs import MAX_JOB_FILE_BYTES, _serialize_job_within_limit
+
+    oversized = "E" * (MAX_JOB_FILE_BYTES * 2)
+    job = Job(
+        id="j-fat", digest="d1", title="Song", target="guitar", status="error",
+        created_at="2026-01-01T00:00:00+00:00", error=oversized,
+    )
+
+    encoded = _serialize_job_within_limit(job)
+
+    assert len(encoded.encode("utf-8")) <= MAX_JOB_FILE_BYTES
+    assert job.error == oversized, "the in-memory job must be left untouched"
+    restored = json.loads(encoded)
+    assert restored["id"] == "j-fat"
+    assert restored["status"] == "error"
+
+
+def test_tail_of_a_normal_multi_line_log_is_unchanged_by_the_byte_cap(tmp_path):
+    """The bounded read must not disturb ordinary logs: a small file is read
+    whole, and its last n lines come back exactly as before."""
+    from stemlab.web.jobs import _tail
+
+    log = tmp_path / "small.log"
+    log.write_text("\n".join(f"line {i}" for i in range(1, 21)) + "\n", encoding="utf-8")
+    assert _tail(log, 8).splitlines() == [f"line {i}" for i in range(13, 21)]
+
+    empty = tmp_path / "empty.log"
+    empty.write_text("", encoding="utf-8")
+    assert _tail(empty, 8) == "(empty log)"
+
+    assert _tail(tmp_path / "does-not-exist.log", 8) == "(log file unavailable)"
+
+
+def test_tail_drops_the_partial_first_line_when_it_reads_from_an_offset(tmp_path):
+    """Reading only the tail starts mid-file, so the first thing in the
+    window is the back half of a line we never saw the start of. Returning
+    it as if it were a whole line would be a lie about the log's content."""
+    from stemlab.web.jobs import LOG_TAIL_READ_BYTES, _tail
+
+    log = tmp_path / "big.log"
+    filler = "F" * (LOG_TAIL_READ_BYTES * 2)  # pushes the window past the start
+    log.write_text(f"{filler}\ncomplete line A\ncomplete line B\n", encoding="utf-8")
+
+    result = _tail(log, 8)
+
+    assert result.splitlines() == ["complete line A", "complete line B"]
+    assert "F" not in result, "the fragment of the truncated line must be dropped"
+
+
 def test_success_exit_code_without_player_html_is_still_an_error(tmp_path):
     # exit 0 but the expected player.html never showed up -- e.g. a partial
     # crash after the CLI printed success but before the file landed. The

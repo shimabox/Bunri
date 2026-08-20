@@ -54,6 +54,37 @@ DEFAULT_TIMEOUT_SECONDS = 2 * 60 * 60
 # read and parse. Anything past it is not a job record.
 MAX_JOB_FILE_BYTES = 1024 * 1024
 
+# The read limit above is only half the story: this app also *writes* job
+# records, and until these three caps existed it could write one it would
+# then refuse to read back. A runner that emits a single multi-megabyte log
+# line (a progress bar with no newlines, a dumped payload) made `_tail` hand
+# that whole line to `job.error`, which `_write_job` duly serialized past
+# MAX_JOB_FILE_BYTES -- so an ordinary failed job produced a record that the
+# next startup quarantined, and the job silently vanished.
+
+# How much of a log's tail `_tail` will read at all. 64 KiB holds the last
+# handful of lines of any sane log many times over, and bounds the read even
+# when the file has no line breaks to work with.
+LOG_TAIL_READ_BYTES = 64 * 1024
+
+# Ceiling on the string `_tail` returns, i.e. on what lands in `job.error`
+# and therefore in the record on disk. 8 lines of context is what this is
+# for; 10k characters is generous for that and still two orders of magnitude
+# below the record limit.
+MAX_ERROR_CHARS = 10_000
+
+# Prefixed to a value whose beginning was cut away, so the truncation is
+# visible in the UI rather than looking like a log that simply starts
+# mid-sentence.
+_TRUNCATION_NOTE = "... (truncated)\n"
+
+# Longest requested title kept. A song title is realistically well under 100
+# characters; 200 leaves room for "Artist - Title (Live at Somewhere, 1994)"
+# while keeping the record's one user-supplied free-text field bounded.
+# (This is about record size only -- how long a *folder* name may be remains
+# the filesystem's business, unchanged by this cap.)
+MAX_TITLE_CHARS = 200
+
 # Same rule as stemlab.package._safe_filename -- see module docstring for why
 # this is duplicated rather than imported.
 _UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|#%]')
@@ -547,6 +578,59 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
     return None
 
 
+def _serialize_job_within_limit(job: Job) -> str:
+    """`job` as the JSON that goes on disk, guaranteed to fit within
+    MAX_JOB_FILE_BYTES if it possibly can.
+
+    This is the last line of defence, not the first: `_tail`'s clamp and
+    MAX_TITLE_CHARS already keep both free-length fields far below the limit,
+    so in normal operation this function just serializes and returns. It
+    exists because writing a record the loader will refuse to read is a
+    uniquely nasty failure -- the job doesn't error, it *disappears* on the
+    next start -- and that must not be one upstream oversight away.
+
+    `error` is the only field with any real slack, so it is what gets cut,
+    halved repeatedly (from the front, keeping the informative end) until the
+    record fits, and finally dropped altogether. `job` itself is left alone:
+    the in-memory copy keeps the full text for the UI, and only the on-disk
+    record is trimmed.
+    """
+    data = job.to_dict()
+
+    def encode(payload: dict) -> str:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def too_big(encoded: str) -> bool:
+        return len(encoded.encode("utf-8")) > MAX_JOB_FILE_BYTES
+
+    encoded = encode(data)
+    if not too_big(encoded):
+        return encoded
+
+    error = data.get("error") or ""
+    while error and too_big(encoded):
+        # +1 so this strictly shrinks and always terminates, even at length 1.
+        error = error[len(error) // 2 + 1:]
+        data["error"] = _TRUNCATION_NOTE + error if error else None
+        encoded = encode(data)
+
+    if too_big(encoded):
+        # Nothing left to give: something other than `error` is oversized,
+        # which the caps upstream should make impossible. Write it anyway --
+        # a record the next startup quarantines is still better than an
+        # exception here, which would take down the worker mid-job -- but say
+        # so, because it means a cap above has been outflanked.
+        data["error"] = "(error message dropped: job record too large)"
+        encoded = encode(data)
+        if too_big(encoded):
+            _warn(
+                f"[stemlab-web] job {job.id}: record is {len(encoded.encode('utf-8'))} bytes "
+                f"even after dropping its error, over the {MAX_JOB_FILE_BYTES}-byte limit; "
+                "writing it anyway, but it will not survive a restart"
+            )
+    return encoded
+
+
 class JobStore:
     """File-backed job queue + sequential worker.
 
@@ -585,7 +669,7 @@ class JobStore:
     def _write_job(self, job: Job) -> None:
         path = self._job_path(job.id)
         tmp = path.with_suffix(f".json.tmp-{secrets.token_hex(4)}")
-        tmp.write_text(json.dumps(job.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(_serialize_job_within_limit(job), encoding="utf-8")
         os.replace(tmp, path)  # atomic on the same filesystem
 
     def _quarantine_job_file(self, path: Path, reason: str) -> None:
@@ -820,6 +904,10 @@ class JobStore:
         """Returns (job, created). created is False when an existing
         done/queued/running job for this digest+target was reused instead of
         starting a new one."""
+        # Bounded before it reaches _resolve_title, so neither the stored
+        # title nor the "-2"/"-3" variants derived from it can grow the job
+        # record without limit (see MAX_TITLE_CHARS).
+        requested_title = requested_title[:MAX_TITLE_CHARS]
         with self._lock:
             reusable = self.find_reusable(digest, target)
             if reusable is not None:
@@ -931,9 +1019,47 @@ class JobStore:
             self._write_job(job)
 
 
+def _clamp_error(text: str) -> str:
+    """`text`, shortened from the front to at most MAX_ERROR_CHARS. The tail
+    is what matters in a failure message (the error is at the end), so it is
+    the beginning that gets dropped, with a note in its place."""
+    if len(text) <= MAX_ERROR_CHARS:
+        return text
+    return _TRUNCATION_NOTE + text[-(MAX_ERROR_CHARS - len(_TRUNCATION_NOTE)):]
+
+
 def _tail(log_path: Path, n: int) -> str:
+    """Last `n` lines of a log, for a failed job's error message.
+
+    Only the final LOG_TAIL_READ_BYTES are read, and the result is clamped to
+    MAX_ERROR_CHARS. Both bounds matter: without them a runner emitting one
+    enormous line pulled its entire log into memory here and from there into
+    `job.error`, producing a job record too big for the loader to accept --
+    see the constants at the top of this module.
+    """
     try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        with log_path.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            start = max(0, size - LOG_TAIL_READ_BYTES)
+            f.seek(start)
+            raw = f.read()
     except OSError:
         return "(log file unavailable)"
-    return "\n".join(lines[-n:]) if lines else "(empty log)"
+
+    # errors="replace" as before, and doubly needed now: starting from a byte
+    # offset can land in the middle of a multi-byte character.
+    text = raw.decode("utf-8", errors="replace")
+    if start > 0:
+        first_break = text.find("\n")
+        if first_break != -1:
+            # Whatever precedes it is a fragment of a line we never saw the
+            # start of, so it isn't one of the last `n` lines.
+            text = text[first_break + 1:]
+        # else: the window holds no line break at all -- one gigantic line,
+        # exactly the case the byte cap exists for. Keep the fragment; it's
+        # the only content there is, and the clamp below still bounds it.
+
+    lines = text.splitlines()
+    if not lines:
+        return "(empty log)"
+    return _clamp_error("\n".join(lines[-n:]))
