@@ -306,7 +306,13 @@ def terminate_pid_from_sidecar(
         # No sidecar: the runner never got far enough to write one, or a
         # previous reap already consumed it. Nothing to stop.
         return TerminationOutcome.NOTHING_TO_STOP
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError as well as OSError: `log_path` is built from a job
+        # record, and a path the OS cannot even represent (an embedded NUL)
+        # raises ValueError rather than OSError. Letting that escape aborts
+        # startup, since the recovery path calls this for every running job.
+        # Either way the answer is the same -- we learned nothing about the
+        # old process, so the job is held.
         _warn(
             f"[stemlab-web] cannot read pid sidecar {sidecar.name} ({exc}); "
             "assuming its process may still be running"
@@ -561,6 +567,18 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
         return f"unknown status: {data['status']!r}"
     if data["id"] != expected_id:
         return f"id {data['id']!r} does not match filename (expected {expected_id!r})"
+    if len(data["title"]) > MAX_TITLE_CHARS:
+        # The same cap create_job applies, enforced on the way in too, and
+        # for a subtler reason than symmetry: `package` is derived from the
+        # title and is roughly twice its length, so an unbounded title makes
+        # the record grow *after* it was admitted, when the job succeeds.
+        # `error` is the only field the writer can trim, so a title-driven
+        # overflow can't be recovered from -- it has to be refused here.
+        # Nothing this app writes can trip this; such a record is hand-made.
+        return (
+            f"title is {len(data['title'])} characters, over the "
+            f"{MAX_TITLE_CHARS}-character limit"
+        )
     for name in _OPTIONAL_DATETIME_FIELDS:
         value = data.get(name)
         if value is None:
@@ -593,20 +611,37 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
             value.encode("utf-8")
         except UnicodeEncodeError as exc:
             return f"field {name!r} holds text that cannot be encoded as UTF-8: {exc}"
+        # A NUL is valid in a Python str and in JSON, and in nothing else
+        # here: `log`, `upload` and `package` become filesystem paths, where
+        # a NUL raises ValueError from every path operation, and `title`
+        # becomes a folder name. A record carrying one is corrupt, and
+        # admitting it strands the job -- the reaper can't read a sidecar at
+        # a path that cannot exist, so a "running" one is held forever with
+        # nothing able to clear it. Refuse it here, where it costs one file.
+        if "\x00" in value:
+            return f"field {name!r} contains a NUL byte"
     return None
 
 
 def _serialize_job_within_limit(job: Job) -> str:
     """`job` as the JSON that goes on disk.
 
-    The contract, which the loader is what makes true: for any job built
-    from a record `_load_and_recover` accepted, the result fits within
-    MAX_JOB_FILE_BYTES. `error` is the only field with real slack, so it is
-    what gets cut -- halved repeatedly from the front, keeping the
-    informative end, and finally dropped -- and a record whose *other*
-    fields are already too big to save is refused at load time rather than
-    accepted and then written back unsavably. That is the loop this closes:
-    accept only what can be re-saved, and re-saving always succeeds.
+    The contract has two halves, stated separately because only one of them
+    holds unconditionally:
+
+    * The result always encodes as UTF-8. Any field that wouldn't (a lone
+      surrogate or a NUL, see `_storable`) is normalized here, so "what this returns
+      can be written" needs no assumptions about the caller.
+    * The result fits within MAX_JOB_FILE_BYTES *provided the fields other
+      than `error` do*. `error` is the only field with real slack, so it is
+      what gets cut -- halved repeatedly from the front, keeping the
+      informative end, and finally dropped. A record whose title or paths
+      alone exceed the limit cannot be saved by any amount of trimming, and
+      is refused at load time (`_load_and_recover`) rather than accepted and
+      then written back unsavably; jobs this app creates can't reach that
+      state either, since `create_job` caps the title. That is the loop
+      being closed: accept only what can be re-saved, and re-saving always
+      succeeds.
 
     This is the last line of defence, not the first: `_tail`'s clamp and
     MAX_TITLE_CHARS keep both free-length fields far below the limit, so in
@@ -621,6 +656,11 @@ def _serialize_job_within_limit(job: Job) -> str:
     function never raises.
     """
     data = job.to_dict()
+    # First half of the contract above. `data` is a fresh dict, so this
+    # normalizes only what goes to disk -- `job` keeps whatever it had.
+    for key, value in data.items():
+        if isinstance(value, str):
+            data[key] = _storable(value)
 
     def encode(payload: dict) -> str:
         return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -740,62 +780,74 @@ class JobStore:
             file=sys.stderr,
         )
 
+    def _read_job_file(self, path: Path) -> tuple[Optional[Job], Optional[str]]:
+        """One job file, as either `(job, None)` or `(None, reason)`.
+
+        Every admission rule lives here, in the order that does the least
+        work for a file that will be refused anyway. The last one is the
+        subtle one: passing the read-side size check does not mean the record
+        can be *written back*, because the canonical form is indented and a
+        compact record of exactly the limit re-serializes larger. Admitting
+        such a job would have the recovery path save it oversized and the
+        *next* start quarantine it -- the job disappearing one restart after
+        the moment it was actually lost, with nothing reported at the time.
+        Refusing it now is what makes "whatever the loader accepts, the
+        writer can save" true rather than hopeful.
+        """
+        # Size first, so a rogue file is never read into memory or handed to
+        # the parser at all.
+        size = path.stat().st_size
+        if size > MAX_JOB_FILE_BYTES:
+            return None, f"job file is {size} bytes, over the {MAX_JOB_FILE_BYTES}-byte limit"
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+        # The id a well-formed file for this path *should* have -- ".json"
+        # stripped from the filename, matching how _job_path/_write_job name
+        # job files.
+        reason = _validate_job_record(data, path.stem)
+        if reason is not None:
+            return None, reason
+
+        job = Job.from_dict(data)
+        # Fill in what the app itself would fill in later, so the size check
+        # below measures the record as it will actually be written rather
+        # than as it happens to arrive. A job with no `log` is assigned one
+        # the first time it runs (`_log_path_for`), which is post-admission
+        # growth: the check would pass on a record smaller than the one that
+        # ends up on disk.
+        if not job.log:
+            job.log = str(Path("web") / "logs" / f"{job.id}.log")
+        saved_bytes = _job_record_bytes(job)
+        if saved_bytes > MAX_JOB_FILE_BYTES:
+            return None, (
+                f"record cannot be saved back: it re-serializes to {saved_bytes} bytes, "
+                f"over the {MAX_JOB_FILE_BYTES}-byte limit"
+            )
+        return job, None
+
     def _load_and_recover(self) -> None:
         for path in sorted(self.jobs_dir.glob("j-*.json")):
-            # Size first, so a rogue file is never read into memory or
-            # handed to the parser at all. A failed stat is treated like any
-            # other unreadable file: quarantine and move on.
             try:
-                size = path.stat().st_size
-            except OSError as exc:
-                self._quarantine_job_file(path, f"unreadable: {exc}")
-                continue
-            if size > MAX_JOB_FILE_BYTES:
-                self._quarantine_job_file(
-                    path, f"job file is {size} bytes, over the {MAX_JOB_FILE_BYTES}-byte limit"
-                )
-                continue
-
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, RecursionError) as exc:
-                # ValueError rather than json.JSONDecodeError: decoding runs
-                # before parsing, and a file with bytes that aren't valid
-                # UTF-8 raises UnicodeDecodeError. Both are ValueError
-                # subclasses. RecursionError is neither -- it's what
-                # json.loads raises on deeply nested input, since it
-                # recurses once per level and a few thousand nested arrays
-                # exhaust the stack in well under the size limit above.
-                # All three mean the same thing here -- this file is not a
-                # job record we can read -- and all three must be contained,
-                # or one corrupted file takes the whole server's startup
-                # down instead of just being quarantined.
-                self._quarantine_job_file(path, f"unreadable/invalid JSON: {exc}")
-                continue
-            # The id a well-formed file for this path *should* have -- ".json"
-            # stripped from the filename, matching how _job_path/_write_job
-            # name job files.
-            expected_id = path.stem
-            reason = _validate_job_record(data, expected_id)
-            if reason is not None:
-                self._quarantine_job_file(path, reason)
-                continue
-            job = Job.from_dict(data)
-            # Last admission check, and the one that makes
-            # _serialize_job_within_limit's contract hold: the file we just
-            # read fits the limit, but the canonical form we would write back
-            # is indented and may not (a compact 1 MiB record re-saves
-            # larger). Admitting such a job means the recovery path re-saves
-            # it oversized and the *next* start quarantines it -- the job
-            # disappearing one restart later, for a reason nothing reported
-            # at the time. Refuse it now, while there's still a file to name.
-            saved_bytes = _job_record_bytes(job)
-            if saved_bytes > MAX_JOB_FILE_BYTES:
-                self._quarantine_job_file(
-                    path,
-                    f"record cannot be saved back: it re-serializes to {saved_bytes} bytes, "
-                    f"over the {MAX_JOB_FILE_BYTES}-byte limit",
-                )
+                job, reason = self._read_job_file(path)
+            except Exception as exc:
+                # Deliberately not a list of exception types. Enumerating
+                # them was tried and lost three times running: JSONDecodeError
+                # missed UnicodeDecodeError (bytes that aren't valid UTF-8),
+                # widening to ValueError missed RecursionError (json.loads
+                # recurses per nesting level, so a few thousand nested arrays
+                # exhaust the stack), and each miss meant one corrupted file
+                # aborting the server's entire startup, every start, forever.
+                #
+                # The reason the list kept being wrong is that the list was
+                # the wrong idea: what matters is not which way this file is
+                # broken but that a broken file costs only itself. This is
+                # untrusted input, parsed in a loop, and every outcome here is
+                # reported and quarantined -- so catch everything and say what
+                # happened. (BaseException still passes: Ctrl-C must work.)
+                job, reason = None, f"unexpected failure while reading: {exc!r}"
+            if job is None:
+                self._quarantine_job_file(path, reason or "unusable job record")
                 continue
             self._jobs[job.id] = job
 
@@ -968,10 +1020,16 @@ class JobStore:
         """Returns (job, created). created is False when an existing
         done/queued/running job for this digest+target was reused instead of
         starting a new one."""
-        # Bounded before it reaches _resolve_title, so neither the stored
-        # title nor the "-2"/"-3" variants derived from it can grow the job
-        # record without limit (see MAX_TITLE_CHARS).
-        requested_title = requested_title[:MAX_TITLE_CHARS]
+        # Normalized before it reaches _resolve_title, for one reason with
+        # two halves: a title is the only free-text field a caller controls,
+        # and the record it lands in must always be *savable*. Bounded, so
+        # neither it nor the "-2"/"-3" variants derived from it can grow the
+        # record without limit (MAX_TITLE_CHARS); and forced through a UTF-8
+        # round trip, so a lone surrogate arriving from an upstream decode
+        # can't produce a job whose record won't encode -- the same defect
+        # _validate_job_record rejects on the way in, closed here on the way
+        # out rather than left to blow up at write time.
+        requested_title = _storable(requested_title)[:MAX_TITLE_CHARS]
         with self._lock:
             reusable = self.find_reusable(digest, target)
             if reusable is not None:
@@ -1019,7 +1077,61 @@ class JobStore:
             job = self.get_job(job_id)
             if job is None:
                 continue
-            self._run_job(job)
+            try:
+                self._run_job(job)
+            except Exception as exc:
+                # The worker is a singleton: if it dies, no job ever runs
+                # again and every later upload sits "queued" forever, with
+                # nothing in the UI to say why. That is a far worse outcome
+                # than any single job failing, so nothing a job can do is
+                # allowed to end this loop. (_run_job handles its own
+                # expected failures -- this catches the unexpected, e.g. a
+                # hand-edited record whose paths the filesystem rejects.)
+                _warn(f"[stemlab-web] job {job_id}: worker raised {exc!r}; marking it failed")
+                self._force_error(job, f"internal error: {exc!r}")
+
+    def _force_error(self, job: Job, message: str) -> None:
+        """Best-effort "this job is over and it failed", for the worker's
+        last-resort handler. Best-effort because it runs after something
+        already went wrong in a way we didn't anticipate, so it must not be
+        able to throw a second time."""
+        try:
+            with self._lock:
+                job.status = "error"
+                job.error = _clamp_error(message)
+                job.finished_at = _now_iso()
+                self._write_job(job)
+        except Exception as exc:
+            _warn(f"[stemlab-web] job {job.id}: could not even record its failure: {exc!r}")
+
+    def _log_path_for(self, job: Job) -> Path:
+        """Where this job's log goes.
+
+        Normally `out_dir / job.log`, but `job.log` comes from a record on
+        disk and can name something the filesystem refuses outright -- an
+        embedded NUL (ValueError), bytes no filename encoding accepts
+        (OSError). Opening it is checked here rather than discovered halfway
+        through the run, when the failure would land in the *error handler*
+        and take the worker down with it. On refusal the job gets the
+        canonical path instead, and its record is corrected to match so the
+        UI still finds the log it actually has.
+        """
+        default = self.logs_dir / f"{job.id}.log"
+        if job.log:
+            candidate = self.out_dir / job.log
+            try:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                with candidate.open("a", encoding="utf-8"):
+                    pass
+                return candidate
+            except (OSError, ValueError) as exc:
+                _warn(
+                    f"[stemlab-web] job {job.id}: log path {job.log!r} is unusable "
+                    f"({exc}); falling back to {default.name}"
+                )
+        default.parent.mkdir(parents=True, exist_ok=True)
+        job.log = str(Path("web") / "logs" / f"{job.id}.log")
+        return default
 
     def _run_job(self, job: Job) -> None:
         with self._lock:
@@ -1040,9 +1152,11 @@ class JobStore:
             job.started_at = _now_iso()
             self._write_job(job)
 
+        log_path = self._log_path_for(job)
+        # No guard needed on this one: building a Path never fails, and
+        # .exists() answers False (rather than raising) for a path the OS
+        # can't even represent, such as one with an embedded NUL.
         upload_path = self.out_dir / job.upload if job.upload else None
-        log_path = self.out_dir / job.log if job.log else self.logs_dir / f"{job.id}.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             if upload_path is None or not upload_path.exists():
@@ -1050,8 +1164,14 @@ class JobStore:
             rc = self._runner(upload_path, self.out_dir, job.title, job.target, log_path)
         except Exception as exc:  # runner itself blew up (not the subprocess exit code)
             rc = 1
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(f"\n[stemlab-web] runner raised: {exc!r}\n")
+            try:
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(f"\n[stemlab-web] runner raised: {exc!r}\n")
+            except (OSError, ValueError) as log_exc:
+                # Reporting a failure must not itself become one: the job is
+                # already failing, and the error tail below will just say the
+                # log is unavailable.
+                _warn(f"[stemlab-web] job {job.id}: could not write to its log: {log_exc}")
 
         safe = safe_filename(job.title)
         expected_player = self.out_dir / safe / f"{safe}.{job.target}.player.html"
@@ -1081,6 +1201,28 @@ class JobStore:
                 job.status = "error"
                 job.error = _tail(log_path, 8)
             self._write_job(job)
+
+
+def _storable(text: str) -> str:
+    """`text` reduced to something `_validate_job_record` will accept back.
+
+    Two transformations, both for the same reason -- a value that can be
+    held in memory but not read back off disk turns a job into one that
+    quietly disappears on the next start:
+
+    * Characters that won't survive a UTF-8 encode become "?" (the codec's
+      substitute when *encoding*). Lone surrogates are the case in practice:
+      they decode out of JSON, and out of some upstream byte handling, into
+      a perfectly ordinary str that Python then refuses to encode.
+    * NUL bytes are dropped. They're legal in a str and in JSON and nowhere
+      else here -- a path containing one raises from every filesystem call,
+      and a title containing one can't become a folder name.
+
+    This is deliberately the exact inverse of what the validator rejects:
+    normalizing on the way in is what lets "anything we write, we can read"
+    be a property rather than a hope.
+    """
+    return text.encode("utf-8", errors="replace").decode("utf-8").replace("\x00", "")
 
 
 def _clamp_error(text: str) -> str:

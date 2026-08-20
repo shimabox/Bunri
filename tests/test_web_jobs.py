@@ -1603,21 +1603,25 @@ def test_lone_surrogate_in_a_field_is_quarantined_and_startup_continues(tmp_path
 def test_a_record_that_cannot_be_saved_back_is_quarantined_on_load(tmp_path):
     """The read limit and the write limit have to agree. A compact record of
     exactly MAX_JOB_FILE_BYTES passes the size check on the way in, but the
-    canonical form is indented, so writing it back overflows -- and with a
-    giant title rather than a giant error, there is nothing the serializer
-    can trim. Accepting it meant the recovery path re-saved it oversized and
-    the *next* start quarantined it: the job vanishing one restart later,
-    with nothing reported at the time it was actually lost."""
+    canonical form is indented, so writing it back overflows -- and with the
+    bulk in a field the serializer cannot trim (`error` is the only one it
+    can), there is no way to save it at all. Accepting it meant the recovery
+    path re-saved it oversized and the *next* start quarantined it: the job
+    vanishing one restart later, with nothing reported at the time it was
+    actually lost.
+
+    `digest` carries the bulk here rather than `title`, which has a cap of
+    its own -- this is specifically the size check, not that one."""
     from stemlab.web.jobs import MAX_JOB_FILE_BYTES, _serialize_job_within_limit
 
     jobs_dir = tmp_path / "web" / "jobs"
     jobs_dir.mkdir(parents=True)
 
     payload = _valid_job_payload(
-        id="j-unsavable", status="queued", title="",
+        id="j-unsavable", status="queued", digest="",
         started_at=None, finished_at=None, package=None, error=None,
     )
-    payload["title"] = "T" * (MAX_JOB_FILE_BYTES - len(json.dumps(payload)))
+    payload["digest"] = "d" * (MAX_JOB_FILE_BYTES - len(json.dumps(payload)))
     compact = json.dumps(payload)
     assert len(compact) == MAX_JOB_FILE_BYTES, "fixture must be accepted by the read-side check"
     (jobs_dir / "j-unsavable.json").write_text(compact, encoding="utf-8")
@@ -1634,6 +1638,30 @@ def test_a_record_that_cannot_be_saved_back_is_quarantined_on_load(tmp_path):
     assert store.get_job("j-unsavable") is None, "an unsavable record must never be admitted"
     assert len(_quarantined_names(tmp_path, "j-unsavable")) == 1
     assert store.get_job("j-slim") is not None
+
+
+def test_an_over_long_title_is_rejected_on_load(tmp_path):
+    """`package` is derived from the title at roughly twice its length, so a
+    record with an unbounded title grows *after* it is admitted, the moment
+    the job succeeds -- and `error` being the only trimmable field means the
+    writer can't recover from it. The cap create_job applies is therefore
+    enforced on the way in too. Nothing this app writes can trip it."""
+    from stemlab.web.jobs import MAX_TITLE_CHARS
+
+    _write_raw_job_file(
+        tmp_path, "j-longtitle",
+        _valid_job_payload(id="j-longtitle", title="T" * (MAX_TITLE_CHARS + 1)),
+    )
+    _write_raw_job_file(
+        tmp_path, "j-attheborder",
+        _valid_job_payload(id="j-attheborder", title="T" * MAX_TITLE_CHARS),
+    )
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    assert store.get_job("j-longtitle") is None
+    assert len(_quarantined_names(tmp_path, "j-longtitle")) == 1
+    assert store.get_job("j-attheborder") is not None, "the cap itself is not over it"
 
 
 def test_an_accepted_record_can_always_be_written_back(tmp_path):
