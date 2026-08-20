@@ -442,13 +442,21 @@ def test_preexisting_cli_package_folder_is_a_collision(tmp_path):
     assert job.title == "Song-2"
 
 
-def _spawn_marked_sleeper():
+def _spawn_marked_sleeper(*, own_group: bool = True):
     """A throwaway process whose command line contains "stemlab.cli" (inside
-    the -c payload), so the sidecar reaper's pid-recycling guard accepts it."""
+    the -c payload), so the sidecar reaper's pid-recycling guard accepts it.
+
+    `own_group` mirrors default_runner's start_new_session=True, which makes
+    the CLI lead its own process group -- the only shape the reaper is
+    willing to signal. Pass own_group=False to reproduce a sidecar written by
+    an older server version, which the reaper must refuse to touch."""
     import subprocess
     import sys
 
-    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)  # stemlab.cli"])
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)  # stemlab.cli"],
+        start_new_session=own_group,
+    )
 
 
 def test_terminate_pid_from_sidecar_kills_only_matching_processes(tmp_path):
@@ -519,7 +527,7 @@ def _spawn_sigterm_ignoring_sleeper():
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "time.sleep(60)  # stemlab.cli\n"
     )
-    return subprocess.Popen([sys.executable, "-c", code])
+    return subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
 
 
 def test_terminate_pid_from_sidecar_escalates_to_sigkill_when_sigterm_is_ignored(tmp_path):
@@ -548,11 +556,11 @@ def test_terminate_pid_from_sidecar_keeps_sidecar_when_sigterm_raises_non_lookup
     tmp_path, monkeypatch
 ):
     """A PermissionError (or any OSError other than ProcessLookupError) from
-    the SIGTERM os.kill call means the process's actual fate is unknown --
-    unlike a confirmed-gone process, the sidecar must be *kept* (not
-    discarded) so the next startup's recovery gets a chance to deal with
-    whatever's actually there. Regression for a bug where the sidecar was
-    unconditionally removed on any OSError from the SIGTERM call."""
+    the SIGTERM call means the process's actual fate is unknown -- unlike a
+    confirmed-gone process, the sidecar must be *kept* (not discarded) so the
+    next startup's recovery gets a chance to deal with whatever's actually
+    there. Regression for a bug where the sidecar was unconditionally removed
+    on any OSError from the SIGTERM call."""
     from stemlab.web import jobs as jobs_module
     from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
@@ -561,14 +569,14 @@ def test_terminate_pid_from_sidecar_keeps_sidecar_when_sigterm_raises_non_lookup
     try:
         (tmp_path / "j-perm.pid").write_text(str(proc.pid))
 
-        real_kill = jobs_module.os.kill
+        real_killpg = jobs_module.os.killpg
 
-        def fake_kill(pid, sig):
+        def fake_killpg(pgid, sig):
             if sig == 15:  # SIGTERM
-                raise PermissionError("simulated: not permitted to signal this process")
-            return real_kill(pid, sig)
+                raise PermissionError("simulated: not permitted to signal this group")
+            return real_killpg(pgid, sig)
 
-        monkeypatch.setattr(jobs_module.os, "kill", fake_kill)
+        monkeypatch.setattr(jobs_module.os, "killpg", fake_killpg)
 
         result = terminate_pid_from_sidecar(log)
 
@@ -597,24 +605,24 @@ def test_terminate_pid_from_sidecar_removes_stale_sidecar_when_sigterm_finds_pro
     try:
         (tmp_path / "j-gone.pid").write_text(str(proc.pid))
 
-        real_kill = jobs_module.os.kill
+        real_killpg = jobs_module.os.killpg
         calls: list[tuple[int, int]] = []
         simulated = {"done": False}
 
-        def fake_kill(pid, sig):
-            # Only the very first SIGTERM aimed at our target pid is faked
+        def fake_killpg(pgid, sig):
+            # Only the very first SIGTERM aimed at our target group is faked
             # as "process already gone" -- everything else (including the
             # test's own cleanup in `finally` below) must go through to the
-            # real os.kill, or this monkeypatch would interfere with
+            # real os.killpg, or this monkeypatch would interfere with
             # unrelated signalling for the rest of the test.
-            if not simulated["done"] and pid == proc.pid and sig == 15:
+            if not simulated["done"] and pgid == proc.pid and sig == 15:
                 simulated["done"] = True
-                calls.append((pid, sig))
+                calls.append((pgid, sig))
                 raise ProcessLookupError("simulated: process already exited")
-            calls.append((pid, sig))
-            return real_kill(pid, sig)
+            calls.append((pgid, sig))
+            return real_killpg(pgid, sig)
 
-        monkeypatch.setattr(jobs_module.os, "kill", fake_kill)
+        monkeypatch.setattr(jobs_module.os, "killpg", fake_killpg)
 
         result = terminate_pid_from_sidecar(log)
 
@@ -644,11 +652,15 @@ def _pid_running(pid: int) -> bool:
     return True
 
 
-def _spawn_marked_leader_with_grandchild(grandchild_pid_file: Path):
-    """A marker-matching process that leads its own process group (exactly
-    what default_runner's start_new_session=True arranges for the CLI) and
-    spawns a child of its own -- standing in for the CLI's ffmpeg. It reports
-    that child's pid to `grandchild_pid_file`, then sleeps."""
+def _spawn_marked_parent_with_child(grandchild_pid_file: Path, *, own_group: bool = True):
+    """A marker-matching process that spawns a child of its own -- standing
+    in for the CLI and its ffmpeg. It reports that child's pid to
+    `grandchild_pid_file`, then sleeps.
+
+    `own_group=True` mirrors default_runner's start_new_session=True (the
+    whole tree shares one signallable process group); `own_group=False`
+    reproduces the shape a pre-fix server left behind, where no group-wide
+    signal is possible."""
     import subprocess
     import sys
 
@@ -659,7 +671,7 @@ def _spawn_marked_leader_with_grandchild(grandchild_pid_file: Path):
         "time.sleep(60)  # stemlab.cli\n"
     )
     return subprocess.Popen(
-        [sys.executable, "-c", code, str(grandchild_pid_file)], start_new_session=True
+        [sys.executable, "-c", code, str(grandchild_pid_file)], start_new_session=own_group
     )
 
 
@@ -676,7 +688,7 @@ def test_terminate_pid_from_sidecar_kills_the_whole_process_tree(tmp_path):
 
     log = tmp_path / "j-tree.log"
     grandchild_pid_file = tmp_path / "grandchild.pid"
-    leader = _spawn_marked_leader_with_grandchild(grandchild_pid_file)
+    leader = _spawn_marked_parent_with_child(grandchild_pid_file)
     grandchild_pid = None
     try:
         _wait_until(
@@ -702,17 +714,196 @@ def test_terminate_pid_from_sidecar_kills_the_whole_process_tree(tmp_path):
             _os.kill(grandchild_pid, 9)
 
 
-def _spawn_marked_group_leader():
-    """Like _spawn_marked_sleeper, but in its own process group (as
-    default_runner starts the real CLI), so the group-signalling path -- and
-    therefore os.killpg -- is the one exercised."""
-    import subprocess
-    import sys
+def _write_running_job_file(out_dir: Path, job_id: str, upload: Path) -> None:
+    """A job record left "running" by a previous server, with a pid sidecar
+    at web/logs/<id>.pid -- the exact shape _load_and_recover has to reason
+    about on startup."""
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "web" / "logs").mkdir(parents=True, exist_ok=True)
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps({
+        "id": job_id, "digest": "dx", "title": "Song", "target": "guitar",
+        "status": "running", "created_at": "2026-07-12T00:00:00+00:00",
+        "started_at": "2026-07-12T00:00:01+00:00",
+        "log": f"web/logs/{job_id}.log",
+        "upload": str(upload.relative_to(out_dir)),
+    }), encoding="utf-8")
 
-    return subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)  # stemlab.cli"],
-        start_new_session=True,
+
+def test_legacy_non_group_leader_sidecar_is_held_without_signalling_anything(tmp_path):
+    """Regression for sidecars written before the CLI was given its own
+    process group: that pid isn't a group leader, so there is no safe way to
+    reach its children. killpg on it would address our *own* server's group,
+    and signalling the lone pid is the orphaned-ffmpeg bug itself (the user
+    saw outcome=stopped with the child still alive, and the job re-queued
+    into a file fight with it).
+
+    The reaper must therefore leave such a process completely alone, report
+    FAILED, keep the sidecar, and let the recovery path hold the job -- which
+    self-resolves once the old process exits on its own."""
+    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+
+    upload = _make_upload(tmp_path)
+    _write_running_job_file(tmp_path, "j-legacy", upload)
+    logs_dir = tmp_path / "web" / "logs"
+    child_pid_file = tmp_path / "legacy-child.pid"
+
+    # Exactly what the current released server leaves behind: no new session.
+    parent = _spawn_marked_parent_with_child(child_pid_file, own_group=False)
+    child_pid = None
+    try:
+        _wait_until(lambda: child_pid_file.exists() and child_pid_file.read_text().strip() != "")
+        child_pid = int(child_pid_file.read_text().strip())
+        (logs_dir / "j-legacy.pid").write_text(str(parent.pid))
+
+        outcome = terminate_pid_from_sidecar(
+            logs_dir / "j-legacy.log", grace_seconds=1.0, poll_interval=0.05
+        )
+
+        assert outcome is TerminationOutcome.FAILED
+        assert parent.poll() is None, "a pid we cannot safely signal must be left running"
+        assert _pid_running(child_pid), (
+            "signalling the parent alone is the very bug this guards against -- "
+            "its child would be orphaned rather than stopped"
+        )
+        assert (logs_dir / "j-legacy.pid").exists(), "the sidecar must be kept for a later retry"
+
+        # ...and the recovery path must act on that verdict: no re-run.
+        runner = FakeRunner()
+        store = JobStore(tmp_path, runner=runner)
+        time.sleep(0.3)
+        assert store.get_job("j-legacy").status == "running"
+        assert runner.calls == [], "the job must not be re-run beside the surviving process"
+        assert (logs_dir / "j-legacy.pid").exists()
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+        if child_pid is not None and _pid_running(child_pid):
+            import os as _os
+
+            _os.kill(child_pid, 9)
+
+
+@pytest.mark.parametrize("failure_kind", ["ps-unavailable", "ps-timeout"])
+def test_unverifiable_liveness_holds_the_job_instead_of_assuming_the_process_is_gone(
+    tmp_path, monkeypatch, failure_kind
+):
+    """Regression for collapsing "ps couldn't tell us" into "the process is
+    gone": that made the reaper drop the sidecar and report NOTHING_TO_STOP,
+    so the recovery path cheerfully re-ran a job whose previous process was
+    demonstrably still alive (the user saw rerun_started=True with
+    old_process_alive=True and the sidecar deleted). An unverifiable check
+    must fail closed -- FAILED, sidecar kept, job held."""
+    import subprocess
+
+    from stemlab.web import jobs as jobs_module
+    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+
+    failure: Exception = (
+        OSError("simulated: cannot exec ps")
+        if failure_kind == "ps-unavailable"
+        else subprocess.TimeoutExpired(cmd="ps", timeout=10)
     )
+
+    upload = _make_upload(tmp_path)
+    _write_running_job_file(tmp_path, "j-unknown", upload)
+    logs_dir = tmp_path / "web" / "logs"
+
+    orphan = _spawn_marked_sleeper()
+    try:
+        (logs_dir / "j-unknown.pid").write_text(str(orphan.pid))
+
+        def broken_ps(*args, **kwargs):
+            raise failure
+
+        monkeypatch.setattr(jobs_module.subprocess, "run", broken_ps)
+
+        outcome = terminate_pid_from_sidecar(logs_dir / "j-unknown.log")
+
+        assert outcome is TerminationOutcome.FAILED
+        assert (logs_dir / "j-unknown.pid").exists(), (
+            "an unverifiable process must keep its sidecar, not have it deleted"
+        )
+        assert orphan.poll() is None
+
+        runner = FakeRunner()
+        store = JobStore(tmp_path, runner=runner)
+        time.sleep(0.3)
+        assert store.get_job("j-unknown").status == "running"
+        assert runner.calls == [], "the job must not be re-run while liveness is unknown"
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+
+
+def test_unreadable_sidecar_holds_the_job_but_a_missing_one_does_not(tmp_path, monkeypatch):
+    """The three sidecar-read outcomes must not be lumped together: absent
+    means "nothing to stop" (the common, healthy case), while an I/O error
+    means we have no idea what the previous run left behind and must hold."""
+    from stemlab.web import jobs as jobs_module
+    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+
+    logs_dir = tmp_path / "web" / "logs"
+    logs_dir.mkdir(parents=True)
+
+    # No sidecar at all -> nothing to stop.
+    assert (
+        terminate_pid_from_sidecar(logs_dir / "j-absent.log") is TerminationOutcome.NOTHING_TO_STOP
+    )
+
+    sidecar = logs_dir / "j-unreadable.pid"
+    sidecar.write_text("12345")
+    real_read_text = jobs_module.Path.read_text
+
+    def denying_read_text(self, *args, **kwargs):
+        if self.name == "j-unreadable.pid":
+            raise PermissionError("simulated: sidecar not readable")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(jobs_module.Path, "read_text", denying_read_text)
+
+    assert (
+        terminate_pid_from_sidecar(logs_dir / "j-unreadable.log") is TerminationOutcome.FAILED
+    )
+    assert sidecar.exists(), "an unreadable sidecar must be kept, not silently dropped"
+
+
+def test_garbage_in_the_sidecar_holds_the_job_and_says_it_needs_a_human(tmp_path, capsys):
+    """A sidecar we can read but can't parse is the one held state that will
+    never clear itself, so it must both hold the job and say plainly that
+    someone has to remove the file."""
+    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+
+    logs_dir = tmp_path / "web" / "logs"
+    logs_dir.mkdir(parents=True)
+    sidecar = logs_dir / "j-garbage.pid"
+    sidecar.write_text("not-a-pid")
+
+    assert terminate_pid_from_sidecar(logs_dir / "j-garbage.log") is TerminationOutcome.FAILED
+    assert sidecar.exists()
+    err = capsys.readouterr().err
+    assert "j-garbage.pid" in err
+    assert "by hand" in err, "the operator must be told this one needs manual clearing"
+
+
+def test_a_confirmed_dead_process_still_yields_nothing_to_stop(tmp_path):
+    """The fail-closed handling above must not make the healthy path
+    paranoid: when `ps` runs fine and reports no such process, that really is
+    a stale sidecar -- drop it and let the job be re-queued."""
+    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+
+    logs_dir = tmp_path / "web" / "logs"
+    logs_dir.mkdir(parents=True)
+
+    dead = _spawn_marked_sleeper()
+    dead.kill()
+    dead.wait()
+
+    sidecar = logs_dir / "j-dead.pid"
+    sidecar.write_text(str(dead.pid))
+
+    assert terminate_pid_from_sidecar(logs_dir / "j-dead.log") is TerminationOutcome.NOTHING_TO_STOP
+    assert not sidecar.exists(), "a confirmed-stale sidecar is still cleaned up"
 
 
 def test_recovery_holds_a_job_whose_previous_process_could_not_be_stopped(
@@ -732,7 +923,7 @@ def test_recovery_holds_a_job_whose_previous_process_could_not_be_stopped(
     jobs_dir.mkdir(parents=True)
     logs_dir.mkdir(parents=True)
 
-    orphan = _spawn_marked_group_leader()
+    orphan = _spawn_marked_sleeper()
     blocking = {"on": True}
     try:
         (logs_dir / "j-stuck.pid").write_text(str(orphan.pid))
