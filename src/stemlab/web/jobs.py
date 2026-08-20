@@ -47,6 +47,13 @@ from typing import Any, Callable, Optional
 # 2 hours: generous upper bound for a single separation + export on CPU.
 DEFAULT_TIMEOUT_SECONDS = 2 * 60 * 60
 
+# Job records we write are a few hundred bytes (see Job's fields -- ids,
+# statuses, a couple of paths); 1 MiB leaves four orders of magnitude of
+# headroom for a title full of multi-byte characters and a long error tail,
+# while still capping what a hand-placed or corrupted file can make startup
+# read and parse. Anything past it is not a job record.
+MAX_JOB_FILE_BYTES = 1024 * 1024
+
 # Same rule as stemlab.package._safe_filename -- see module docstring for why
 # this is duplicated rather than imported.
 _UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|#%]')
@@ -603,17 +610,34 @@ class JobStore:
 
     def _load_and_recover(self) -> None:
         for path in sorted(self.jobs_dir.glob("j-*.json")):
+            # Size first, so a rogue file is never read into memory or
+            # handed to the parser at all. A failed stat is treated like any
+            # other unreadable file: quarantine and move on.
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                self._quarantine_job_file(path, f"unreadable: {exc}")
+                continue
+            if size > MAX_JOB_FILE_BYTES:
+                self._quarantine_job_file(
+                    path, f"job file is {size} bytes, over the {MAX_JOB_FILE_BYTES}-byte limit"
+                )
+                continue
+
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, RecursionError) as exc:
                 # ValueError rather than json.JSONDecodeError: decoding runs
                 # before parsing, and a file with bytes that aren't valid
                 # UTF-8 raises UnicodeDecodeError. Both are ValueError
-                # subclasses, and both mean the same thing here -- this file
-                # is not a job record we can read -- so catching the base
-                # class keeps a truncated/corrupted write from taking the
-                # whole server's startup down instead of just quarantining
-                # the one bad file.
+                # subclasses. RecursionError is neither -- it's what
+                # json.loads raises on deeply nested input, since it
+                # recurses once per level and a few thousand nested arrays
+                # exhaust the stack in well under the size limit above.
+                # All three mean the same thing here -- this file is not a
+                # job record we can read -- and all three must be contained,
+                # or one corrupted file takes the whole server's startup
+                # down instead of just being quarantined.
                 self._quarantine_job_file(path, f"unreadable/invalid JSON: {exc}")
                 continue
             # The id a well-formed file for this path *should* have -- ".json"

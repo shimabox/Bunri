@@ -1378,6 +1378,67 @@ def test_invalid_utf8_bytes_are_quarantined_and_startup_continues(tmp_path):
     assert store.get_job("j-readable") is not None, "other jobs must still load"
 
 
+def test_deeply_nested_json_is_quarantined_and_startup_continues(tmp_path):
+    """json.loads recurses once per nesting level, so a few thousand nested
+    arrays exhaust the stack and raise RecursionError -- which is a
+    RuntimeError, not a ValueError, and so slipped straight past the
+    decode/parse handler and aborted JobStore construction. ~20KB of "[[[["
+    is enough to take the whole server's startup down."""
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    depth = 10_000
+    (jobs_dir / "j-deep.json").write_text("[" * depth + "]" * depth, encoding="utf-8")
+    _write_raw_job_file(tmp_path, "j-shallow", _valid_job_payload(id="j-shallow"))
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    names = [p.name for p in jobs_dir.iterdir()]
+    assert "j-deep.json" not in names
+    assert len(_quarantined_names(tmp_path, "j-deep")) == 1, names
+    assert store.get_job("j-shallow") is not None, "other jobs must still load"
+
+
+def test_oversized_job_file_is_quarantined_without_being_parsed(tmp_path):
+    """Belt to the RecursionError braces: a job record is a few hundred
+    bytes, so anything past the size limit is rejected on its stat alone --
+    never read into memory, never handed to the parser."""
+    from stemlab.web.jobs import MAX_JOB_FILE_BYTES
+
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    # Syntactically valid JSON, just absurdly large: a job-shaped object
+    # padded with thousands of fields Job has never heard of.
+    bloat = _valid_job_payload(id="j-huge")
+    bloat.update({f"junk-{i}": "x" * 256 for i in range(6000)})
+    payload = json.dumps(bloat)
+    assert len(payload) > MAX_JOB_FILE_BYTES, "the fixture must actually exceed the limit"
+    (jobs_dir / "j-huge.json").write_text(payload, encoding="utf-8")
+    _write_raw_job_file(tmp_path, "j-small", _valid_job_payload(id="j-small"))
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    assert store.get_job("j-huge") is None
+    assert len(_quarantined_names(tmp_path, "j-huge")) == 1
+    assert store.get_job("j-small") is not None
+
+
+def test_a_job_file_just_under_the_size_limit_still_loads(tmp_path):
+    """The size cap must not become a new way to lose good records: a
+    legitimately chatty job (a long error tail, a multi-byte title) is
+    nowhere near the limit and has to keep loading."""
+    from stemlab.web.jobs import MAX_JOB_FILE_BYTES
+
+    payload = _valid_job_payload(id="j-chatty", status="error", error="ffmpeg said no. " * 500)
+    encoded = json.dumps(payload)
+    assert len(encoded) < MAX_JOB_FILE_BYTES
+    _write_raw_job_file(tmp_path, "j-chatty", payload)
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    assert store.get_job("j-chatty") is not None
+    assert _quarantined_names(tmp_path, "j-chatty") == []
+
+
 def test_wrong_type_field_is_quarantined(tmp_path):
     _write_raw_job_file(tmp_path, "j-bad-type", _valid_job_payload(id="j-bad-type", digest=123))
     store = JobStore(tmp_path, runner=FakeRunner())
