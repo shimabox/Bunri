@@ -1576,6 +1576,92 @@ def test_a_job_file_one_byte_over_the_size_limit_is_quarantined(tmp_path):
     assert len(_quarantined_names(tmp_path, "j-onebyte")) == 1
 
 
+def test_lone_surrogate_in_a_field_is_quarantined_and_startup_continues(tmp_path):
+    """A JSON `"\\ud800"` escape decodes to a lone surrogate: a perfectly
+    ordinary Python str that passes every schema check, and that Python
+    then refuses to encode back to UTF-8. A queued record holding one used
+    to be accepted, get re-saved by the recovery path, and raise
+    UnicodeEncodeError out of JobStore construction -- never quarantined, so
+    every subsequent start failed the same way.
+
+    Reading a record has to imply being able to write it back, so this is
+    now a validation failure like any other."""
+    payload = _valid_job_payload(
+        id="j-surrogate", status="queued", title="Bad\ud800Title",
+        started_at=None, finished_at=None, package=None,
+    )
+    _write_raw_job_file(tmp_path, "j-surrogate", payload)
+    _write_raw_job_file(tmp_path, "j-clean", _valid_job_payload(id="j-clean"))
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    assert store.get_job("j-surrogate") is None
+    assert len(_quarantined_names(tmp_path, "j-surrogate")) == 1
+    assert store.get_job("j-clean") is not None, "other jobs must still load"
+
+
+def test_a_record_that_cannot_be_saved_back_is_quarantined_on_load(tmp_path):
+    """The read limit and the write limit have to agree. A compact record of
+    exactly MAX_JOB_FILE_BYTES passes the size check on the way in, but the
+    canonical form is indented, so writing it back overflows -- and with a
+    giant title rather than a giant error, there is nothing the serializer
+    can trim. Accepting it meant the recovery path re-saved it oversized and
+    the *next* start quarantined it: the job vanishing one restart later,
+    with nothing reported at the time it was actually lost."""
+    from stemlab.web.jobs import MAX_JOB_FILE_BYTES, _serialize_job_within_limit
+
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+
+    payload = _valid_job_payload(
+        id="j-unsavable", status="queued", title="",
+        started_at=None, finished_at=None, package=None, error=None,
+    )
+    payload["title"] = "T" * (MAX_JOB_FILE_BYTES - len(json.dumps(payload)))
+    compact = json.dumps(payload)
+    assert len(compact) == MAX_JOB_FILE_BYTES, "fixture must be accepted by the read-side check"
+    (jobs_dir / "j-unsavable.json").write_text(compact, encoding="utf-8")
+
+    # ...and it really is unsavable: the canonical form overflows, and no
+    # amount of error-trimming helps, because the bulk is in the title.
+    fat = Job.from_dict(payload)
+    assert len(_serialize_job_within_limit(fat).encode("utf-8")) > MAX_JOB_FILE_BYTES
+
+    _write_raw_job_file(tmp_path, "j-slim", _valid_job_payload(id="j-slim"))
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    assert store.get_job("j-unsavable") is None, "an unsavable record must never be admitted"
+    assert len(_quarantined_names(tmp_path, "j-unsavable")) == 1
+    assert store.get_job("j-slim") is not None
+
+
+def test_an_accepted_record_can_always_be_written_back(tmp_path):
+    """The property both tests above exist to establish, checked directly on
+    the healthy path: whatever the loader admits, _write_job can save --
+    within the limit and without an encoding error."""
+    from stemlab.web.jobs import MAX_JOB_FILE_BYTES, _job_record_bytes
+
+    _write_raw_job_file(tmp_path, "j-normal", _valid_job_payload(id="j-normal"))
+    _write_raw_job_file(
+        tmp_path, "j-utf8",
+        _valid_job_payload(id="j-utf8", title="曲名 — ライブ音源 🎸", status="queued",
+                           started_at=None, finished_at=None, package=None),
+    )
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    for job_id in ("j-normal", "j-utf8"):
+        job = store.get_job(job_id)
+        assert job is not None, f"{job_id} should have been accepted"
+        assert _job_record_bytes(job) <= MAX_JOB_FILE_BYTES
+        store._write_job(job)  # must not raise
+        written = (tmp_path / "web" / "jobs" / f"{job_id}.json").read_text(encoding="utf-8")
+        assert json.loads(written)["id"] == job_id
+
+    assert store.get_job("j-utf8").title == "曲名 — ライブ音源 🎸"
+
+
 def test_wrong_type_field_is_quarantined(tmp_path):
     _write_raw_job_file(tmp_path, "j-bad-type", _valid_job_payload(id="j-bad-type", digest=123))
     store = JobStore(tmp_path, runner=FakeRunner())

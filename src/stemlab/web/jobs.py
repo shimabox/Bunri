@@ -513,6 +513,8 @@ _VALID_STATUSES = {"queued", "running", "done", "error"}
 _REQUIRED_STR_FIELDS = ("id", "digest", "title", "target", "status", "created_at")
 _OPTIONAL_DATETIME_FIELDS = ("started_at", "finished_at")
 _OPTIONAL_STR_FIELDS = ("error", "package", "log", "upload")
+# Every field of Job that can hold text, for checks that apply to all of them.
+_ALL_STR_FIELDS = _REQUIRED_STR_FIELDS + _OPTIONAL_DATETIME_FIELDS + _OPTIONAL_STR_FIELDS
 
 
 def _datetime_problem(value: str, name: str) -> Optional[str]:
@@ -575,25 +577,48 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
         value = data.get(name)
         if value is not None and not isinstance(value, str):
             return f"non-string field: {name!r}"
+    # Accepting a record obliges us to be able to write it back out again:
+    # every job the recovery path touches gets re-saved, and a string that
+    # can be *decoded* from JSON is not necessarily one Python can encode to
+    # UTF-8 afterwards. A lone surrogate is the case that bites -- `"\ud800"`
+    # parses happily and passes every check above, then raises
+    # UnicodeEncodeError from _write_job and takes startup down with it,
+    # having never been quarantined. Reject it here instead, where a bad
+    # record costs nothing but its own file.
+    for name in _ALL_STR_FIELDS:
+        value = data.get(name)
+        if not isinstance(value, str):
+            continue
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            return f"field {name!r} holds text that cannot be encoded as UTF-8: {exc}"
     return None
 
 
 def _serialize_job_within_limit(job: Job) -> str:
-    """`job` as the JSON that goes on disk, guaranteed to fit within
-    MAX_JOB_FILE_BYTES if it possibly can.
+    """`job` as the JSON that goes on disk.
+
+    The contract, which the loader is what makes true: for any job built
+    from a record `_load_and_recover` accepted, the result fits within
+    MAX_JOB_FILE_BYTES. `error` is the only field with real slack, so it is
+    what gets cut -- halved repeatedly from the front, keeping the
+    informative end, and finally dropped -- and a record whose *other*
+    fields are already too big to save is refused at load time rather than
+    accepted and then written back unsavably. That is the loop this closes:
+    accept only what can be re-saved, and re-saving always succeeds.
 
     This is the last line of defence, not the first: `_tail`'s clamp and
-    MAX_TITLE_CHARS already keep both free-length fields far below the limit,
-    so in normal operation this function just serializes and returns. It
-    exists because writing a record the loader will refuse to read is a
-    uniquely nasty failure -- the job doesn't error, it *disappears* on the
-    next start -- and that must not be one upstream oversight away.
+    MAX_TITLE_CHARS keep both free-length fields far below the limit, so in
+    normal operation the function just serializes and returns. It exists
+    because writing a record the loader will refuse to read is a uniquely
+    nasty failure -- the job doesn't error, it *disappears* on the next
+    start -- and that must not be one upstream oversight away.
 
-    `error` is the only field with any real slack, so it is what gets cut,
-    halved repeatedly (from the front, keeping the informative end) until the
-    record fits, and finally dropped altogether. `job` itself is left alone:
-    the in-memory copy keeps the full text for the UI, and only the on-disk
-    record is trimmed.
+    `job` itself is left alone: the in-memory copy keeps the full text for
+    the UI, and only the on-disk record is trimmed. Callers that need to
+    know whether the result actually fits check the returned string; the
+    function never raises.
     """
     data = job.to_dict()
 
@@ -615,20 +640,19 @@ def _serialize_job_within_limit(job: Job) -> str:
         encoded = encode(data)
 
     if too_big(encoded):
-        # Nothing left to give: something other than `error` is oversized,
-        # which the caps upstream should make impossible. Write it anyway --
-        # a record the next startup quarantines is still better than an
-        # exception here, which would take down the worker mid-job -- but say
-        # so, because it means a cap above has been outflanked.
+        # Nothing left to give: something other than `error` is oversized.
+        # Unreachable for an accepted record -- the loader rejects those --
+        # and kept only as depth behind that guarantee. Reporting it is the
+        # caller's job (see `_write_job`), since at load time "too big" is a
+        # reason to quarantine, not a reason to warn.
         data["error"] = "(error message dropped: job record too large)"
         encoded = encode(data)
-        if too_big(encoded):
-            _warn(
-                f"[stemlab-web] job {job.id}: record is {len(encoded.encode('utf-8'))} bytes "
-                f"even after dropping its error, over the {MAX_JOB_FILE_BYTES}-byte limit; "
-                "writing it anyway, but it will not survive a restart"
-            )
     return encoded
+
+
+def _job_record_bytes(job: Job) -> int:
+    """Size on disk of the record `_write_job` would write for `job`."""
+    return len(_serialize_job_within_limit(job).encode("utf-8"))
 
 
 class JobStore:
@@ -668,8 +692,32 @@ class JobStore:
 
     def _write_job(self, job: Job) -> None:
         path = self._job_path(job.id)
+        encoded = _serialize_job_within_limit(job)
+        if len(encoded.encode("utf-8", errors="backslashreplace")) > MAX_JOB_FILE_BYTES:
+            # Can't happen for a record the loader accepted (it checks this
+            # very thing before admitting one) or for a job this app built.
+            # If it ever does, saving an oversized record beats raising here
+            # and killing the worker mid-job -- but it means a cap upstream
+            # has been outflanked, so say so.
+            _warn(
+                f"[stemlab-web] job {job.id}: record exceeds the "
+                f"{MAX_JOB_FILE_BYTES}-byte limit even with its error dropped; "
+                "writing it anyway, but it will not survive a restart"
+            )
         tmp = path.with_suffix(f".json.tmp-{secrets.token_hex(4)}")
-        tmp.write_text(_serialize_job_within_limit(job), encoding="utf-8")
+        try:
+            tmp.write_text(encoded, encoding="utf-8")
+        except UnicodeEncodeError as exc:
+            # Likewise unreachable: _validate_job_record rejects text that
+            # won't encode, and nothing this app generates contains lone
+            # surrogates. Degrade rather than die -- an escaped-but-readable
+            # record keeps the server up, where the exception would abort
+            # startup (from the recovery path) or the job (from the worker).
+            _warn(
+                f"[stemlab-web] job {job.id}: record holds text that is not valid "
+                f"UTF-8 ({exc}); saving it with the offending characters escaped"
+            )
+            tmp.write_bytes(encoded.encode("utf-8", errors="backslashreplace"))
         os.replace(tmp, path)  # atomic on the same filesystem
 
     def _quarantine_job_file(self, path: Path, reason: str) -> None:
@@ -733,6 +781,22 @@ class JobStore:
                 self._quarantine_job_file(path, reason)
                 continue
             job = Job.from_dict(data)
+            # Last admission check, and the one that makes
+            # _serialize_job_within_limit's contract hold: the file we just
+            # read fits the limit, but the canonical form we would write back
+            # is indented and may not (a compact 1 MiB record re-saves
+            # larger). Admitting such a job means the recovery path re-saves
+            # it oversized and the *next* start quarantines it -- the job
+            # disappearing one restart later, for a reason nothing reported
+            # at the time. Refuse it now, while there's still a file to name.
+            saved_bytes = _job_record_bytes(job)
+            if saved_bytes > MAX_JOB_FILE_BYTES:
+                self._quarantine_job_file(
+                    path,
+                    f"record cannot be saved back: it re-serializes to {saved_bytes} bytes, "
+                    f"over the {MAX_JOB_FILE_BYTES}-byte limit",
+                )
+                continue
             self._jobs[job.id] = job
 
         # Anything that didn't reach a terminal state last time this process
