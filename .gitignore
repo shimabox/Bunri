@@ -13,3 +13,6 @@ models/
 
 # Local release-planning notes (intentionally not committed)
 OSS_RELEASE_CHECKLIST.local.md
+
+# Hypothesis's example database (local cache of failing cases).
+.hypothesis/

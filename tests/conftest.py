@@ -18,16 +18,31 @@ from hypothesis import HealthCheck, settings
 
 settings.register_profile(
     "stemlab",
-    # A few hundred examples per property: enough to reach the interesting
-    # corners of the strategies below (surrogates, size boundaries, every
-    # status) while keeping the whole suite comfortably inside a couple of
-    # minutes.
-    max_examples=200,
+    # Enough examples to reach the interesting corners of the strategies
+    # (surrogates, size boundaries, path shapes, every status) while keeping
+    # the suite quick enough that people actually run it. Most of these draw
+    # from sampled_from menus rather than open-ended text, so the space is
+    # small and covering it does not take many hundreds of tries; the few
+    # properties that want more, or that build a JobStore per example and so
+    # want fewer, say so locally.
+    max_examples=100,
     derandomize=True,
     deadline=None,
-    # Several properties build a JobStore per example, which is genuinely
-    # slow-ish; that's inherent to what's being tested, not a sign the
-    # strategy is misbehaving.
-    suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+    # All three of these flag things that are inherent to what is being
+    # tested rather than signs of a misbehaving strategy:
+    #   too_slow / function_scoped_fixture -- several properties build a real
+    #     JobStore per example, which is genuinely slow-ish.
+    #   filter_too_much -- the round-trip properties are conditional on the
+    #     loader accepting a record ("assume(job is not None)"), and the
+    #     strategies deliberately generate mostly-invalid records so that
+    #     P1/P4/P6 have something hostile to work with. A high filter rate is
+    #     the intended shape, not a defect. The strategies still mix the
+    #     derived (acceptable) values in, so the conditional properties get a
+    #     healthy supply of examples -- see _job_payloads.
+    suppress_health_check=[
+        HealthCheck.too_slow,
+        HealthCheck.function_scoped_fixture,
+        HealthCheck.filter_too_much,
+    ],
 )
 settings.load_profile("stemlab")

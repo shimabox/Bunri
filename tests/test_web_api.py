@@ -231,23 +231,26 @@ def test_dotfile_anywhere_under_a_package_path_is_blocked(client):
     assert client.get("/packages/Song/.secret").status_code == 404
 
 
-def _write_legacy_job_file(out_dir: Path, job_id: str, **overrides) -> None:
-    """Simulates a job JSON persisted by a server version predating the
-    filename sanitizer's "#"/"%" stripping -- its package_url must still be
-    served as a valid, correctly percent-encoded URL."""
+def _write_job_file(out_dir: Path, job_id: str, **overrides) -> None:
+    """A persisted job record. `package` and `log` default to the values the
+    store derives from the title/target/id, because those are the only ones
+    the loader accepts -- a record may only claim its own package and write
+    its own log."""
     import json
 
+    title = overrides.get("title", "Song 1")
+    target = overrides.get("target", "guitar")
     payload = {
         "id": job_id,
         "digest": "d-legacy",
-        "title": "Song #1",
-        "target": "guitar",
+        "title": title,
+        "target": target,
         "status": "done",
         "created_at": "2026-01-01T00:00:00+00:00",
         "started_at": "2026-01-01T00:00:01+00:00",
         "finished_at": "2026-01-01T00:00:02+00:00",
         "error": None,
-        "package": "Song #1/Song #1.guitar.player.html",
+        "package": f"{safe_filename(title)}/{safe_filename(title)}.{target}.player.html",
         "log": f"web/logs/{job_id}.log",
         "upload": "web/uploads/song.mp3",
     }
@@ -257,12 +260,30 @@ def _write_legacy_job_file(out_dir: Path, job_id: str, **overrides) -> None:
     (jobs_dir / f"{job_id}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_package_url_is_percent_encoded_for_hash_and_space(tmp_path):
-    _write_legacy_job_file(tmp_path, "j-legacy-hash")
+def test_package_url_is_percent_encoded_for_spaces(tmp_path):
+    """A space survives safe_filename, so it reaches the URL and has to be
+    encoded there -- otherwise the link breaks in the browser."""
+    _write_job_file(tmp_path, "j-spaced", title="Song 1")
     app = create_app(tmp_path, runner=ApiFakeRunner())
     with TestClient(app) as c:
-        detail = c.get("/api/jobs/j-legacy-hash").json()
-        assert detail["package_url"] == "/packages/Song%20%231/Song%20%231.guitar.player.html"
+        detail = c.get("/api/jobs/j-spaced").json()
+        assert detail["package_url"] == "/packages/Song%201/Song%201.guitar.player.html"
+
+
+def test_a_record_claiming_a_package_it_did_not_produce_is_rejected(tmp_path):
+    """`package` is what the API tells the browser to fetch, so a record is
+    only allowed to claim the path its own title and target derive. This one
+    is shaped like a record written before the sanitizer stripped "#" -- and
+    like anything else hand-edited to point elsewhere, it is quarantined
+    rather than served."""
+    _write_job_file(
+        tmp_path, "j-claims", title="Song #1",
+        package="Song #1/Song #1.guitar.player.html",  # pre-sanitizer, underivable now
+    )
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        assert c.get("/api/jobs/j-claims").status_code == 404
+        assert c.get("/api/jobs").json() == []
 
 
 # ---------------------------------------------------------------------------
@@ -311,14 +332,14 @@ def test_timezone_naive_job_file_does_not_break_the_job_list(tmp_path):
     no finished_at used to make _elapsed_seconds subtract a naive datetime
     from an aware "now" -> TypeError -> GET /api/jobs 500 for *every* job.
     Such a record is now rejected at load time (quarantined) instead."""
-    _write_legacy_job_file(
+    _write_job_file(
         tmp_path,
         "j-naive",
         status="done",
         started_at="2026-01-01T00:00:01",  # no UTC offset
         finished_at=None,
     )
-    _write_legacy_job_file(tmp_path, "j-fine")
+    _write_job_file(tmp_path, "j-fine")
 
     app = create_app(tmp_path, runner=ApiFakeRunner())
     with TestClient(app) as c:

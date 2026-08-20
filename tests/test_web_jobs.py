@@ -1431,11 +1431,16 @@ def _valid_job_payload(**overrides) -> dict:
         "started_at": "2026-01-01T00:00:01+00:00",
         "finished_at": "2026-01-01T00:00:02+00:00",
         "error": None,
-        "package": "Song/Song.guitar.player.html",
-        "log": "web/logs/j-valid-0001.log",
         "upload": "web/uploads/song.mp3",
     }
     payload.update(overrides)
+    # `log` and `package` are derived values the loader requires to match the
+    # record's own id/title/target -- a job may only write its own log and
+    # only claim its own package. So the fixture derives them too, unless a
+    # test is deliberately overriding one to check that very rule.
+    payload.setdefault("log", f"web/logs/{payload['id']}.log")
+    safe = safe_filename(payload["title"])
+    payload.setdefault("package", f"{safe}/{safe}.{payload['target']}.player.html")
     return payload
 
 
@@ -1638,6 +1643,74 @@ def test_a_record_that_cannot_be_saved_back_is_quarantined_on_load(tmp_path):
     assert store.get_job("j-unsavable") is None, "an unsavable record must never be admitted"
     assert len(_quarantined_names(tmp_path, "j-unsavable")) == 1
     assert store.get_job("j-slim") is not None
+
+
+def test_a_record_cannot_point_its_log_at_the_users_audio(tmp_path):
+    """Regression for arbitrary file overwrite. `default_runner` opens the log
+    with "wb", so honouring a record's stored `log` meant a hand-edited (or
+    corrupted) record could name any file under out_dir and have the server
+    truncate it -- observed live: pointing a queued job's log at the user's
+    own source audio replaced the audio with log text on the next restart,
+    no request needed. The log location is derived from the job id now, and a
+    record claiming anything else is refused."""
+    upload = _make_upload(tmp_path)
+    victim = tmp_path / "Song" / "Song.original.mp3"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"the user's irreplaceable source audio")
+    original = victim.read_bytes()
+
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (jobs_dir / "j-evil.json").write_text(json.dumps({
+        "id": "j-evil", "digest": "dx", "title": "Song", "target": "guitar",
+        "status": "queued", "created_at": "2026-07-12T00:00:00+00:00",
+        "log": "Song/Song.original.mp3",
+        "upload": str(upload.relative_to(tmp_path)),
+    }), encoding="utf-8")
+
+    store = JobStore(tmp_path, runner=FakeRunner(returncode=1, write_player=False))
+    try:
+        time.sleep(0.4)  # let the worker do whatever it is going to do
+        assert victim.read_bytes() == original, "the user's audio was overwritten"
+        assert store.get_job("j-evil") is None, "a record claiming another file's path"
+        assert len(_quarantined_names(tmp_path, "j-evil")) == 1
+    finally:
+        store.shutdown(join_timeout=5.0)
+
+
+def test_a_symlinked_log_directory_cannot_be_used_to_write_outside_out_dir(tmp_path):
+    """The other half of the same bug, and the half no string check can see:
+    with `out/web/logs/escape` symlinked to a directory elsewhere, a record
+    whose log pointed through it wrote outside out_dir entirely. Containment
+    is therefore checked after resolve(), on the real path."""
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_bytes(b"nothing in out_dir may touch this")
+
+    upload = _make_upload(out_dir)
+    logs_dir = out_dir / "web" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "escape").symlink_to(outside, target_is_directory=True)
+
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    (jobs_dir / "j-escape.json").write_text(json.dumps({
+        "id": "j-escape", "digest": "dx", "title": "Song", "target": "guitar",
+        "status": "queued", "created_at": "2026-07-12T00:00:00+00:00",
+        "log": "web/logs/escape/secret.txt",
+        "upload": str(upload.relative_to(out_dir)),
+    }), encoding="utf-8")
+
+    store = JobStore(out_dir, runner=FakeRunner(returncode=1, write_player=False))
+    try:
+        time.sleep(0.4)
+        assert secret.read_bytes() == b"nothing in out_dir may touch this"
+        assert store.get_job("j-escape") is None
+        assert len(_quarantined_names(out_dir, "j-escape")) == 1
+    finally:
+        store.shutdown(join_timeout=5.0)
 
 
 def test_a_running_record_whose_log_path_names_no_file_is_quarantined_not_fatal(tmp_path):

@@ -521,8 +521,6 @@ _OPTIONAL_DATETIME_FIELDS = ("started_at", "finished_at")
 _OPTIONAL_STR_FIELDS = ("error", "package", "log", "upload")
 # Every field of Job that can hold text, for checks that apply to all of them.
 _ALL_STR_FIELDS = _REQUIRED_STR_FIELDS + _OPTIONAL_DATETIME_FIELDS + _OPTIONAL_STR_FIELDS
-# Fields resolved against out_dir, and therefore held to _path_problem's rules.
-_PATH_FIELDS = ("log", "upload", "package")
 
 
 def _datetime_problem(value: str, name: str) -> Optional[str]:
@@ -547,30 +545,76 @@ def _datetime_problem(value: str, name: str) -> Optional[str]:
     return None
 
 
-def _path_problem(value: str, name: str) -> Optional[str]:
-    """None if `value` is usable as a path relative to `out_dir`, else why it
-    isn't.
+def _log_relpath(job_id: str) -> str:
+    """The one and only place a job's log may live, relative to out_dir.
 
-    Three rules, all of them load-bearing:
+    Derived from the id, never read back from the record. The stored `log`
+    field is a *cache* of this value -- something for the API to hand out --
+    and never an instruction about where to write. Treating it as one was an
+    arbitrary-file-overwrite bug: `default_runner` opens the log with "wb",
+    so a record saying `log: "Song/Song.original.mp3"` had the recovery path
+    truncate the user's own audio, and a symlinked directory under web/logs
+    reached files outside out_dir entirely. A job may write its own log and
+    nothing else.
+    """
+    return str(Path("web") / "logs" / f"{job_id}.log")
 
-    * It must be relative, and free of ".." segments. Everything in a job
-      record is resolved against `out_dir`, so an absolute path or one that
-      climbs out of it reaches files this server has no business touching --
-      and `package` is served over HTTP.
-    * It must have a name component. `"/"` and `"."` pass every other check
-      and then raise ValueError from `Path.with_suffix` when the pid sidecar
-      is derived from them -- which happens in the recovery path, outside
-      any per-file handler, so a single such record used to abort startup
-      entirely rather than being quarantined.
+
+def _derived_package(title: str, target: str) -> str:
+    """Where a successful run puts its player, relative to out_dir. Like the
+    log path, this is derived rather than trusted: `package` is served over
+    HTTP, so a stored value is a claim about what to serve, and the only
+    claim worth honouring is the one this function would have made."""
+    safe = safe_filename(title)
+    return f"{safe}/{safe}.{target}.player.html"
+
+
+def _package_problem(value: str) -> Optional[str]:
+    """None if `value` is a package path safe to store and serve, else why it
+    isn't. `safe_filename` sanitizes the title half, but `target` is
+    interpolated raw, so this is what keeps a hand-written target from
+    steering the derived path out of the output directory."""
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return f"it is an absolute path: {value!r}"
+    if ".." in candidate.parts:
+        return f"it climbs above the output directory: {value!r}"
+    if not candidate.name:
+        return f"it names no file: {value!r}"
+    return None
+
+
+def _upload_problem(value: str) -> Optional[str]:
+    """None if `value` could name an upload, else why it couldn't.
+
+    Shape only -- whether the file is really there, and really inside the
+    uploads directory once symlinks are followed, is checked at the moment
+    it is used (`JobStore._resolved_upload`). Existence deliberately is not
+    checked here: a finished job whose upload has since been cleaned up is
+    still a perfectly good record, and quarantining it would throw away the
+    package link the user actually wants.
     """
     candidate = Path(value)
     if candidate.is_absolute():
-        return f"field {name!r} is an absolute path: {value!r}"
+        return f"field 'upload' is an absolute path: {value!r}"
     if ".." in candidate.parts:
-        return f"field {name!r} climbs above the output directory: {value!r}"
+        return f"field 'upload' climbs above the output directory: {value!r}"
     if not candidate.name:
-        return f"field {name!r} names no file: {value!r}"
+        return f"field 'upload' names no file: {value!r}"
+    if candidate.parts[:2] != ("web", "uploads"):
+        return f"field 'upload' is not under web/uploads: {value!r}"
     return None
+
+
+def _resolves_inside(base: Path, path: Path) -> bool:
+    """True if `path` really is inside `base` once every symlink on both is
+    followed. String comparison is not enough and never was: `web/logs` (or
+    any directory under out_dir) being a symlink is all it takes for a
+    perfectly innocent-looking relative path to land somewhere else."""
+    try:
+        return path.resolve().is_relative_to(base.resolve())
+    except OSError:
+        return False
 
 
 def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
@@ -648,12 +692,32 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
         # nothing able to clear it. Refuse it here, where it costs one file.
         if "\x00" in value:
             return f"field {name!r} contains a NUL byte"
-    for name in _PATH_FIELDS:
-        value = data.get(name)
-        if isinstance(value, str):
-            problem = _path_problem(value, name)
-            if problem is not None:
-                return problem
+    # The three path fields, each held to what the app itself would have
+    # written there. `log` and `package` are fully derived, so anything other
+    # than the derived value (or nothing at all) is a record making a claim
+    # this server has no reason to honour -- and honouring `log` was an
+    # arbitrary-file-overwrite bug, see `_log_relpath`. `upload` cannot be
+    # derived, so it gets the strongest shape check available here and a
+    # second, symlink-aware check at the moment it is used.
+    log = data.get("log")
+    if log is not None and log != _log_relpath(expected_id):
+        return (
+            f"field 'log' is {log!r}, but a job may only ever write its own log at "
+            f"{_log_relpath(expected_id)!r}"
+        )
+    package = data.get("package")
+    if package is not None:
+        expected_package = _derived_package(data["title"], data["target"])
+        if package != expected_package:
+            return (
+                f"field 'package' is {package!r}, but this job's title and target give "
+                f"{expected_package!r}"
+            )
+    upload = data.get("upload")
+    if upload is not None:
+        problem = _upload_problem(upload)
+        if problem is not None:
+            return problem
     return None
 
 
@@ -788,8 +852,7 @@ def _fully_grown(job: Job) -> Job:
     grown.started_at = reserve(grown.started_at, _LONGEST_TIMESTAMP)
     grown.finished_at = reserve(grown.finished_at, _LONGEST_TIMESTAMP)
     # Exactly what _run_job builds on success.
-    safe = safe_filename(grown.title)
-    grown.package = reserve(grown.package, f"{safe}/{safe}.{grown.target}.player.html")
+    grown.package = reserve(grown.package, _derived_package(grown.title, grown.target))
     grown.status = reserve(grown.status, max(_VALID_STATUSES, key=len))
     return grown
 
@@ -911,21 +974,19 @@ class JobStore:
             return None, reason
 
         job = Job.from_dict(data)
-        # `log` is filled in for real (the first run would assign it anyway),
-        # then the size check runs against the job's *fully grown* form --
-        # see `_fully_grown` for why measuring the record as it arrives is
-        # not enough.
-        if not job.log:
-            job.log = str(Path("web") / "logs" / f"{job.id}.log")
-        grown = _fully_grown(job)
-        # The package path is *derived* (from the title and the target), so
-        # validating the record's current one isn't enough: a target with a
-        # ".." in it produces an invalid package the moment the job succeeds,
-        # and the record would then be refused on the next load. Check the
-        # value this job would actually produce.
-        problem = _path_problem(grown.package, "package")
+        # `log` is filled in for real -- it is derived, and the first run
+        # would assign it anyway -- then the size check runs against the
+        # job's *fully grown* form; see `_fully_grown` for why measuring the
+        # record as it arrives is not enough.
+        job.log = _log_relpath(job.id)
+        # The package this job would *produce* has to be usable too, not just
+        # the one it stores. `safe_filename` sanitizes the title, but `target`
+        # goes in raw, so a ".." there yields an escaping package the moment
+        # the job succeeds -- accepted now, refused on the next load, gone.
+        problem = _package_problem(_derived_package(job.title, job.target))
         if problem is not None:
-            return None, f"this job would produce an unusable package path -- {problem}"
+            return None, f"this job would produce an unusable package path: {problem}"
+        grown = _fully_grown(job)
         saved_bytes = _job_record_bytes(grown)
         if saved_bytes > MAX_JOB_FILE_BYTES:
             return None, (
@@ -990,7 +1051,7 @@ class JobStore:
         """Re-queue one job left unfinished by the previous server, having
         first made sure its old subprocess is gone. See _load_and_recover."""
         if job.status == "running" and job.log:
-            outcome = terminate_pid_from_sidecar(self.out_dir / job.log)
+            outcome = terminate_pid_from_sidecar(self.out_dir / _log_relpath(job.id))
             if outcome is TerminationOutcome.FAILED:
                 # We could not confirm the previous run's process tree is
                 # gone (no permission to signal it, or it survived SIGKILL).
@@ -1073,7 +1134,7 @@ class JobStore:
         deadline = time.monotonic() + join_timeout
         while True:
             for job in running:
-                terminate_pid_from_sidecar(self.out_dir / job.log)
+                terminate_pid_from_sidecar(self.out_dir / _log_relpath(job.id))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
@@ -1245,33 +1306,48 @@ class JobStore:
             _warn(f"[stemlab-web] job {job.id}: could not even record its failure: {exc!r}")
 
     def _log_path_for(self, job: Job) -> Path:
-        """Where this job's log goes.
+        """The absolute path this job's log is written to: always
+        `out_dir/web/logs/<id>.log`, derived from the id and never taken from
+        the record (see `_log_relpath` for the overwrite bug that came of
+        taking it). The record's `log` field is refreshed to match, so it
+        stays a truthful cache of where the log really is.
 
-        Normally `out_dir / job.log`, but `job.log` comes from a record on
-        disk and can name something the filesystem refuses outright -- an
-        embedded NUL (ValueError), bytes no filename encoding accepts
-        (OSError). Opening it is checked here rather than discovered halfway
-        through the run, when the failure would land in the *error handler*
-        and take the worker down with it. On refusal the job gets the
-        canonical path instead, and its record is corrected to match so the
-        UI still finds the log it actually has.
+        Raises RuntimeError if that location does not resolve to somewhere
+        inside out_dir -- `web/logs` being a symlink is the case that matters,
+        and the runner truncates whatever it opens, so refusing to write at
+        all is the only safe answer. The caller turns that into a failed job;
+        the server carries on.
         """
-        default = self.logs_dir / f"{job.id}.log"
-        if job.log:
-            candidate = self.out_dir / job.log
-            try:
-                candidate.parent.mkdir(parents=True, exist_ok=True)
-                with candidate.open("a", encoding="utf-8"):
-                    pass
-                return candidate
-            except (OSError, ValueError) as exc:
-                _warn(
-                    f"[stemlab-web] job {job.id}: log path {job.log!r} is unusable "
-                    f"({exc}); falling back to {default.name}"
-                )
-        default.parent.mkdir(parents=True, exist_ok=True)
-        job.log = str(Path("web") / "logs" / f"{job.id}.log")
-        return default
+        job.log = _log_relpath(job.id)
+        path = self.out_dir / job.log
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not _resolves_inside(self.out_dir, path):
+            raise RuntimeError(
+                f"refusing to write the log for {job.id}: {path} resolves outside {self.out_dir}"
+            )
+        return path
+
+    def _resolved_upload(self, job: Job) -> Optional[Path]:
+        """The upload this job is allowed to read, or None if its record
+        points anywhere else.
+
+        Checked after `resolve()`, so a symlink planted in web/uploads can't
+        be used to reach out of the tree, and required to be a regular file
+        so a record can't aim the runner at a directory or a device. The
+        shape was already checked at load (`_upload_problem`); this is the
+        half that string inspection cannot do.
+        """
+        if not job.upload:
+            return None
+        candidate = self.out_dir / job.upload
+        if not _resolves_inside(self.uploads_dir, candidate):
+            return None
+        try:
+            if not candidate.resolve().is_file():
+                return None
+        except OSError:
+            return None
+        return candidate
 
     def _run_job(self, job: Job) -> None:
         with self._lock:
@@ -1292,15 +1368,22 @@ class JobStore:
             job.started_at = _now_iso()
             self._write_job(job)
 
-        log_path = self._log_path_for(job)
-        # No guard needed on this one: building a Path never fails, and
-        # .exists() answers False (rather than raising) for a path the OS
-        # can't even represent, such as one with an embedded NUL.
-        upload_path = self.out_dir / job.upload if job.upload else None
+        # Both of these are refusals, not conveniences: the runner truncates
+        # the log it opens and reads whatever upload it is handed, so a job
+        # that cannot be given a safe pair of paths must not run at all.
+        try:
+            log_path = self._log_path_for(job)
+        except Exception as exc:
+            self._force_error(job, f"cannot write this job's log: {exc}")
+            return
+        upload_path = self._resolved_upload(job)
 
         try:
-            if upload_path is None or not upload_path.exists():
-                raise RuntimeError(f"upload file missing: {job.upload}")
+            if upload_path is None:
+                raise RuntimeError(
+                    f"upload file missing, or not a regular file under "
+                    f"{self.uploads_dir.name}/: {job.upload}"
+                )
             rc = self._runner(upload_path, self.out_dir, job.title, job.target, log_path)
         except Exception as exc:  # runner itself blew up (not the subprocess exit code)
             rc = 1
@@ -1313,9 +1396,8 @@ class JobStore:
                 # log is unavailable.
                 _warn(f"[stemlab-web] job {job.id}: could not write to its log: {log_exc}")
 
-        safe = safe_filename(job.title)
-        expected_player = self.out_dir / safe / f"{safe}.{job.target}.player.html"
-        succeeded = rc == 0 and expected_player.exists()
+        package_rel = _derived_package(job.title, job.target)
+        succeeded = rc == 0 and (self.out_dir / package_rel).exists()
 
         with self._lock:
             if not succeeded and self._stopping.is_set():
@@ -1335,7 +1417,7 @@ class JobStore:
             job.finished_at = _now_iso()
             if succeeded:
                 job.status = "done"
-                job.package = f"{safe}/{safe}.{job.target}.player.html"
+                job.package = package_rel
                 job.error = None
             else:
                 job.status = "error"

@@ -44,6 +44,7 @@ from stemlab.web.jobs import (
     _job_record_bytes,
     _serialize_job_within_limit,
     _validate_job_record,
+    safe_filename,
 )
 
 from test_web_jobs import FakeRunner, _make_upload, _wait_until
@@ -113,6 +114,70 @@ _PATHISH = st.sampled_from(
 
 _PATH_FIELD = st.one_of(st.none(), _TEXT, _PATHISH)
 
+# Paths aimed squarely at the sentinels _plant_sentinels lays down, including
+# the two routes out of the tree (a symlinked directory inside web/logs, and a
+# symlink sitting in out_dir itself). Fuzzing alone would take a very long
+# time to guess "Song/Song.original.mp3"; naming the targets is what turns
+# P6 from a lottery into a statement.
+_BLAST_TARGETS = st.sampled_from(
+    [
+        "Song/Song.original.mp3",  # the user's own audio, truncated by open("wb")
+        "Song/Song.guitar.player.html",
+        "web/uploads/song.mp3",
+        "web/jobs/keep.txt",
+        ".cache/stem.wav",
+        "web/logs/escape/secret.txt",  # web/logs/escape is a symlink out of the tree
+        "escape-hatch/secret.txt",  # so is out_dir/escape-hatch
+        "../outside/secret.txt",
+        "web/logs/../../outside/secret.txt",
+    ]
+)
+
+
+def _plant_sentinels(out_dir: Path, outside: Path) -> dict[Path, Path]:
+    """Lay a known file in every directory a job record could name, plus two
+    symlinks pointing clean out of the tree, and return the set of files whose
+    bytes must not change."""
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "secret.txt").write_text("outside, untouchable", encoding="utf-8")
+
+    for rel, content in [
+        ("Song/Song.original.mp3", "the user's source audio"),
+        ("Song/Song.guitar.player.html", "<html>a finished package</html>"),
+        ("web/uploads/song.mp3", "an uploaded file"),
+        ("web/jobs/keep.txt", "not a job record, but still ours"),
+        (".cache/stem.wav", "an expensive intermediate"),
+    ]:
+        path = out_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    (out_dir / "web" / "logs").mkdir(parents=True, exist_ok=True)
+    # Two ways out of the tree that no amount of string checking can see.
+    for link in (out_dir / "web" / "logs" / "escape", out_dir / "escape-hatch"):
+        if not link.exists():
+            link.symlink_to(outside, target_is_directory=True)
+
+    watched = [out_dir / rel for rel, _ in [
+        ("Song/Song.original.mp3", None), ("Song/Song.guitar.player.html", None),
+        ("web/uploads/song.mp3", None), ("web/jobs/keep.txt", None),
+        (".cache/stem.wav", None),
+    ]]
+    watched.append(outside / "secret.txt")
+    return {p: p for p in watched}
+
+
+def _fingerprint(paths: dict[Path, Path]) -> dict[Path, object]:
+    """Exact bytes of each watched file, or a marker if it is gone. Bytes,
+    not mtimes: the question is whether the content changed."""
+    out: dict[Path, object] = {}
+    for path in paths:
+        try:
+            out[path] = path.read_bytes()
+        except OSError:
+            out[path] = "<missing>"
+    return out
+
 _STATUS = st.sampled_from(["queued", "running", "done", "error"])
 
 _ISO = st.sampled_from(
@@ -127,22 +192,37 @@ _ISO = st.sampled_from(
 @st.composite
 def _job_payloads(draw, job_id: str = "j-prop-0001") -> dict:
     """Job-shaped dicts spanning every status, optional-field presence, and
-    the nastier corners of Unicode. Most of what this produces is *invalid*,
-    which is the point for P1/P4; the round-trip property filters down to
-    what the loader actually accepts."""
+    the nastier corners of Unicode and of path syntax.
+
+    The path fields are drawn from a mix that deliberately includes the
+    *derived* values -- the log path this id implies, the package this title
+    and target imply -- alongside the hostile ones. Without them the loader
+    would reject nearly every draw, and a property whose examples are almost
+    all filtered out is a property that tests almost nothing: P1/P4/P6 want
+    the hostile records, but P2 needs records that get accepted.
+    """
+    title = draw(_TEXT)
+    target = draw(st.sampled_from(["guitar", "vocals", "bass", draw(_TEXT)]))
+    safe = safe_filename(title)
     return {
         "id": job_id,
         "digest": draw(_TEXT),
-        "title": draw(_TEXT),
-        "target": draw(st.sampled_from(["guitar", "vocals", "bass", draw(_TEXT)])),
+        "title": title,
+        "target": target,
         "status": draw(_STATUS),
         "created_at": draw(_ISO),
         "started_at": draw(st.one_of(st.none(), _ISO)),
         "finished_at": draw(st.one_of(st.none(), _ISO)),
         "error": draw(st.one_of(st.none(), _TEXT)),
-        "package": draw(_PATH_FIELD),
-        "log": draw(_PATH_FIELD),
-        "upload": draw(_PATH_FIELD),
+        "package": draw(
+            st.one_of(
+                st.just(f"{safe}/{safe}.{target}.player.html"), st.none(), _PATH_FIELD
+            )
+        ),
+        "log": draw(st.one_of(st.just(f"web/logs/{job_id}.log"), st.none(), _PATH_FIELD)),
+        "upload": draw(
+            st.one_of(st.just("web/uploads/song.mp3"), st.none(), _PATH_FIELD)
+        ),
     }
 
 
@@ -393,17 +473,14 @@ def test_p2_a_record_near_the_size_limit_is_accepted_only_if_it_can_be_saved(
     # the title, and a value that is shorter in characters than the one
     # replacing it can still be longer in bytes -- the unit the limit is in.
     title=st.sampled_from(["Song", "曲名", "🎸🎸🎸", "曲" * 60, "Ünïcödé Tïtlé"]),
-    # A `log` that is present but unusable (a directory, say) is replaced at
-    # run time by the canonical path, which is longer: growth after
-    # admission, and invisible to a check that only fills in missing fields.
-    log=st.sampled_from(
-        ["web/logs/j-prop-0001.log", "web", "web/logs", "曲.log", "n/d/e/file.log"]
-    ),
-    package=st.one_of(st.none(), st.sampled_from(["x/y.html", "曲名/曲名.guitar.player.html"])),
+    # `package` is either absent or the value this title and target derive --
+    # the only two a record may carry. Whichever it is, succeeding fills it
+    # in, and that is the growth being measured.
+    stores_package=st.booleans(),
 )
-@settings(max_examples=80)
+@settings(max_examples=60)
 def test_p2_an_accepted_record_still_fits_after_the_job_actually_runs(
-    tmp_path_factory, slack, succeeds, start_status, title, log, package
+    tmp_path_factory, slack, succeeds, start_status, title, stores_package
 ):
     """Admission is a promise about the job's whole life, not about the
     moment it was read.
@@ -429,8 +506,13 @@ def test_p2_an_accepted_record_still_fits_after_the_job_actually_runs(
         # A stored timestamp without microseconds is seven characters shorter
         # than the one a re-run writes over it -- more growth to reserve for.
         "started_at": "2026-01-01T00:00:01+00:00" if start_status == "running" else None,
-        "finished_at": None, "error": None, "package": package,
-        "log": log,
+        "finished_at": None, "error": None,
+        "package": (
+            f"{safe_filename(title)}/{safe_filename(title)}.guitar.player.html"
+            if stores_package
+            else None
+        ),
+        "log": "web/logs/j-prop-0001.log",
         "upload": str(upload.relative_to(tmp_path)),
     }
     # Padding in `digest`: uncapped and untrimmable, so it puts the record
@@ -529,6 +611,7 @@ def test_p2_title_collision_suffixes_never_break_the_title_cap(
 
 
 @given(payload=_job_payloads(), style=_STYLE)
+@settings(max_examples=50)  # two JobStores per example -- the priciest draw here
 def test_p2_a_record_survives_an_actual_restart(tmp_path_factory, payload, style):
     """The same property end to end, through the real filesystem: a record
     the loader accepts is still there after the store writes it out and a
@@ -773,6 +856,76 @@ def test_p5_a_job_is_re_run_exactly_when_its_old_process_is_accounted_for(
             assert final.status == status, "a terminal job must be left alone"
     finally:
         store.shutdown(join_timeout=5.0)
+
+
+@given(
+    log=st.one_of(st.none(), _PATH_FIELD, _BLAST_TARGETS),
+    upload=st.one_of(st.none(), _PATH_FIELD, _BLAST_TARGETS),
+    package=st.one_of(st.none(), _PATH_FIELD, _BLAST_TARGETS),
+    status=st.sampled_from(["queued", "running"]),
+)
+@settings(max_examples=80)
+def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
+    tmp_path_factory, log, upload, package, status
+):
+    """A job record says what a job *is*, not what files the server may
+    write. Nothing a record can say may cause anything outside that job's own
+    log to change.
+
+    P1-P5 pinned that records can be read, written and safely re-run; none of
+    them said anything about *reach*. So `log: "Song/Song.original.mp3"` was
+    honoured, and since `default_runner` opens the log with "wb", merely
+    restarting the server truncated the user's own audio -- with a symlinked
+    directory under web/logs, files outside out_dir entirely. Path-string
+    validation alone cannot state this property, because the damage is done
+    through filesystem structure (symlinks) that strings don't describe. So
+    the property is stated over the actual bytes on disk.
+
+    Every file in the tree is fingerprinted before the store runs and after
+    it finishes; only `web/logs/<id>.log` is allowed to differ.
+    """
+    tmp_path = tmp_path_factory.mktemp("p6")
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    sentinels = _plant_sentinels(out_dir, outside)
+
+    upload_file = _make_upload(out_dir)
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "id": "j-prop-0001", "digest": "d", "title": "Song", "target": "guitar",
+        "status": status, "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:01+00:00" if status == "running" else None,
+        "finished_at": None, "error": None,
+        "package": package, "log": log,
+        "upload": upload if upload is not None else str(upload_file.relative_to(out_dir)),
+    }
+    (jobs_dir / "j-prop-0001.json").write_text(json.dumps(record), encoding="utf-8")
+    own_log = out_dir / "web" / "logs" / "j-prop-0001.log"
+
+    before = _fingerprint(sentinels)
+    # A runner that writes no player, so the *only* write this job is entitled
+    # to make is its own log. (A successful job legitimately creates its
+    # package; allowing that here would blunt the assertion below.)
+    store = JobStore(out_dir, runner=FakeRunner(returncode=1, write_player=False))
+    try:
+        # Let the worker get as far as it is ever going to.
+        _wait_until(
+            lambda: store.get_job("j-prop-0001") is None
+            or store.get_job("j-prop-0001").status in ("done", "error", "running"),
+            timeout=10.0,
+        )
+        time.sleep(0.3)
+    finally:
+        store.shutdown(join_timeout=5.0)
+
+    after = _fingerprint(sentinels)
+    changed = {p for p in before if before[p] != after.get(p)}
+    assert changed == set(), (
+        f"a job record reached files it has no business touching: {sorted(changed)}. "
+        f"Only {own_log} may ever be written."
+    )
+    assert set(after) == set(before), "no sentinel may be deleted either"
 
 
 @given(outcome=st.sampled_from(list(TerminationOutcome)))
