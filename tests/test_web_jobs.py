@@ -10,6 +10,8 @@ Real `stemlab` CLI execution is never exercised by these tests.
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1929,6 +1931,87 @@ def test_a_relocated_jobs_directory_is_neither_read_nor_written(tmp_path):
         assert store.list_jobs() == [], "nothing may be loaded from a relocated jobs directory"
     finally:
         store.shutdown(join_timeout=5.0)
+
+
+def test_a_failed_pid_write_stops_the_subprocess_instead_of_orphaning_it(tmp_path, monkeypatch):
+    """Opening the sidecar before spawning covers the usual case -- we refuse
+    to start a process whose pid we cannot record. It does not cover the
+    write itself failing, which happens *after* the spawn: at that point
+    there is a live subprocess whose pid is about to be lost, and nothing
+    would ever reap it. Both shutdown and the next startup's recovery find
+    processes only through the sidecar, so the job's re-run would separate
+    the same song alongside the survivor, into the same cache.
+
+    So the write failing stops the process there and then. The job fails,
+    which is fine; an orphan is not.
+    """
+    from stemlab.web import jobs as jobs_module
+    from stemlab.web.jobs import default_runner
+
+    upload = _make_upload(tmp_path)
+    log_path = tmp_path / "web" / "logs" / "j-orphan.log"
+
+    spawned = {}
+    real_popen = jobs_module.subprocess.Popen
+
+    def recording_popen(cmd, **kwargs):
+        # A harmless, long-lived stand-in for the separation CLI, spawned
+        # through the real code path (its own session and all).
+        proc = real_popen(
+            [sys.executable, "-c", "import time; time.sleep(60)  # stemlab.cli"], **kwargs
+        )
+        spawned["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(jobs_module.subprocess, "Popen", recording_popen)
+
+    # The sidecar opens fine and only the *write* fails -- which is the whole
+    # point: an open failure is already handled by refusing to spawn, and the
+    # gap is the window after the process exists.
+    real_opener = jobs_module._open_in_logs_dir
+
+    def failing_pid_write(path, *, expected_logs_dir, mode):
+        opened = real_opener(path, expected_logs_dir=expected_logs_dir, mode=mode)
+        if not str(path).endswith("j-orphan.pid"):
+            return opened
+
+        class _WriteRefused:
+            def __enter__(self):
+                opened.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return opened.__exit__(*exc)
+
+            def fileno(self):
+                return opened.fileno()
+
+            def write(self, data):
+                raise OSError("simulated: cannot write the pid")
+
+            def flush(self):
+                pass
+
+        return _WriteRefused()
+
+    monkeypatch.setattr(jobs_module, "_open_in_logs_dir", failing_pid_write)
+
+    proc = None
+    try:
+        with pytest.raises(OSError):
+            default_runner(upload, tmp_path, "Song", "guitar", log_path)
+
+        proc = spawned.get("proc")
+        assert proc is not None, "the spawn must have happened for this to test anything"
+        _wait_until(lambda: proc.poll() is not None, timeout=5.0)
+        assert not _pid_running(proc.pid), (
+            "a subprocess whose pid could not be recorded must not be left running -- "
+            "nothing would ever find it again"
+        )
+        assert not (tmp_path / "web" / "logs" / "j-orphan.pid").exists()
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
 
 
 def test_a_relocated_web_directory_gets_nothing_created_inside_it(tmp_path):

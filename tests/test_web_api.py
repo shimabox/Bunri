@@ -313,6 +313,56 @@ def test_a_record_claiming_a_package_of_the_wrong_shape_is_rejected(tmp_path, pa
         assert c.get("/api/jobs").json() == []
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/packages/Alias/uploads/secret.mp3",
+        "/packages/Alias/jobs/j-x.json",
+        "/packages/Alias/logs/j-x.log",
+        "/packages/AliasC/stem.wav",
+    ],
+)
+def test_an_internal_alias_symlink_cannot_serve_the_private_directories(tmp_path, url):
+    """The segment rules describe the URL, and a symlink inside out_dir can
+    make the URL innocent while the file is not: `out/Alias -> web` has no
+    "web" in the path, no leading dot, and resolves inside out_dir, so every
+    one of those checks passed and the user's own uploaded audio was served.
+
+    The check now also asks where the path really lands.
+    """
+    out_dir = tmp_path
+    (out_dir / "web" / "uploads").mkdir(parents=True)
+    (out_dir / "web" / "uploads" / "secret.mp3").write_bytes(b"the user's source audio")
+    (out_dir / "web" / "jobs").mkdir(parents=True, exist_ok=True)
+    (out_dir / "web" / "jobs" / "j-x.json").write_text("{}", encoding="utf-8")
+    (out_dir / "web" / "logs").mkdir(parents=True, exist_ok=True)
+    (out_dir / "web" / "logs" / "j-x.log").write_text("log", encoding="utf-8")
+    (out_dir / ".cache").mkdir(parents=True)
+    (out_dir / ".cache" / "stem.wav").write_bytes(b"an expensive intermediate")
+
+    (out_dir / "Alias").symlink_to(out_dir / "web", target_is_directory=True)
+    (out_dir / "AliasC").symlink_to(out_dir / ".cache", target_is_directory=True)
+
+    app = create_app(out_dir, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        assert c.get(url).status_code == 404
+
+
+def test_a_real_package_is_still_served_alongside_the_alias_check(tmp_path):
+    """The resolve-based check must not cost the ordinary case: a genuine
+    package directory still serves."""
+    out_dir = tmp_path
+    package = out_dir / "Song 1"
+    package.mkdir(parents=True)
+    (package / "Song 1.guitar.player.html").write_text("<html>player</html>", encoding="utf-8")
+
+    app = create_app(out_dir, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        res = c.get("/packages/Song%201/Song%201.guitar.player.html")
+        assert res.status_code == 200
+        assert "player" in res.text
+
+
 # ---------------------------------------------------------------------------
 # CSRF: strict same-origin enforcement on unsafe methods
 # ---------------------------------------------------------------------------

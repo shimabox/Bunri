@@ -154,7 +154,37 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
     # "." check on every segment (not just the top one) blanket-blocks any
     # dotfile/dotdir anywhere under a package path, ".cache" included,
     # instead of enumerating every private dotdir by name.
+    #
+    # Segment checks alone are not enough, though, because they describe the
+    # URL rather than the file. A symlink inside out_dir -- `out/Alias ->
+    # web` -- gives a URL with no "web" in it, no dot in it, and a target
+    # inside out_dir, so every one of those rules says yes and
+    # /packages/Alias/uploads/song.mp3 hands over the private original. The
+    # second half of the check therefore resolves the path and asks the same
+    # questions of where it actually lands. A resolve() per request is real
+    # work, and worth it here: this server binds 127.0.0.1 and serves one
+    # person, so the traffic is tiny and the file being exposed is their own
+    # source audio.
     _BLOCKED_TOPDIRS_CF = {"web", ".cache"}
+
+    def _leads_somewhere_private(rest: list[str]) -> bool:
+        real_out = out_dir.resolve()
+        # Literal joins for the expected private roots, never resolves of
+        # them -- resolving both sides is the tautology web/jobs.py's
+        # _real_subdir documents at length.
+        private_roots = (real_out / "web", real_out / ".cache")
+        try:
+            real = real_out.joinpath(*rest).resolve()
+        except OSError:
+            return True  # unresolvable is not something we are willing to serve
+        if not real.is_relative_to(real_out):
+            return True
+        if any(real == root or real.is_relative_to(root) for root in private_roots):
+            return True
+        # The dot rule again, applied to the components the path really has:
+        # an alias can launder a dotdir out of the URL just as easily as it
+        # can launder "web".
+        return any(part.startswith(".") for part in real.relative_to(real_out).parts)
 
     @app.middleware("http")
     async def _block_private_package_paths(request: Request, call_next):
@@ -165,6 +195,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                 ".." in rest
                 or rest[0].casefold() in _BLOCKED_TOPDIRS_CF
                 or any(seg.startswith(".") for seg in rest)
+                or _leads_somewhere_private(rest)
             ):
                 return PlainTextResponse("Not Found", status_code=404)
         return await call_next(request)

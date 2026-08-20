@@ -350,3 +350,34 @@ def test_build_package_never_writes_through_a_planted_output_symlink(
     produced = package_dir / planted
     assert not produced.is_symlink(), "the export must have replaced the link, not followed it"
     assert produced.stat().st_size > 0, "and the real output must still be there"
+
+
+@_NEED_FFMPEG
+def test_build_package_refuses_a_package_directory_that_is_a_symlink(tmp_path, song_input):
+    """Containment says a link is fine as long as it points inside out_dir --
+    but `out/Song -> out/victim` points at somebody else's package, and every
+    export then runs through it, temporary file and rename together. A
+    package folder has to be a real directory."""
+    out_dir = tmp_path / "out"
+    victim = out_dir / "victim"
+    victim.mkdir(parents=True)
+    kept = victim / "victim.guitar.player.html"
+    kept.write_text("another song's package", encoding="utf-8")
+    original = kept.read_bytes()
+
+    (out_dir / "song").symlink_to(victim, target_is_directory=True)
+
+    refused = None
+    try:
+        build_package(song_input, out_dir, title="song")
+    except ValueError as exc:
+        refused = exc
+
+    # Damage first, so a failure says what was written rather than what was
+    # not raised.
+    assert sorted(p.name for p in victim.iterdir()) == [kept.name], (
+        f"wrote {sorted(p.name for p in victim.iterdir())} through the link into "
+        "another song's package"
+    )
+    assert kept.read_bytes() == original
+    assert refused is not None and "symlink" in str(refused)

@@ -549,6 +549,21 @@ def terminate_pid_from_sidecar(
     return TerminationOutcome.STOPPED
 
 
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """Stop `proc` and everything it spawned, and wait for it to go.
+
+    Group-wide, for the same reason every other stop path here is: killing
+    only the CLI leaves its ffmpeg running. `start_new_session=True` at spawn
+    is what makes the group ours to signal; the fallback covers the case
+    where it somehow is not.
+    """
+    try:
+        os.killpg(proc.pid, 9)  # SIGKILL
+    except OSError:
+        proc.kill()
+    proc.wait()
+
+
 def default_runner(
     upload_path: Path,
     out_dir: Path,
@@ -597,21 +612,26 @@ def default_runner(
             except Exception:
                 sidecar.unlink(missing_ok=True)
                 raise
-            pid_f.write(str(proc.pid).encode())
-            pid_f.flush()
+            try:
+                pid_f.write(str(proc.pid).encode())
+                pid_f.flush()
+            except Exception:
+                # Opening the sidecar first means we can *usually* refuse to
+                # spawn; if the write itself fails we are already past that,
+                # holding a live subprocess whose pid is about to be lost.
+                # Nothing would ever reap it -- not shutdown, not the next
+                # startup's recovery, both of which find processes only
+                # through this file -- and the job's re-run would then
+                # separate the same song alongside it, into the same cache.
+                # So stop it here, while we still know what it is. The job
+                # fails, which is fine; an orphan is not.
+                _kill_process_group(proc)
+                sidecar.unlink(missing_ok=True)
+                raise
         try:
             return proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            # Group-wide, for the same reason the shutdown path is: killing
-            # only the CLI would leave its ffmpeg running long past the
-            # timeout we just declared. Fall back to the lone process if the
-            # group can't be signalled (it should always be ours, given
-            # start_new_session above).
-            try:
-                os.killpg(proc.pid, 9)  # SIGKILL
-            except OSError:
-                proc.kill()
-            proc.wait()
+            _kill_process_group(proc)
             log_f.write(
                 f"\n[stemlab-web] timed out after {timeout}s; process killed\n".encode()
             )

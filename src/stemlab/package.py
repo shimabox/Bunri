@@ -219,6 +219,14 @@ def build_package(
     # out_dir rather than trusting the string ever looked safe.
     # is_relative_to() on the *resolved* paths (not a string-prefix compare)
     # so a `..`-bearing or symlinked component can't slip past the check.
+    # A package folder is a real directory, never a link. Containment alone
+    # does not give that: `out/Song -> out/victim` resolves inside out_dir
+    # and passes the check below, and then every export -- temp file and
+    # os.replace alike -- runs through the link and lands in somebody else's
+    # package. lstat, so the test does not follow what it is testing; and
+    # before mkdir, which would otherwise report success for the target.
+    if package_dir.is_symlink():
+        raise ValueError(f"refusing to write a package through a symlink: {package_dir}")
     if not package_dir.resolve().is_relative_to(out_dir.resolve()):
         raise ValueError(f"refusing to write package outside out_dir: {package_dir}")
     package_dir.mkdir(parents=True, exist_ok=True)
