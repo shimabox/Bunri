@@ -695,6 +695,55 @@ def _job_record_bytes(job: Job) -> int:
     return len(_serialize_job_within_limit(job).encode("utf-8"))
 
 
+# The longest string `_now_iso` can produce: ISO-8601 with microseconds and a
+# UTC offset. Used to reserve space for timestamps a job has not reached yet
+# -- and for ones it has, since a re-run replaces them (a stored timestamp
+# whose microseconds happened to be zero is seven characters shorter).
+_LONGEST_TIMESTAMP = "2026-12-31T23:59:59.999999+00:00"
+
+
+def _fully_grown(job: Job) -> Job:
+    """A copy of `job` sized as large as any state transition could ever make
+    it, for the admission check to measure.
+
+    Checking a record's size as it *arrives* is not enough, and that gap was
+    a live bug: a queued job admitted just under the limit grows when it runs
+    -- `started_at`, then `finished_at`, then `package`, which is derived
+    from the title at roughly twice its length. It would then be written
+    oversized (with only a warning) and quarantined on the *next* start, so
+    the job disappeared one restart after the point where anything could
+    still have been said about it.
+
+    "Fill in what's missing" is not enough either. A field that already has a
+    value can be *replaced* by a longer one: recovery re-queues a running job
+    and the re-run rewrites both timestamps, `package` is recomputed from the
+    title on success, and `status` cycles through values of different
+    lengths. So each field reserves the longer of what it holds and what
+    could overwrite it.
+
+    That makes the admission check constructive: accept a record and every
+    subsequent write of it is guaranteed to fit, for every path the job can
+    take. `error` is the one exception, deliberately -- it is the field
+    `_serialize_job_within_limit` can trim, so it never needs headroom.
+    """
+    grown = Job.from_dict(job.to_dict())
+    if not grown.log:
+        grown.log = str(Path("web") / "logs" / f"{grown.id}.log")
+
+    def reserve(current: Optional[str], replacement: str) -> str:
+        if current is None or len(replacement) > len(current):
+            return replacement
+        return current
+
+    grown.started_at = reserve(grown.started_at, _LONGEST_TIMESTAMP)
+    grown.finished_at = reserve(grown.finished_at, _LONGEST_TIMESTAMP)
+    # Exactly what _run_job builds on success.
+    safe = safe_filename(grown.title)
+    grown.package = reserve(grown.package, f"{safe}/{safe}.{grown.target}.player.html")
+    grown.status = reserve(grown.status, max(_VALID_STATUSES, key=len))
+    return grown
+
+
 class JobStore:
     """File-backed job queue + sequential worker.
 
@@ -786,13 +835,15 @@ class JobStore:
         Every admission rule lives here, in the order that does the least
         work for a file that will be refused anyway. The last one is the
         subtle one: passing the read-side size check does not mean the record
-        can be *written back*, because the canonical form is indented and a
-        compact record of exactly the limit re-serializes larger. Admitting
-        such a job would have the recovery path save it oversized and the
-        *next* start quarantine it -- the job disappearing one restart after
-        the moment it was actually lost, with nothing reported at the time.
-        Refusing it now is what makes "whatever the loader accepts, the
-        writer can save" true rather than hopeful.
+        can be *written back*. The canonical form is indented, so a compact
+        record of exactly the limit re-serializes larger -- and the record
+        also grows later, as the job runs and its timestamps and package path
+        get filled in (`_fully_grown`). Admitting such a job would have it
+        saved oversized and quarantined on the *next* start: the job
+        disappearing one restart after the moment it was actually lost, with
+        nothing reported at the time. Refusing it now is what makes
+        "whatever the loader accepts, the writer can save -- at every point
+        in the job's life" true rather than hopeful.
         """
         # Size first, so a rogue file is never read into memory or handed to
         # the parser at all.
@@ -810,19 +861,18 @@ class JobStore:
             return None, reason
 
         job = Job.from_dict(data)
-        # Fill in what the app itself would fill in later, so the size check
-        # below measures the record as it will actually be written rather
-        # than as it happens to arrive. A job with no `log` is assigned one
-        # the first time it runs (`_log_path_for`), which is post-admission
-        # growth: the check would pass on a record smaller than the one that
-        # ends up on disk.
+        # `log` is filled in for real (the first run would assign it anyway),
+        # then the size check runs against the job's *fully grown* form --
+        # see `_fully_grown` for why measuring the record as it arrives is
+        # not enough.
         if not job.log:
             job.log = str(Path("web") / "logs" / f"{job.id}.log")
-        saved_bytes = _job_record_bytes(job)
+        saved_bytes = _job_record_bytes(_fully_grown(job))
         if saved_bytes > MAX_JOB_FILE_BYTES:
             return None, (
-                f"record cannot be saved back: it re-serializes to {saved_bytes} bytes, "
-                f"over the {MAX_JOB_FILE_BYTES}-byte limit"
+                f"record cannot be saved back: once this job's timestamps and package "
+                f"path are filled in it re-serializes to {saved_bytes} bytes, over the "
+                f"{MAX_JOB_FILE_BYTES}-byte limit"
             )
         return job, None
 
@@ -990,12 +1040,24 @@ class JobStore:
         -2/-3/... suffix when a *different* digest already used that safe
         folder name (see the plan's "タイトル衝突" section). A digest that
         already owns the folder (e.g. a retried job after a previous error)
-        is not a collision -- it reuses its own name."""
+        is not a collision -- it reuses its own name.
+
+        Every title returned is at most MAX_TITLE_CHARS, *including* the
+        suffix: the base is shortened to make room for it rather than the
+        suffix being appended on top. Appending it was the bug -- a title at
+        exactly the cap that then collided came back one character over, so
+        the app wrote a record its own loader rejected and the job vanished
+        on the next start. Shortening can of course collide with something
+        else, which is what the loop below is for; each n produces a distinct
+        candidate (a longer suffix takes another character off the base), so
+        it still terminates.
+        """
         owners: dict[str, set[str]] = {}
         with self._lock:
             for j in self._jobs.values():
                 owners.setdefault(safe_filename(j.title), set()).add(j.digest)
 
+        requested_title = requested_title[:MAX_TITLE_CHARS]
         candidate_title = requested_title
         n = 2
         while True:
@@ -1010,7 +1072,8 @@ class JobStore:
             folder_taken = existing_owners is not None or (self.out_dir / candidate_safe).exists()
             if not folder_taken:
                 return candidate_title
-            candidate_title = f"{requested_title}-{n}"
+            suffix = f"-{n}"
+            candidate_title = requested_title[: max(0, MAX_TITLE_CHARS - len(suffix))] + suffix
             n += 1
 
     # -- mutation ---------------------------------------------------------

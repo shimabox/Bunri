@@ -305,9 +305,15 @@ def test_p2_a_record_near_the_size_limit_is_accepted_only_if_it_can_be_saved(
     The trap this generalizes: the file on disk and the record written back
     are not the same size. A compact record passes the read-side check at
     exactly the limit and re-serializes larger, because the canonical form
-    is indented. Put the bulk in the title rather than the error and there is
-    nothing the writer can trim, so the record was accepted, re-saved
-    oversized, and quarantined on the *next* start.
+    is indented. Put the bulk somewhere the writer cannot trim (`error` is
+    the only field it can) and the record was accepted, re-saved oversized,
+    and quarantined on the *next* start.
+
+    The padding goes in `digest`, deliberately: `title` has a length cap of
+    its own and would be refused by *that* rule before ever reaching the
+    size branch, leaving this property testing nothing. `digest` is
+    uncapped, untrimmable, and therefore the field that actually exercises
+    the boundary.
 
     Whichever side of the boundary a given draw lands on, only one thing has
     to hold: whatever is accepted can be saved.
@@ -316,7 +322,7 @@ def test_p2_a_record_near_the_size_limit_is_accepted_only_if_it_can_be_saved(
     jobs_dir = _jobs_dir(tmp_path)
 
     base = {
-        "id": "j-prop-0001", "digest": "d", "title": "", "target": "guitar",
+        "id": "j-prop-0001", "digest": "", "title": "Song", "target": "guitar",
         "status": "queued", "created_at": "2026-01-01T00:00:00+00:00",
         "started_at": None, "finished_at": None, "error": None,
         "package": None, "log": None, "upload": None,
@@ -328,7 +334,7 @@ def test_p2_a_record_near_the_size_limit_is_accepted_only_if_it_can_be_saved(
     )
     filler = MAX_JOB_FILE_BYTES + slack - len(dump(base))
     assume(filler > 0)
-    base["title"] = "T" * filler
+    base["digest"] = "d" * filler
     text = dump(base)
     (jobs_dir / "j-prop-0001.json").write_text(text, encoding="utf-8")
 
@@ -347,6 +353,136 @@ def test_p2_a_record_near_the_size_limit_is_accepted_only_if_it_can_be_saved(
             f"{_job_record_bytes(job)} -- it will be quarantined on the next start, "
             "and the job will vanish then rather than now"
         )
+
+
+@given(
+    slack=st.integers(min_value=-600, max_value=100),
+    succeeds=st.booleans(),
+    start_status=st.sampled_from(["queued", "running"]),
+)
+@settings(max_examples=60)
+def test_p2_an_accepted_record_still_fits_after_the_job_actually_runs(
+    tmp_path_factory, slack, succeeds, start_status
+):
+    """Admission is a promise about the job's whole life, not about the
+    moment it was read.
+
+    A record is only ever *smallest* when it arrives: running the job fills
+    in `started_at`, then `finished_at`, then (on success) `package`, which
+    is derived from the title at roughly twice its length. So a queued record
+    admitted just under the limit could be pushed over it by nothing more
+    than succeeding -- written oversized with only a warning, and
+    quarantined on the next start. The job would disappear one restart after
+    the point where anything could still have been said about it.
+
+    This drives the transition for real, through the runner, and checks the
+    promise where it has to hold: on disk, afterwards, and on reload.
+    """
+    tmp_path = tmp_path_factory.mktemp("p2e")
+    jobs_dir = _jobs_dir(tmp_path)
+    upload = _make_upload(tmp_path)
+
+    base = {
+        "id": "j-prop-0001", "digest": "", "title": "Song", "target": "guitar",
+        "status": start_status, "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:01+00:00" if start_status == "running" else None,
+        "finished_at": None, "error": None, "package": None,
+        "log": "web/logs/j-prop-0001.log",
+        "upload": str(upload.relative_to(tmp_path)),
+    }
+    # Padding in `digest`: uncapped and untrimmable, so it puts the record
+    # near the boundary without tripping a different rule first.
+    filler = MAX_JOB_FILE_BYTES + slack - len(json.dumps(base, separators=(",", ":")))
+    assume(filler > 0)
+    base["digest"] = "d" * filler
+    (jobs_dir / "j-prop-0001.json").write_text(
+        json.dumps(base, separators=(",", ":")), encoding="utf-8"
+    )
+
+    runner = FakeRunner(returncode=0 if succeeds else 1, write_player=succeeds)
+    store = JobStore(tmp_path, runner=runner)
+    try:
+        job = store.get_job("j-prop-0001")
+        assume(job is not None)  # only accepted records make a promise
+        _wait_until(
+            lambda: store.get_job("j-prop-0001").status in ("done", "error"), timeout=10.0
+        )
+        final = store.get_job("j-prop-0001")
+        # The transition really did fill in the fields that grow the record.
+        assert final.started_at is not None and final.finished_at is not None
+        if final.status == "done":
+            assert final.package is not None
+
+        written = (jobs_dir / "j-prop-0001.json").stat().st_size
+        assert written <= MAX_JOB_FILE_BYTES, (
+            f"a record accepted at {len(json.dumps(base, separators=(',', ':')))} bytes grew "
+            f"to {written} by running -- over the limit, so the job will be quarantined "
+            "on the next start"
+        )
+    finally:
+        store.shutdown(join_timeout=5.0)
+
+    reloaded = JobStore(tmp_path, runner=FakeRunner())
+    try:
+        assert reloaded.get_job("j-prop-0001") is not None, (
+            "the grown record must still be readable"
+        )
+        assert _quarantined(jobs_dir, "j-prop-0001") == []
+    finally:
+        reloaded.shutdown(join_timeout=5.0)
+
+
+@given(
+    over=st.integers(min_value=0, max_value=40),
+    collisions=st.integers(min_value=2, max_value=12),
+)
+@settings(max_examples=40)
+def test_p2_title_collision_suffixes_never_break_the_title_cap(
+    tmp_path_factory, over, collisions
+):
+    """The title cap has to hold on the value actually stored, suffix and
+    all.
+
+    `create_job` truncated the requested title and *then* handed it to the
+    collision resolver, which appended "-2" on top -- so a title at exactly
+    the cap that collided came back one character over it. The app wrote a
+    record its own loader would reject, and the job vanished on the next
+    start. Uploading the same song title twice was enough.
+    """
+    tmp_path = tmp_path_factory.mktemp("p2f")
+    store = JobStore(tmp_path, runner=FakeRunner())
+    requested = "T" * (MAX_TITLE_CHARS + over)
+    job_ids = []
+    try:
+        for i in range(collisions):
+            upload = _make_upload(tmp_path, f"song{i}.mp3", content=f"audio-{i}".encode())
+            job, created = store.create_job(upload, digest=f"d{i}", requested_title=requested)
+            assert created, "distinct digests must not dedup onto each other"
+            job_ids.append(job.id)
+            assert len(job.title) <= MAX_TITLE_CHARS, (
+                f"collision #{i} produced a {len(job.title)}-character title: "
+                f"{job.title[-10:]!r}"
+            )
+        assert len({store.get_job(j).title for j in job_ids}) == collisions, (
+            "each colliding job must still get a distinct title"
+        )
+        _wait_until(
+            lambda: all(store.get_job(j).status in ("done", "error") for j in job_ids),
+            timeout=15.0,
+        )
+    finally:
+        store.shutdown(join_timeout=5.0)
+
+    # And the records the app just wrote must be ones it can read back.
+    reloaded = JobStore(tmp_path, runner=FakeRunner())
+    try:
+        for job_id in job_ids:
+            assert reloaded.get_job(job_id) is not None, (
+                f"{job_id} did not survive a restart -- the app wrote a record its own "
+                "loader rejects"
+            )
+    finally:
+        reloaded.shutdown(join_timeout=5.0)
 
 
 @given(payload=_job_payloads(), style=_STYLE)
