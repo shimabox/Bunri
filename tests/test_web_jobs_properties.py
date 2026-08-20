@@ -183,6 +183,15 @@ def _neuter_spawn(monkeypatch) -> None:
     monkeypatch.setattr(jobs_module.subprocess, "Popen", lambda *a, **kw: _InstantProc())
 
 
+def _watch_everything_under(sentinels: dict[Path, Path], root: Path) -> None:
+    """Add every file below `root` to the watched set. Naming the interesting
+    ones by hand is how the jobs-directory case stayed invisible: the files
+    that got renamed and rewritten were simply not on the list."""
+    for path in root.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            sentinels[path] = path
+
+
 def _fingerprint(paths: dict[Path, Path]) -> dict[Path, object]:
     """Exact bytes of each watched file, or a marker if it is gone. Bytes,
     not mtimes: the question is whether the content changed."""
@@ -895,6 +904,11 @@ def test_p5_a_job_is_re_run_exactly_when_its_old_process_is_accounted_for(
         # at the far end get truncated by an entirely valid job.
         "logs-dir->outside",
         "web-dir->outside",
+        # web/jobs is the same shape again, and the only one where merely
+        # starting the server does the damage: the loader quarantines
+        # (renames) whatever unparseable JSON it finds, and the recovery path
+        # rewrites whatever valid-looking record it finds.
+        "jobs-dir->outside",
     ],
 )
 # The pid sidecar is only written by the real runner, so a fake one cannot
@@ -947,8 +961,12 @@ def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
     logs_dir.mkdir(parents=True, exist_ok=True)
     own_log = logs_dir / "j-prop-0001.log"
 
-    if plant in ("logs-dir->outside", "web-dir->outside"):
-        relocated = out_dir / ("web/logs" if plant.startswith("logs") else "web")
+    if plant in ("logs-dir->outside", "web-dir->outside", "jobs-dir->outside"):
+        relocated = out_dir / {
+            "logs-dir->outside": "web/logs",
+            "jobs-dir->outside": "web/jobs",
+            "web-dir->outside": "web",
+        }[plant]
         # Move what is already there to the far side first, so the store
         # finds the same tree through the link that it would have found
         # without one -- the record, the upload, all of it. The relocation
@@ -959,14 +977,23 @@ def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
             relocated.rmdir()
         relocated.parent.mkdir(parents=True, exist_ok=True)
         relocated.symlink_to(outside, target_is_directory=True)
-        # Ordinary files waiting exactly where this job's log and sidecar
-        # land once the link is followed.
-        landing = outside if plant.startswith("logs") else outside / "logs"
+        # Ordinary files waiting exactly where this job's own files land
+        # once the link is followed.
+        landing = outside if plant != "web-dir->outside" else outside / "logs"
         landing.mkdir(parents=True, exist_ok=True)
         for suffix in ("log", "pid"):
             target = landing / f"j-prop-0001.{suffix}"
             target.write_bytes(f"{suffix}: a file outside the output tree".encode())
-            sentinels[target] = target
+        # A stranger's JSON sitting where the loader will look: one it cannot
+        # parse (which it would quarantine by *renaming*) and one it can
+        # (which recovery would rewrite).
+        json_landing = outside if plant != "web-dir->outside" else outside / "jobs"
+        json_landing.mkdir(parents=True, exist_ok=True)
+        (json_landing / "j-victim.json").write_text("{ not json at all", encoding="utf-8")
+        # Everything on the far side is a sentinel, the relocated job records
+        # included -- the earlier version watched only the log files and so
+        # never saw the rename.
+        _watch_everything_under(sentinels, outside)
     elif plant is not None:
         which, _, where = plant.partition("->")
         victim = (
@@ -976,6 +1003,7 @@ def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
         (logs_dir / f"j-prop-0001.{which}").symlink_to(victim)
 
     before = _fingerprint(sentinels)
+    outside_listing = sorted(p.name for p in outside.rglob("*"))
     if real_runner:
         # default_runner for real, minus the separation subprocess: its file
         # operations (the truncating log open, the sidecar write) are the
@@ -1006,6 +1034,11 @@ def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
         f"Only {own_log} may ever be written."
     )
     assert set(after) == set(before), "no sentinel may be deleted either"
+    # Renames leave the old content readable under a new name, so content
+    # fingerprints alone would miss a quarantine. Watch the listing too.
+    assert sorted(p.name for p in outside.rglob("*")) == outside_listing, (
+        "something outside the output tree was renamed or created"
+    )
 
 
 @given(outcome=st.sampled_from(list(TerminationOutcome)))

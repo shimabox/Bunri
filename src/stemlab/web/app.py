@@ -189,7 +189,20 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
             )
 
         store.uploads_dir.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=store.uploads_dir, suffix=ext)
+        try:
+            # Not `store.uploads_dir` directly: web/uploads is a fixed,
+            # predictable name, so replacing it with a symlink would have
+            # every upload land wherever it points. The read side already
+            # checks this (JobStore._resolved_upload); this is its mirror,
+            # and it runs before a single byte is written.
+            uploads_dir = store.verified_uploads_dir()
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"upload directory is not usable, refusing to store the file: {exc}",
+            )
+
+        fd, tmp_name = tempfile.mkstemp(dir=uploads_dir, suffix=ext)
         tmp_path = Path(tmp_name)
         digest_hash = hashlib.sha1()
         size = 0
@@ -215,7 +228,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
             raise
 
         digest = digest_hash.hexdigest()
-        dest = store.uploads_dir / f"{digest}{ext}"
+        dest = uploads_dir / f"{digest}{ext}"
         if dest.exists():
             tmp_path.unlink(missing_ok=True)  # already have this exact content on disk
         else:

@@ -122,10 +122,15 @@ def new_job_id() -> str:
 Runner = Callable[[Path, Path, str, str, Path], int]
 
 
-class UnsafeLogPath(OSError):
-    """Refusal to open something under web/logs that is not what it claims.
+class UnsafeOutputPath(OSError):
+    """Refusal to touch something under out_dir that is not what it claims.
 
-    Deliberately an OSError: every caller of log I/O in this module already
+    Raised for all three of the directories this app writes into -- web/logs,
+    web/jobs, web/uploads -- because they have the same weakness: the names
+    are fixed and predictable, so replacing one with a symlink redirects
+    every write that follows it.
+
+    Deliberately an OSError: every caller of file I/O in this module already
     handles OSError from a missing or unreadable file, so a refusal degrades
     along a path that already exists instead of needing a new one.
     """
@@ -185,7 +190,7 @@ def _open_in_logs_dir(path: Path, *, expected_logs_dir: Path, mode: str):
     asked to touch, and deleting the link would be one more of them.
     """
     if not _is_really(path.parent, expected_logs_dir):
-        raise UnsafeLogPath(f"{path} is not really inside {expected_logs_dir}")
+        raise UnsafeOutputPath(f"{path} is not really inside {expected_logs_dir}")
     flags = {
         "rb": os.O_RDONLY,
         "wb": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
@@ -202,7 +207,7 @@ def _open_in_logs_dir(path: Path, *, expected_logs_dir: Path, mode: str):
         # ELOOP here means "it is a symlink", which is what this exists for;
         # anything else unexpected is reported the same way so callers keep
         # their single OSError path.
-        raise UnsafeLogPath(f"refusing to open {path}: {exc}") from exc
+        raise UnsafeOutputPath(f"refusing to open {path}: {exc}") from exc
     return os.fdopen(fd, mode)
 
 
@@ -982,11 +987,44 @@ class JobStore:
         been replaced."""
         return _real_subdir(self.out_dir, "web", "logs")
 
+    def _verified_dir(self, attr: Path, *parts: str) -> Path:
+        """`attr` if it really is `<out_dir>/<parts...>`, else a refusal.
+
+        All three directories this app writes into have the same weakness --
+        fixed, predictable names -- so all three get the same check. Without
+        it on web/jobs, pointing that name at another directory had a
+        *successful* startup rename someone else's JSON files to `.bad-*`
+        and overwrite them during recovery: real data loss outside out_dir,
+        from a server doing nothing but starting up.
+        """
+        expected = _real_subdir(self.out_dir, *parts)
+        if not _is_really(attr, expected):
+            raise UnsafeOutputPath(f"{attr} is not really {expected}")
+        return attr
+
+    def _verified_jobs_dir(self) -> Path:
+        return self._verified_dir(self.jobs_dir, "web", "jobs")
+
+    def verified_uploads_dir(self) -> Path:
+        """Where uploads may be saved. The web layer calls this instead of
+        reading `uploads_dir` directly, so the write side is checked exactly
+        like the read side (`_resolved_upload`) already is."""
+        return self._verified_dir(self.uploads_dir, "web", "uploads")
+
     # -- persistence --------------------------------------------------
     def _job_path(self, job_id: str) -> Path:
         return self.jobs_dir / f"{job_id}.json"
 
     def _write_job(self, job: Job) -> None:
+        try:
+            self._verified_jobs_dir()
+        except UnsafeOutputPath as exc:
+            # Skip rather than raise: the caller is the worker or the
+            # recovery path, and neither should die over this. The job keeps
+            # whatever in-memory state it has and its record on disk -- which
+            # is somebody else's file -- is left exactly as it was.
+            _warn(f"[stemlab-web] job {job.id}: not saving its record -- {exc}")
+            return
         path = self._job_path(job.id)
         encoded = _serialize_job_within_limit(job)
         if len(encoded.encode("utf-8", errors="backslashreplace")) > MAX_JOB_FILE_BYTES:
@@ -1022,6 +1060,11 @@ class JobStore:
         earlier quarantine of a different bad file (hence the retry-on-
         collision loop, however unlikely a collision actually is with an
         8-hex-char random suffix)."""
+        try:
+            self._verified_jobs_dir()
+        except UnsafeOutputPath as exc:
+            _warn(f"[stemlab-web] not quarantining {path.name} -- {exc}")
+            return
         while True:
             dest = path.with_name(f"{path.name}.bad-{secrets.token_hex(4)}")
             if not dest.exists():
@@ -1091,7 +1134,20 @@ class JobStore:
         return job, None
 
     def _load_and_recover(self) -> None:
-        for path in sorted(self.jobs_dir.glob("j-*.json")):
+        try:
+            jobs_dir = self._verified_jobs_dir()
+        except UnsafeOutputPath as exc:
+            # Nothing is read, nothing is renamed, nothing is written. The
+            # job list comes up empty and the server runs -- an empty list is
+            # recoverable by fixing the directory, whereas quarantining and
+            # rewriting a stranger's JSON files is not. Loud, because this is
+            # a misconfiguration (or worse) that a person has to resolve.
+            _warn(
+                f"[stemlab-web] {exc}; loading no job records and leaving that "
+                "directory untouched. Jobs will not be listed until it is restored."
+            )
+            return
+        for path in sorted(jobs_dir.glob("j-*.json")):
             try:
                 job, reason = self._read_job_file(path)
             except Exception as exc:
@@ -1410,7 +1466,7 @@ class JobStore:
         taking it). The record's `log` field is refreshed to match, so it
         stays a truthful cache of where the log really is.
 
-        Raises UnsafeLogPath if the directory that path lands in is not the
+        Raises UnsafeOutputPath if the directory that path lands in is not the
         logs directory -- `web/logs` having been replaced by a symlink. That
         is a fail-fast courtesy only: every actual write goes through
         `_open_in_logs_dir`, which re-checks this *and* refuses to follow a
@@ -1421,7 +1477,7 @@ class JobStore:
         path = self.out_dir / job.log
         path.parent.mkdir(parents=True, exist_ok=True)
         if not _is_really(path.parent, self._real_logs_dir()):
-            raise UnsafeLogPath(
+            raise UnsafeOutputPath(
                 f"refusing to write the log for {job.id}: {path.parent} is not really "
                 f"{self._real_logs_dir()}"
             )
@@ -1433,7 +1489,7 @@ class JobStore:
         # not follow what it is checking.
         for candidate in (path, _pid_sidecar(path)):
             if candidate.is_symlink():
-                raise UnsafeLogPath(
+                raise UnsafeOutputPath(
                     f"refusing to run {job.id}: {candidate} is a symlink, and writing "
                     f"through it would overwrite {os.readlink(candidate)!r}"
                 )

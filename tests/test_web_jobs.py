@@ -1888,6 +1888,75 @@ def test_a_relocated_logs_directory_fails_the_job_but_not_the_server(tmp_path):
         store.shutdown(join_timeout=5.0)
 
 
+def test_a_relocated_jobs_directory_is_neither_read_nor_written(tmp_path):
+    """`web/jobs` has the same fixed, predictable name as `web/logs`, and the
+    same consequence when it is replaced by a symlink -- except that here the
+    damage needs no job to run at all. Starting the server was enough: the
+    loader renamed a stranger's unparseable JSON to `.bad-*` (quarantine),
+    and the recovery path rewrote a stranger's valid-looking one.
+
+    So a jobs directory that is not really `<out_dir>/web/jobs` is not read,
+    not renamed and not written. The job list comes up empty, which is
+    recoverable by fixing the directory; rewriting someone else's files is
+    not.
+    """
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+
+    victim_bad = outside / "j-victim.json"
+    victim_bad.write_text("{ definitely not json", encoding="utf-8")
+    victim_good = outside / "j-good.json"
+    victim_good.write_text(json.dumps({
+        "id": "j-good", "digest": "dx", "title": "Song", "target": "guitar",
+        "status": "queued", "created_at": "2026-07-12T00:00:00+00:00",
+        "log": "web/logs/j-good.log", "upload": "web/uploads/song.mp3",
+    }), encoding="utf-8")
+    originals = {p: p.read_bytes() for p in (victim_bad, victim_good)}
+    before = sorted(p.name for p in outside.iterdir())
+
+    (out_dir / "web").mkdir(parents=True)
+    (out_dir / "web" / "jobs").symlink_to(outside, target_is_directory=True)
+
+    store = JobStore(out_dir, runner=FakeRunner())  # must not raise
+    try:
+        time.sleep(0.4)
+        for path, content in originals.items():
+            assert path.read_bytes() == content, f"{path} was rewritten"
+        assert sorted(p.name for p in outside.iterdir()) == before, (
+            "a file outside the output tree was renamed (quarantined)"
+        )
+        assert store.list_jobs() == [], "nothing may be loaded from a relocated jobs directory"
+    finally:
+        store.shutdown(join_timeout=5.0)
+
+
+def test_a_relocated_uploads_directory_refuses_the_upload(tmp_path):
+    """The mirror of `_resolved_upload`, on the write side: uploads are saved
+    into a fixed name, so if that name has been pointed elsewhere the bytes
+    must not be written at all."""
+    import io
+
+    from fastapi.testclient import TestClient
+
+    from stemlab.web.app import create_app
+
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    (out_dir / "web").mkdir(parents=True)
+    (out_dir / "web" / "uploads").symlink_to(outside, target_is_directory=True)
+
+    app = create_app(out_dir, runner=FakeRunner())
+    with TestClient(app) as client:
+        res = client.post(
+            "/api/jobs", files={"file": ("song.mp3", io.BytesIO(b"abc"), "audio/mpeg")}
+        )
+
+    assert res.status_code == 500
+    assert list(outside.iterdir()) == [], "not one byte may be written outside the tree"
+
+
 def test_a_running_record_whose_log_path_names_no_file_is_quarantined_not_fatal(tmp_path):
     """`log: "/"` passes every type, status and encoding check, and then the
     recovery path derives a pid sidecar from it -- `Path("/").with_suffix()`,
