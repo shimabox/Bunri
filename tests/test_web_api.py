@@ -270,16 +270,43 @@ def test_package_url_is_percent_encoded_for_spaces(tmp_path):
         assert detail["package_url"] == "/packages/Song%201/Song%201.guitar.player.html"
 
 
-def test_a_record_claiming_a_package_it_did_not_produce_is_rejected(tmp_path):
-    """`package` is what the API tells the browser to fetch, so a record is
-    only allowed to claim the path its own title and target derive. This one
-    is shaped like a record written before the sanitizer stripped "#" -- and
-    like anything else hand-edited to point elsewhere, it is quarantined
-    rather than served."""
+def test_package_url_is_percent_encoded_for_hash_and_space(tmp_path):
+    """A job record persisted by a released version, whose sanitizer left
+    "#" in the slug. It is still that user's finished package, so it loads
+    and is served -- with the "#" percent-encoded, or the URL would truncate
+    at a fragment.
+
+    The record's `package` is checked for shape rather than for matching what
+    today's sanitizer would produce. Requiring the latter quarantined records
+    like this one, discarding real packages over a slug rule that changed
+    after they were written."""
     _write_job_file(
-        tmp_path, "j-claims", title="Song #1",
-        package="Song #1/Song #1.guitar.player.html",  # pre-sanitizer, underivable now
+        tmp_path, "j-legacy-hash", title="Song #1",
+        package="Song #1/Song #1.guitar.player.html",
     )
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        detail = c.get("/api/jobs/j-legacy-hash").json()
+        assert detail["package_url"] == "/packages/Song%20%231/Song%20%231.guitar.player.html"
+
+
+@pytest.mark.parametrize(
+    "package",
+    [
+        "Song/Somebody-elses.guitar.player.html",  # file half doesn't match the dir
+        "Song/Song.vocals.player.html",  # a different target's package
+        "../outside/outside.guitar.player.html",
+        "/etc/etc.guitar.player.html",
+        "web/web.guitar.player.html",  # the server's own directory
+        ".hidden/.hidden.guitar.player.html",
+        "Song.guitar.player.html",  # no directory at all
+    ],
+)
+def test_a_record_claiming_a_package_of_the_wrong_shape_is_rejected(tmp_path, package):
+    """Shape is not the same as "anything goes": `package` is what the API
+    tells the browser to fetch, so it must still be one package directory
+    containing its own player for this record's target, and nothing else."""
+    _write_job_file(tmp_path, "j-claims", title="Song", package=package)
     app = create_app(tmp_path, runner=ApiFakeRunner())
     with TestClient(app) as c:
         assert c.get("/api/jobs/j-claims").status_code == 404

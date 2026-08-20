@@ -188,7 +188,6 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                 + ", ".join(sorted(ALLOWED_EXTENSIONS)),
             )
 
-        store.uploads_dir.mkdir(parents=True, exist_ok=True)
         try:
             # Not `store.uploads_dir` directly: web/uploads is a fixed,
             # predictable name, so replacing it with a symlink would have

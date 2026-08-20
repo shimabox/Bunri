@@ -1931,6 +1931,41 @@ def test_a_relocated_jobs_directory_is_neither_read_nor_written(tmp_path):
         store.shutdown(join_timeout=5.0)
 
 
+def test_a_relocated_web_directory_gets_nothing_created_inside_it(tmp_path):
+    """Refusing to *write* outside out_dir is not enough if the refusal comes
+    after the directories are made. `mkdir(parents=True)` follows a symlink
+    and builds the rest of the tree on the far side, so with `web -> outside`
+    and nothing there yet, starting the server and posting an upload left an
+    `uploads/` and a `logs/` behind before anything objected.
+
+    Each component is created and checked one at a time now, so an empty
+    directory stays empty.
+    """
+    import io
+
+    from fastapi.testclient import TestClient
+
+    from stemlab.web.app import create_app
+
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)  # deliberately empty
+    out_dir.mkdir(parents=True)
+    (out_dir / "web").symlink_to(outside, target_is_directory=True)
+
+    app = create_app(out_dir, runner=FakeRunner())
+    with TestClient(app) as client:
+        res = client.post(
+            "/api/jobs", files={"file": ("song.mp3", io.BytesIO(b"abc"), "audio/mpeg")}
+        )
+        assert res.status_code == 500
+        assert client.get("/api/jobs").status_code == 200  # the server is still up
+
+    assert list(outside.iterdir()) == [], (
+        f"created {[p.name for p in outside.iterdir()]} outside the output tree"
+    )
+
+
 def test_a_relocated_uploads_directory_refuses_the_upload(tmp_path):
     """The mirror of `_resolved_upload`, on the write side: uploads are saved
     into a fixed name, so if that name has been pointed elsewhere the bytes

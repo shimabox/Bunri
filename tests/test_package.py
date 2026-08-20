@@ -313,3 +313,40 @@ def test_build_package_refuses_to_write_outside_out_dir_if_safe_filename_is_bypa
         build_package(song_input, out_dir, title="whatever")
 
     assert not (tmp_path / "escaped").exists()
+
+
+@_NEED_FFMPEG
+@pytest.mark.parametrize(
+    "planted",
+    ["song.guitar.player.html", "song.guitar.wav", "song.guitar.mp3", "song.original.mp3"],
+)
+def test_build_package_never_writes_through_a_planted_output_symlink(
+    tmp_path, song_input, planted
+):
+    """Every name a package writes is derivable from the title, so a symlink
+    can be waiting at any of them. Containment checks on the package
+    *directory* say nothing about this -- the link is the final component and
+    resolves wherever it likes -- and copyfile, ffmpeg and write_text all
+    follow it, overwriting the target.
+
+    So exports are written to a temporary beside the destination and renamed
+    into place: `os.replace` swaps the name, leaving the link's target
+    untouched.
+    """
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    victim = outside / "precious.dat"
+    victim.write_bytes(b"a file with nothing to do with this package")
+    original = victim.read_bytes()
+
+    package_dir = out_dir / "song"
+    package_dir.mkdir(parents=True)
+    (package_dir / planted).symlink_to(victim)
+
+    build_package(song_input, out_dir, title="song")
+
+    assert victim.read_bytes() == original, f"writing {planted} followed the symlink"
+    produced = package_dir / planted
+    assert not produced.is_symlink(), "the export must have replaced the link, not followed it"
+    assert produced.stat().st_size > 0, "and the real output must still be there"

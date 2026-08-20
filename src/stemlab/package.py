@@ -7,10 +7,13 @@ StemLab has no downstream (transcription/tab) stages to sequence.
 
 from __future__ import annotations
 
+import os
 import re
+import secrets
 import shutil
 import time
 from pathlib import Path
+from typing import Callable
 
 from rich.console import Console
 
@@ -55,14 +58,43 @@ def _safe_filename(title: str) -> str:
     return slug
 
 
+def _replace_into(dest: Path, write: Callable[[Path], None]) -> Path:
+    """Produce `dest` by writing a uniquely-named temporary beside it and
+    renaming that into place.
+
+    Every export goes through this, and the reason is symlinks. Writing
+    straight to `dest` -- copyfile, ffmpeg's output file, write_text -- all
+    follow a link sitting there and clobber whatever it points at, which for
+    a package path is a name an attacker (or a careless `ln -s`) can predict
+    exactly. `os.replace` does not follow: it swaps the *name*, so a planted
+    link is what gets replaced, not its target. Containment checks on the
+    package directory cannot help here, because the link is the final
+    component and resolves wherever it likes.
+
+    Atomicity comes free with it -- a reader never sees a half-copied export
+    -- and it is the same write-then-rename shape the model download and the
+    job records already use.
+
+    The temporary keeps `dest`'s suffix: ffmpeg picks its muxer from the
+    output extension, so ".../x.tmp-ab12" would leave it guessing.
+    """
+    tmp = dest.with_name(f".{dest.stem}.tmp-{secrets.token_hex(4)}{dest.suffix}")
+    try:
+        write(tmp)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op after a successful replace
+    return dest
+
+
 def _export(src: Path, dest: Path) -> Path:
-    shutil.copyfile(src, dest)
+    _replace_into(dest, lambda tmp: shutil.copyfile(src, tmp))
     console.print(f"→ [cyan]{dest}[/cyan]")
     return dest
 
 
 def _export_mp3(src: Path, dest: Path) -> Path:
-    audio.encode_mp3(src, dest)
+    _replace_into(dest, lambda tmp: audio.encode_mp3(src, tmp))
     console.print(f"→ [cyan]{dest}[/cyan]")
     return dest
 
@@ -212,16 +244,14 @@ def build_package(
         original_ref = None
 
     player_dest = package_dir / f"{safe}.{spec.target}.player.html"
-    player_dest.write_text(
-        render_player(
-            song_title,
-            original=original_ref,
-            target=target_ref,
-            backing=backing_ref,
-            instrument_label=spec.label_ja,
-        ),
-        encoding="utf-8",
+    player_html = render_player(
+        song_title,
+        original=original_ref,
+        target=target_ref,
+        backing=backing_ref,
+        instrument_label=spec.label_ja,
     )
+    _replace_into(player_dest, lambda tmp: tmp.write_text(player_html, encoding="utf-8"))
     console.print(f"→ [cyan]{player_dest}[/cyan]")
 
     return package_dir

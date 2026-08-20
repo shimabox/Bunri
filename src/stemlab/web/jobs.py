@@ -158,6 +158,38 @@ def _real_subdir(out_dir: Path, *parts: str) -> Path:
     return out_dir.resolve().joinpath(*parts)
 
 
+def _verified_mkdir(out_dir: Path, *parts: str) -> Path:
+    """`<out_dir>/<parts...>`, created if missing, with every component
+    checked as it is walked.
+
+    Splitting the walk matters: `mkdir(parents=True)` on the whole path
+    follows any symlink it meets and happily creates the rest of the tree on
+    the far side, so a check afterwards is too late -- with `web -> /outside`
+    and nothing at the other end, the server made `/outside/uploads` and
+    `/outside/logs` before deciding it did not like them. Nothing outside
+    out_dir may be created, not even an empty directory.
+
+    Each component is either created here (so it cannot be a link) or
+    verified with `is_symlink()` -- an lstat, which does not follow what it
+    is testing. The base is out_dir resolved, so an out_dir that itself lives
+    under a symlink keeps working; see `_real_subdir`.
+    """
+    path = out_dir.resolve()
+    if not path.is_dir():
+        raise UnsafeOutputPath(f"{out_dir} is not a directory")
+    for part in parts:
+        path = path / part
+        if path.is_symlink():
+            raise UnsafeOutputPath(f"{path} is a symlink; refusing to use it")
+        try:
+            path.mkdir(exist_ok=True)
+        except OSError as exc:
+            raise UnsafeOutputPath(f"cannot use {path}: {exc}") from exc
+        if not path.is_dir():
+            raise UnsafeOutputPath(f"{path} is not a directory")
+    return path
+
+
 def _is_really(candidate: Path, expected: Path) -> bool:
     """True if `candidate` resolves to exactly `expected`. `expected` is used
     as given -- it is a value built by `_real_subdir`, and resolving it again
@@ -549,8 +581,7 @@ def default_runner(
         "--target",
         target,
     ]
-    (Path(out_dir) / "web" / "logs").mkdir(parents=True, exist_ok=True)
-    expected_logs_dir = _real_subdir(Path(out_dir), "web", "logs")
+    expected_logs_dir = _verified_mkdir(Path(out_dir), "web", "logs")
     sidecar = _pid_sidecar(log_path)
     with _open_in_logs_dir(log_path, expected_logs_dir=expected_logs_dir, mode="wb") as log_f:
         # The sidecar is opened *before* the process exists, and the spawn is
@@ -672,18 +703,61 @@ def _derived_package(title: str, target: str) -> str:
     return f"{safe}/{safe}.{target}.player.html"
 
 
-def _package_problem(value: str) -> Optional[str]:
-    """None if `value` is a package path safe to store and serve, else why it
-    isn't. `safe_filename` sanitizes the title half, but `target` is
-    interpolated raw, so this is what keeps a hand-written target from
-    steering the derived path out of the output directory."""
-    candidate = Path(value)
-    if candidate.is_absolute():
-        return f"it is an absolute path: {value!r}"
-    if ".." in candidate.parts:
-        return f"it climbs above the output directory: {value!r}"
-    if not candidate.name:
-        return f"it names no file: {value!r}"
+def _safe_package_segment(segment: str) -> Optional[str]:
+    """None if `segment` is safe as the single directory component of a
+    package path, else why it isn't.
+
+    This is a check on *shape*, not on provenance -- deliberately, and the
+    distinction cost a regression. Requiring the segment to equal what
+    `safe_filename` produces today quarantines records written by released
+    versions whose sanitizer left `#` and `%` alone, taking a user's finished
+    packages with them. Those records are not dangerous, only old: what makes
+    a package path dangerous is escaping its directory or colliding with the
+    server's own, and that is what this rules out.
+    """
+    if not segment:
+        return "it has an empty directory name"
+    if "/" in segment or "\\" in segment:
+        return f"its directory name spans path separators: {segment!r}"
+    if "\x00" in segment:
+        return f"its directory name contains a NUL byte: {segment!r}"
+    if segment in (".", ".."):
+        return f"its directory name is {segment!r}"
+    if segment.startswith("."):
+        # Same rule the static-file middleware enforces, kept here so a
+        # record can't describe a package the server would then refuse to
+        # serve (or, worse, one that names a private dotdir).
+        return f"its directory name starts with a dot: {segment!r}"
+    if segment.casefold() == "web":
+        return "its directory name is the server's own 'web' directory"
+    try:
+        segment.encode("utf-8")
+    except UnicodeEncodeError:
+        return f"its directory name is not encodable as UTF-8: {segment!r}"
+    return None
+
+
+def _package_problem(value: str, target: str) -> Optional[str]:
+    """None if `value` is a package path this server may store and serve.
+
+    The shape is fixed -- ``<dir>/<dir>.<target>.player.html``, the same
+    string in both halves -- so a record cannot point the player URL at some
+    unrelated file, while an older record whose `<dir>` was slugged by an
+    earlier sanitizer still loads. Containment against out_dir is not decided
+    here: it is a *serving* question, settled after resolve() by the static
+    layer and its middleware.
+    """
+    head, sep, tail = value.partition("/")
+    if not sep:
+        return f"it is not of the form <dir>/<dir>.<target>.player.html: {value!r}"
+    problem = _safe_package_segment(head)
+    if problem is not None:
+        return problem
+    if tail != f"{head}.{target}.player.html":
+        return (
+            f"its file name is {tail!r}, but a package for target {target!r} in "
+            f"{head!r} is named {head}.{target}.player.html"
+        )
     return None
 
 
@@ -799,12 +873,9 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
         )
     package = data.get("package")
     if package is not None:
-        expected_package = _derived_package(data["title"], data["target"])
-        if package != expected_package:
-            return (
-                f"field 'package' is {package!r}, but this job's title and target give "
-                f"{expected_package!r}"
-            )
+        problem = _package_problem(package, data["target"])
+        if problem is not None:
+            return f"field 'package' is unusable: {problem}"
     upload = data.get("upload")
     if upload is not None:
         problem = _upload_problem(upload)
@@ -964,8 +1035,18 @@ class JobStore:
         self.jobs_dir = self.out_dir / "web" / "jobs"
         self.logs_dir = self.out_dir / "web" / "logs"
         self.uploads_dir = self.out_dir / "web" / "uploads"
-        for d in (self.jobs_dir, self.logs_dir, self.uploads_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        # Created component by component, and only inside out_dir's real
+        # location -- see _verified_mkdir. A plain mkdir(parents=True) here
+        # would build the tree on the far side of a relocated `web` before
+        # anything got the chance to object.
+        for name in ("jobs", "logs", "uploads"):
+            try:
+                _verified_mkdir(self.out_dir, "web", name)
+            except UnsafeOutputPath as exc:
+                # Not fatal: every user of these directories checks again at
+                # the point of use and refuses there, so the server comes up
+                # and says what is wrong rather than failing to start.
+                _warn(f"[stemlab-web] cannot prepare web/{name}: {exc}")
 
         self._runner = runner
         self._lock = threading.RLock()
@@ -987,29 +1068,24 @@ class JobStore:
         been replaced."""
         return _real_subdir(self.out_dir, "web", "logs")
 
-    def _verified_dir(self, attr: Path, *parts: str) -> Path:
-        """`attr` if it really is `<out_dir>/<parts...>`, else a refusal.
+    def _verified_jobs_dir(self) -> Path:
+        """The job-record directory, verified (and created if missing).
 
         All three directories this app writes into have the same weakness --
-        fixed, predictable names -- so all three get the same check. Without
-        it on web/jobs, pointing that name at another directory had a
-        *successful* startup rename someone else's JSON files to `.bad-*`
-        and overwrite them during recovery: real data loss outside out_dir,
-        from a server doing nothing but starting up.
+        fixed, predictable names -- so all three go through `_verified_mkdir`.
+        Without it on web/jobs, pointing that name at another directory had a
+        *successful* startup rename someone else's JSON files to `.bad-*` and
+        overwrite them during recovery: real data loss outside out_dir, from
+        a server doing nothing but starting up.
         """
-        expected = _real_subdir(self.out_dir, *parts)
-        if not _is_really(attr, expected):
-            raise UnsafeOutputPath(f"{attr} is not really {expected}")
-        return attr
-
-    def _verified_jobs_dir(self) -> Path:
-        return self._verified_dir(self.jobs_dir, "web", "jobs")
+        return _verified_mkdir(self.out_dir, "web", "jobs")
 
     def verified_uploads_dir(self) -> Path:
         """Where uploads may be saved. The web layer calls this instead of
         reading `uploads_dir` directly, so the write side is checked exactly
-        like the read side (`_resolved_upload`) already is."""
-        return self._verified_dir(self.uploads_dir, "web", "uploads")
+        like the read side (`_resolved_upload`) already is -- and so the
+        directory is only ever created inside out_dir."""
+        return _verified_mkdir(self.out_dir, "web", "uploads")
 
     # -- persistence --------------------------------------------------
     def _job_path(self, job_id: str) -> Path:
@@ -1120,7 +1196,7 @@ class JobStore:
         # the one it stores. `safe_filename` sanitizes the title, but `target`
         # goes in raw, so a ".." there yields an escaping package the moment
         # the job succeeds -- accepted now, refused on the next load, gone.
-        problem = _package_problem(_derived_package(job.title, job.target))
+        problem = _package_problem(_derived_package(job.title, job.target), job.target)
         if problem is not None:
             return None, f"this job would produce an unusable package path: {problem}"
         grown = _fully_grown(job)
@@ -1474,8 +1550,10 @@ class JobStore:
         refusal into a failed job; the server carries on.
         """
         job.log = _log_relpath(job.id)
+        # Creates web/logs if needed, verifying each component on the way --
+        # never `mkdir(parents=True)` on a path that might run through a link.
+        _verified_mkdir(self.out_dir, "web", "logs")
         path = self.out_dir / job.log
-        path.parent.mkdir(parents=True, exist_ok=True)
         if not _is_really(path.parent, self._real_logs_dir()):
             raise UnsafeOutputPath(
                 f"refusing to write the log for {job.id}: {path.parent} is not really "

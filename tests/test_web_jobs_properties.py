@@ -909,6 +909,11 @@ def test_p5_a_job_is_re_run_exactly_when_its_old_process_is_accounted_for(
         # (renames) whatever unparseable JSON it finds, and the recovery path
         # rewrites whatever valid-looking record it finds.
         "jobs-dir->outside",
+        # Nothing waiting on the far side at all. Refusing to *write* there
+        # is not enough if the directories get made first: mkdir(parents=True)
+        # follows the link and builds the tree beyond it, so this plant
+        # watches for an empty directory staying empty.
+        "web-dir->empty",
     ],
 )
 # The pid sidecar is only written by the real runner, so a fake one cannot
@@ -961,7 +966,14 @@ def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
     logs_dir.mkdir(parents=True, exist_ok=True)
     own_log = logs_dir / "j-prop-0001.log"
 
-    if plant in ("logs-dir->outside", "web-dir->outside", "jobs-dir->outside"):
+    if plant == "web-dir->empty":
+        # A separate, pristine directory: `outside` already holds sentinels,
+        # and the statement here is specifically that nothing is created.
+        pristine = tmp_path / "pristine"
+        pristine.mkdir()
+        shutil.rmtree(out_dir / "web")
+        (out_dir / "web").symlink_to(pristine, target_is_directory=True)
+    elif plant in ("logs-dir->outside", "web-dir->outside", "jobs-dir->outside"):
         relocated = out_dir / {
             "logs-dir->outside": "web/logs",
             "jobs-dir->outside": "web/jobs",
@@ -1039,6 +1051,11 @@ def test_p6_a_recovered_job_can_only_ever_touch_its_own_log(
     assert sorted(p.name for p in outside.rglob("*")) == outside_listing, (
         "something outside the output tree was renamed or created"
     )
+    if plant == "web-dir->empty":
+        created = sorted(p.name for p in (tmp_path / "pristine").rglob("*"))
+        assert created == [], (
+            f"created {created} beyond a relocated web/ that had nothing in it"
+        )
 
 
 @given(outcome=st.sampled_from(list(TerminationOutcome)))
