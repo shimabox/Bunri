@@ -147,7 +147,11 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
         # and polling stops (no more active jobs).
         page.wait_for_selector("a.sw-open-link", timeout=10_000)
         link = page.get_attribute("a.sw-open-link", "href")
-        assert link == "/packages/テスト曲/テスト曲.guitar.player.html"
+        # package_url is percent-encoded (see web/app.py's _serialize_job).
+        assert link == (
+            "/packages/%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2/"
+            "%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2.guitar.player.html"
+        )
         assert page.get_attribute("a.sw-open-link", "target") == "_blank"
 
         page.wait_for_function("window.__stemlabWeb.isPolling() === false", timeout=5_000)

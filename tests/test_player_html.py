@@ -146,6 +146,26 @@ def test_output_is_fully_offline_no_external_resources():
     assert "//fonts." not in lowered
 
 
+def test_audio_src_percent_encodes_spaces_and_hash():
+    # A filename passed straight to render_player (e.g. an existing on-disk
+    # file that predates the sanitizer's #/% stripping, or a title with a
+    # space) must still resolve as one valid <audio src> -- an unescaped
+    # space breaks the attribute value and an unescaped "#" truncates the
+    # URL at a fragment.
+    out = render_player(
+        "s",
+        original="song #1 take.mp3",
+        target="song #1 take.guitar.mp3",
+        backing="song #1 take.backing.mp3",
+        instrument_label=_LABEL,
+    )
+    assert 'src="song%20%231%20take.mp3"' in out
+    assert 'src="song%20%231%20take.guitar.mp3"' in out
+    assert 'src="song%20%231%20take.backing.mp3"' in out
+    # The raw, unencoded filename must not appear anywhere as a src value.
+    assert 'src="song #1 take.mp3"' not in out
+
+
 def test_instrument_label_drives_track_button_text():
     out = render_player(
         "s", original="a.mp3", target="b.mp3", backing="c.mp3", instrument_label="ボーカル"

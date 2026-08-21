@@ -252,3 +252,311 @@ def test_build_package_normalize_rerun_forces_reseparation(tmp_path, song_input)
     assert len(_PackageFakeSeparator.instances) == 2, (
         "an upstream (normalize) re-run must force re-separation"
     )
+
+
+# ---------------------------------------------------------------------------
+# sanitizer hardening / containment (security review fixes)
+# ---------------------------------------------------------------------------
+@_NEED_FFMPEG
+def test_build_package_dot_only_title_falls_back_to_untitled(tmp_path, song_input):
+    # "--title .." must never resolve to a package folder outside out_dir.
+    out_dir = tmp_path / "out"
+
+    package_dir = build_package(song_input, out_dir, title="..")
+
+    assert package_dir == out_dir / "untitled"
+    assert package_dir.resolve().is_relative_to(out_dir.resolve())
+    assert (package_dir / "untitled.guitar.wav").exists()
+
+
+@_NEED_FFMPEG
+def test_build_package_web_title_is_renamed_to_web_package(tmp_path, song_input):
+    # "web" is the web UI's own private out_dir subfolder; a package titled
+    # "web" must not land on top of (or masquerade as) it.
+    out_dir = tmp_path / "out"
+
+    package_dir = build_package(song_input, out_dir, title="Web")
+
+    assert package_dir == out_dir / "web-package"
+    assert (package_dir / "web-package.guitar.wav").exists()
+
+
+@_NEED_FFMPEG
+def test_build_package_strips_hash_and_percent_from_slug_but_keeps_display_title(
+    tmp_path, song_input
+):
+    out_dir = tmp_path / "out"
+
+    package_dir = build_package(song_input, out_dir, title="Song #1 100%")
+
+    assert package_dir == out_dir / "Song _1 100_"
+    html = (package_dir / "Song _1 100_.guitar.player.html").read_text(encoding="utf-8")
+    # The on-disk slug is sanitized, but the *displayed* title is verbatim.
+    assert "Song #1 100%" in html
+
+
+@_NEED_FFMPEG
+def test_build_package_refuses_to_write_outside_out_dir_if_safe_filename_is_bypassed(
+    tmp_path, song_input, monkeypatch
+):
+    """Defense in depth: even if _safe_filename's own sanitizing were somehow
+    bypassed (a future regression, or some other caller), build_package must
+    still refuse to write a package directory that resolves outside out_dir.
+    Forced here by directly patching _safe_filename to hand back a
+    traversal string, isolating this check from the sanitizer itself."""
+    import stemlab.package as package_module
+
+    monkeypatch.setattr(package_module, "_safe_filename", lambda title: "../escaped")
+    out_dir = tmp_path / "out"
+
+    with pytest.raises(ValueError, match="outside out_dir"):
+        build_package(song_input, out_dir, title="whatever")
+
+    assert not (tmp_path / "escaped").exists()
+
+
+@_NEED_FFMPEG
+@pytest.mark.parametrize(
+    "planted",
+    ["song.guitar.player.html", "song.guitar.wav", "song.guitar.mp3", "song.original.mp3"],
+)
+def test_build_package_never_writes_through_a_planted_output_symlink(
+    tmp_path, song_input, planted
+):
+    """Every name a package writes is derivable from the title, so a symlink
+    can be waiting at any of them. Containment checks on the package
+    *directory* say nothing about this -- the link is the final component and
+    resolves wherever it likes -- and copyfile, ffmpeg and write_text all
+    follow it, overwriting the target.
+
+    So exports are written to a temporary beside the destination and renamed
+    into place: `os.replace` swaps the name, leaving the link's target
+    untouched.
+    """
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    victim = outside / "precious.dat"
+    victim.write_bytes(b"a file with nothing to do with this package")
+    original = victim.read_bytes()
+
+    package_dir = out_dir / "song"
+    package_dir.mkdir(parents=True)
+    (package_dir / planted).symlink_to(victim)
+
+    build_package(song_input, out_dir, title="song")
+
+    assert victim.read_bytes() == original, f"writing {planted} followed the symlink"
+    produced = package_dir / planted
+    assert not produced.is_symlink(), "the export must have replaced the link, not followed it"
+    assert produced.stat().st_size > 0, "and the real output must still be there"
+
+
+@_NEED_FFMPEG
+def test_build_package_refuses_a_package_directory_that_is_a_symlink(tmp_path, song_input):
+    """Containment says a link is fine as long as it points inside out_dir --
+    but `out/Song -> out/victim` points at somebody else's package, and every
+    export then runs through it, temporary file and rename together. A
+    package folder has to be a real directory."""
+    out_dir = tmp_path / "out"
+    victim = out_dir / "victim"
+    victim.mkdir(parents=True)
+    kept = victim / "victim.guitar.player.html"
+    kept.write_text("another song's package", encoding="utf-8")
+    original = kept.read_bytes()
+
+    (out_dir / "song").symlink_to(victim, target_is_directory=True)
+
+    refused = None
+    try:
+        build_package(song_input, out_dir, title="song")
+    except ValueError as exc:
+        refused = exc
+
+    # Damage first, so a failure says what was written rather than what was
+    # not raised.
+    assert sorted(p.name for p in victim.iterdir()) == [kept.name], (
+        f"wrote {sorted(p.name for p in victim.iterdir())} through the link into "
+        "another song's package"
+    )
+    assert kept.read_bytes() == original
+    assert refused is not None and "symlink" in str(refused)
+
+
+@_NEED_FFMPEG
+def test_build_package_refuses_a_symlinked_cache_directory(tmp_path, song_input):
+    """The cache layer runs before any package output, so protecting the
+    package files was only half the job. `out/.cache -> outside` had
+    mkdir(parents=True) follow the link and put the normalized input, the
+    separated stems and every meta file out there -- none of it ever passing
+    through the write-time protections, because it never got that far."""
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    out_dir.mkdir(parents=True)
+    (out_dir / ".cache").symlink_to(outside, target_is_directory=True)
+
+    refused = None
+    try:
+        build_package(song_input, out_dir, title="song")
+    except OSError as exc:
+        refused = exc
+
+    # Damage first, so a failure names what was written rather than what was
+    # not raised.
+    assert sorted(p.name for p in outside.rglob("*")) == [], (
+        f"created {sorted(p.name for p in outside.rglob('*'))} outside the output tree"
+    )
+    assert refused is not None and "symlink" in str(refused)
+
+
+@_NEED_FFMPEG
+@pytest.mark.parametrize("planted", ["normalize.meta.json", "input.wav"])
+def test_build_package_never_writes_through_a_planted_cache_symlink(
+    tmp_path, song_input, planted
+):
+    """Same rule as the package exports, applied to the cache: every name in
+    there is derivable from the input digest, so a symlink can be waiting at
+    one, and write_text (the meta) or ffmpeg (input.wav) would follow it."""
+    from stemlab.cache import file_digest
+
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    victim = outside / "victim.txt"
+    victim.write_bytes(b"a file with nothing to do with this cache")
+    original = victim.read_bytes()
+
+    cache_dir = out_dir / ".cache" / file_digest(song_input)
+    cache_dir.mkdir(parents=True)
+    (cache_dir / planted).symlink_to(victim)
+
+    build_package(song_input, out_dir, title="song")
+
+    assert victim.read_bytes() == original, f"writing {planted} followed the symlink"
+    produced = cache_dir / planted
+    assert not produced.is_symlink(), "the write must have replaced the link, not followed it"
+    assert produced.stat().st_size > 0
+
+
+@_NEED_FFMPEG
+@pytest.mark.parametrize("swapped", ["guitar.wav", "guitar.backing.wav", "input.wav"])
+def test_build_package_does_not_trust_a_cached_artifact_that_is_a_symlink(
+    tmp_path, song_input, swapped
+):
+    """Guarding what the cache *writes* does nothing if what it *reads* trusts
+    whatever is sitting there. `exists()` follows symlinks, so leaving a valid
+    meta in place and swapping a cached artifact for a link elsewhere read as
+    "cached" -- and the link's target was copied into the package the user
+    shares."""
+    from stemlab.cache import file_digest
+
+    out_dir = tmp_path / "out"
+    build_package(song_input, out_dir, title="song")
+    assert len(_PackageFakeSeparator.instances) == 1
+
+    # Real audio, so the pre-fix path runs all the way through and the leak
+    # shows up as the outsider's audio inside the user's package -- rather
+    # than as ffmpeg choking on a file of nonsense.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.wav"
+    sf.write(str(victim), np.full((44100, 2), 0.77, dtype=np.float32), 44100)
+    original = victim.read_bytes()
+
+    cache_dir = out_dir / ".cache" / file_digest(song_input)
+    (cache_dir / swapped).unlink()
+    (cache_dir / swapped).symlink_to(victim)
+
+    build_package(song_input, out_dir, title="song")
+
+    # The harm first: what ends up in the package the user shares.
+    package_dir = out_dir / "song"
+    for produced in package_dir.glob("*.wav"):
+        assert produced.read_bytes() != original, (
+            f"the link's target was published as {produced.name}"
+        )
+    assert victim.read_bytes() == original, "and the link's target must be left alone"
+    assert len(_PackageFakeSeparator.instances) == 2, (
+        f"a symlinked {swapped} must not count as a cached artifact"
+    )
+
+
+@_NEED_FFMPEG
+def test_build_package_does_not_trust_a_cache_meta_that_is_a_symlink(tmp_path, song_input):
+    """The meta is read for the same reason and gets the same treatment: a
+    link standing where it belongs cannot be what decides a stage is fresh."""
+    from stemlab.cache import file_digest
+
+    out_dir = tmp_path / "out"
+    build_package(song_input, out_dir, title="song")
+    assert len(_PackageFakeSeparator.instances) == 1
+
+    cache_dir = out_dir / ".cache" / file_digest(song_input)
+    meta = cache_dir / "separate:guitar.meta.json"
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_bytes(meta.read_bytes())
+    meta.unlink()
+    meta.symlink_to(elsewhere)
+
+    build_package(song_input, out_dir, title="song")
+
+    assert len(_PackageFakeSeparator.instances) == 2, (
+        "a symlinked meta must not be what says the stage is fresh"
+    )
+
+
+@_NEED_FFMPEG
+def test_build_package_reseparates_after_a_run_that_died_between_the_two_stems(
+    tmp_path, song_input
+):
+    """separate() moves the target stem into the cache before it writes the
+    backing track, so a failure between the two leaves a *new* target beside
+    an *old* backing. Both exist, so the old meta called the pair fresh and
+    the next run packaged one stem from each separation.
+
+    The meta is cleared before a stage recomputes, so an interrupted run
+    leaves nothing claiming to be cached."""
+    from stemlab.cache import file_digest
+
+    out_dir = tmp_path / "out"
+    build_package(song_input, out_dir, title="song")
+    cache_dir = out_dir / ".cache" / file_digest(song_input)
+    meta = cache_dir / "separate:guitar.meta.json"
+    assert meta.exists()
+
+    class _DiesAfterTargetSeparator(_PackageFakeSeparator):
+        """Writes its stems, then fails the way a crash between the target
+        move and the backing write does -- by leaving separate() to blow up
+        after the target has already landed in the cache."""
+
+        def separate(self, audio_file_path, custom_output_names=None):
+            written = super().separate(audio_file_path, custom_output_names)
+            # Remove every non-target stem: separate() then moves the target
+            # into place and raises on the missing backing material.
+            for name in list(written):
+                if "Other" in name:
+                    (self.output_dir / name).unlink()
+                    written.remove(name)
+            return written
+
+    from audio_separator import separator as separator_module
+
+    original_cls = separator_module.Separator
+    separator_module.Separator = _DiesAfterTargetSeparator
+    try:
+        with pytest.raises(Exception):
+            build_package(song_input, out_dir, title="song", no_cache=True)
+    finally:
+        separator_module.Separator = original_cls
+
+    assert not meta.exists(), (
+        "an interrupted stage must not leave a meta vouching for its artifacts"
+    )
+
+    before = len(_PackageFakeSeparator.instances)
+    build_package(song_input, out_dir, title="song")
+    assert len(_PackageFakeSeparator.instances) == before + 1, (
+        "the next run must re-separate rather than package a mismatched pair"
+    )
+    assert (cache_dir / "guitar.backing.wav").stat().st_size > 0

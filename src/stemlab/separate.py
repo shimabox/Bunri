@@ -11,8 +11,11 @@ block below."""
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 import re
+import secrets
+import shutil
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,6 +27,7 @@ import soundfile as sf
 from rich.console import Console
 
 from stemlab.registry import TargetSpec
+from stemlab.safepath import replace_into
 
 console = Console()
 
@@ -73,6 +77,58 @@ class SeparationResult:
     model_used: str
 
 
+_ACCELERATOR_DEVICES = ("mps", "cuda")
+
+
+def _check_device_available(device: str) -> None:
+    """Raise if an explicitly requested accelerator isn't actually usable on
+    this machine. Called before construction so a bad --device fails loudly
+    up front, instead of Separator's own CUDA > MPS > CPU autodetection
+    silently landing on some *other* device than the one asked for (or on
+    CPU) once accelerator visibility is hidden below."""
+    if device not in _ACCELERATOR_DEVICES:
+        return
+    import torch
+
+    if device == "mps":
+        available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    else:
+        available = torch.cuda.is_available()
+    if not available:
+        raise RuntimeError(f"requested device {device!r} is not available on this machine")
+
+
+@contextmanager
+def _accelerator_visibility(allowed: frozenset[str]):
+    """Hide torch's CUDA/MPS availability checks except for the device(s) in
+    `allowed`, for the duration of the context; restores the real functions
+    on exit. Generalizes what was a CPU-only inline patch: Separator has no
+    constructor argument to pin its device, and setup_torch_device() always
+    re-derives it from torch.cuda.is_available()/torch.backends.mps.is_available()
+    during __init__ (CUDA > MPS > CPU priority) -- so getting Separator to
+    honor an explicit --device mps (rather than silently preferring CUDA if
+    that also happens to be visible) means hiding every *other* accelerator
+    from those checks for the instant of construction. The conclusion is
+    baked into the instance's torch_device attribute, not re-checked
+    afterwards, so this is safe even though the patch is global for that
+    instant."""
+    import torch
+
+    has_mps = hasattr(torch.backends, "mps")
+    real_cuda_available = torch.cuda.is_available
+    real_mps_available = torch.backends.mps.is_available if has_mps else None
+    if "cuda" not in allowed:
+        torch.cuda.is_available = lambda: False
+    if has_mps and "mps" not in allowed:
+        torch.backends.mps.is_available = lambda: False
+    try:
+        yield
+    finally:
+        torch.cuda.is_available = real_cuda_available
+        if has_mps:
+            torch.backends.mps.is_available = real_mps_available
+
+
 def _construct_separator(separator_cls: Any, work_dir: Path, device: str) -> Any:
     """Build a Separator that writes every stem the loaded model produces into
     work_dir. No output_single_stem: this function needs every stem so the
@@ -80,6 +136,13 @@ def _construct_separator(separator_cls: Any, work_dir: Path, device: str) -> Any
     Confirmed from source (demucs_separator.py, mdx_separator.py, vr_separator.py,
     mdxc_separator.py): all four architectures write every stem whenever
     output_single_stem is falsy, gated per-stem via `self.output_single_stem`.
+
+    device="auto" leaves the choice to Separator's own CUDA > MPS > CPU
+    autodetection entirely (no patching). Any other device is both verified
+    available (raising if not -- an explicit request must never silently fall
+    back to a different device) and actually forced by hiding every other
+    accelerator from Separator's own detection for the instant of
+    construction ("cpu" hides both; "mps"/"cuda" hide the other one).
     """
     kwargs: dict[str, Any] = {
         "model_file_dir": str(_MODEL_DIR),
@@ -87,31 +150,13 @@ def _construct_separator(separator_cls: Any, work_dir: Path, device: str) -> Any
         "output_format": "WAV",
         "output_single_stem": None,
     }
-    if device != "cpu":
-        # "auto"/"mps": leave the choice to Separator's own CUDA > MPS > CPU
-        # autodetection in setup_torch_device(), run during __init__ below.
+    if device == "auto":
         return separator_cls(**kwargs)
 
-    # Separator has no constructor argument to force CPU; setup_torch_device() always
-    # re-derives the device from torch.cuda.is_available()/torch.backends.mps.is_available()
-    # during __init__. Hide accelerators from those checks for the instant of
-    # construction so it concludes CPU-only, then restore them immediately -- the
-    # conclusion is baked into the instance's torch_device attribute, not re-checked
-    # afterwards, so this is safe even though the patch is global for that instant.
-    import torch
-
-    has_mps = hasattr(torch.backends, "mps")
-    real_cuda_available = torch.cuda.is_available
-    real_mps_available = torch.backends.mps.is_available if has_mps else None
-    torch.cuda.is_available = lambda: False
-    if has_mps:
-        torch.backends.mps.is_available = lambda: False
-    try:
+    _check_device_available(device)
+    allowed = frozenset({device} & set(_ACCELERATOR_DEVICES))
+    with _accelerator_visibility(allowed):
         return separator_cls(**kwargs)
-    finally:
-        torch.cuda.is_available = real_cuda_available
-        if has_mps:
-            torch.backends.mps.is_available = real_mps_available
 
 
 # --- becruily guitar Mel-Band Roformer bootstrap ----------------------------
@@ -145,13 +190,23 @@ def _construct_separator(separator_cls: Any, work_dir: Path, device: str) -> Any
 #      _patched_mask_estimator_mlp_expansion_factor binds the right factor in
 #      memory for the duration of model construction only; nothing on disk or
 #      in the installed package is modified.
-_BECRUILY_REPO_BASE = "https://huggingface.co/becruily/mel-band-roformer-guitar/resolve/main"
+# Pinned to a specific commit (not "main"): "main" can be force-pushed or
+# amended upstream, silently swapping the bytes served at this URL for
+# something whose SHA-256 no longer matches what's pinned below -- pinning +
+# hashing together is what makes this bootstrap actually verifiable rather
+# than "trust HuggingFace forever".
+_BECRUILY_REPO_BASE = (
+    "https://huggingface.co/becruily/mel-band-roformer-guitar/resolve/"
+    "6409e7f88754b07ef7ca3bd1b76a15f010f1672a"
+)
 _BECRUILY_CKPT_HF_NAME = "becruily_guitar.ckpt"
 _BECRUILY_YAML_HF_NAME = "config_guitar_becruily.yaml"
 _BECRUILY_CKPT_LOCAL_NAME = "mel_band_roformer_guitar_becruily.ckpt"
 _BECRUILY_YAML_LOCAL_NAME = "config_mel_band_roformer_guitar_becruily.yaml"
 _BECRUILY_CATALOG_NAME = "Roformer Model: MelBand Roformer | Guitar by becruily"
 _BECRUILY_MLP_EXPANSION_FACTOR = 1
+_BECRUILY_CKPT_SHA256 = "83472bbf125774af5282d2e0b86df89eaf2dd45e8a4ec8d68e820ebf3e42a83c"
+_BECRUILY_YAML_SHA256 = "b681c3f886251b04b666b3f06e87ce65d7ec610e40b5d75915c01782e5444b0e"
 
 
 def _is_becruily_model(model_filename: str) -> bool:
@@ -161,18 +216,54 @@ def _is_becruily_model(model_filename: str) -> bool:
     return "becruily" in model_filename.lower()
 
 
-def _download_if_missing(url: str, dest: Path) -> None:
+def _sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _download_if_missing(url: str, dest: Path, expected_sha256: str) -> None:
     """Fetch url to dest with urllib (stdlib -- no extra dependency for a
-    one-time bootstrap), skipping entirely if dest already exists. Downloads
-    to a sibling .part file and renames into place only once complete, so an
-    interrupted download can never be mistaken for a complete model file on a
-    later run."""
+    one-time bootstrap), verifying its SHA-256 against `expected_sha256`
+    either way.
+
+    - dest already exists: verify what's on disk. A mismatch means the file
+      isn't the model we expect (corrupted, tampered with, or left over from
+      a stale/different version) -- delete it and raise rather than silently
+      trusting it or silently overwriting it with a fresh download.
+    - dest missing: download to a uniquely-named sibling temp file (never a
+      fixed ".part" name -- two concurrent bootstraps, e.g. two web jobs
+      racing on a cold model cache, must not read/write the same temp file),
+      verify the download, and only then atomically move it into place. A
+      failed download or a hash mismatch never leaves a corrupt file at
+      `dest`.
+    """
     if dest.exists():
+        actual = _sha256_of(dest)
+        if actual != expected_sha256:
+            dest.unlink()
+            raise RuntimeError(
+                f"{dest} failed SHA-256 verification "
+                f"(expected {expected_sha256}, got {actual}); removed -- "
+                "re-run to re-download it"
+            )
         return
+
     dest.parent.mkdir(parents=True, exist_ok=True)
-    part = dest.with_name(dest.name + ".part")
-    urllib.request.urlretrieve(url, part)
-    part.replace(dest)
+    tmp = dest.with_name(f"{dest.name}.part-{secrets.token_hex(8)}")
+    try:
+        urllib.request.urlretrieve(url, tmp)
+        actual = _sha256_of(tmp)
+        if actual != expected_sha256:
+            raise RuntimeError(
+                f"downloaded {url} failed SHA-256 verification "
+                f"(expected {expected_sha256}, got {actual})"
+            )
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op once replace() has moved it into place
 
 
 def _inject_becruily_catalog(separator: Any) -> None:
@@ -222,12 +313,39 @@ def _bootstrap_becruily(separator: Any) -> None:
     _download_if_missing(
         f"{_BECRUILY_REPO_BASE}/{_BECRUILY_CKPT_HF_NAME}",
         _MODEL_DIR / _BECRUILY_CKPT_LOCAL_NAME,
+        _BECRUILY_CKPT_SHA256,
     )
     _download_if_missing(
         f"{_BECRUILY_REPO_BASE}/{_BECRUILY_YAML_HF_NAME}",
         _MODEL_DIR / _BECRUILY_YAML_LOCAL_NAME,
+        _BECRUILY_YAML_SHA256,
     )
     _inject_becruily_catalog(separator)
+
+
+def _new_staging_dir(work_dir: Path) -> Path:
+    """A fresh directory for one separation attempt's raw output.
+
+    audio-separator writes its stems itself, so those writes cannot be routed
+    through `safepath.replace_into` the way ours are -- and the names it
+    picks are predictable ("input_(Guitar)_<model>.wav", or whatever
+    custom_output_names asked for). Dropping them straight into the cache
+    directory therefore left a symlink planted at one of those names free to
+    be followed, and the separation would overwrite whatever it pointed at.
+
+    The defence is the name: the library writes into a directory whose name
+    was chosen at random a moment earlier, so there is nothing to plant a
+    link *in* ahead of time. `mkdir` without exist_ok, so this can only ever
+    be a directory this call created -- it can never adopt something that was
+    already sitting there.
+
+    The results are moved out of here into the cache directory afterwards, by
+    the same replace-the-name mechanics everything else uses, and the staging
+    directory is removed either way.
+    """
+    stage_dir = work_dir / f".sep-tmp-{secrets.token_hex(8)}"
+    stage_dir.mkdir()
+    return stage_dir
 
 
 def _run_separation(
@@ -332,7 +450,10 @@ def _write_backing_track(stem_paths: list[Path], dest: Path) -> None:
     peak = float(np.abs(total).max()) if total.size else 0.0
     if peak > 1.0:
         total = total / peak
-    sf.write(str(dest), total, samplerate, subtype="PCM_16")
+    # Renamed into place rather than written directly: soundfile follows a
+    # symlink at `dest` like everything else does, and the backing track's
+    # name is derivable from the target. See stemlab/safepath.py.
+    replace_into(dest, lambda tmp: sf.write(str(tmp), total, samplerate, subtype="PCM_16"))
 
 
 def separate(
@@ -370,79 +491,91 @@ def separate(
     # (_partition_stems).
     is_default = model is None
     model_name = model if model is not None else spec.default_model
+    # Everything from here to the `finally` runs against a staging directory
+    # rather than work_dir itself -- see _new_staging_dir for why.
+    stage_dir = _new_staging_dir(work_dir)
     try:
-        output_files = _run_separation(
-            Separator, work_dir, device, model_name, input_wav, target_wav, spec.stem_name
-        )
-    except RuntimeError as exc:
-        # Only fall back when the caller didn't override the model (i.e. the
-        # default was used) and a fallback is actually registered and
-        # distinct from the default. A model the caller picked explicitly
-        # must fail loudly, not be silently swapped out from under them, and
-        # the fallback target itself must never retry against itself.
-        can_fall_back = (
-            is_default
-            and spec.fallback_model is not None
-            and spec.default_model != spec.fallback_model
-        )
-        if not can_fall_back:
-            raise
-        assert spec.fallback_model is not None
-        console.print(
-            f"[yellow]separate: default model {model_name!r} failed ({exc}); "
-            f"falling back to {spec.fallback_model!r}[/yellow]"
-        )
         try:
             output_files = _run_separation(
-                Separator, work_dir, device, spec.fallback_model, input_wav, target_wav,
-                spec.stem_name,
+                Separator, stage_dir, device, model_name, input_wav, target_wav, spec.stem_name
             )
-        except RuntimeError as fallback_exc:
+        except RuntimeError as exc:
+            # Only fall back when the caller didn't override the model (i.e. the
+            # default was used) and a fallback is actually registered and
+            # distinct from the default. A model the caller picked explicitly
+            # must fail loudly, not be silently swapped out from under them, and
+            # the fallback target itself must never retry against itself.
+            can_fall_back = (
+                is_default
+                and spec.fallback_model is not None
+                and spec.default_model != spec.fallback_model
+            )
+            if not can_fall_back:
+                raise
+            assert spec.fallback_model is not None
+            console.print(
+                f"[yellow]separate: default model {model_name!r} failed ({exc}); "
+                f"falling back to {spec.fallback_model!r}[/yellow]"
+            )
+            # A fresh staging directory for the retry: the failed attempt may
+            # have left partial stems behind, and they must not be mistaken for
+            # the fallback model's output.
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            stage_dir = _new_staging_dir(work_dir)
+            try:
+                output_files = _run_separation(
+                    Separator, stage_dir, device, spec.fallback_model, input_wav, target_wav,
+                    spec.stem_name,
+                )
+            except RuntimeError as fallback_exc:
+                raise RuntimeError(
+                    f"separation failed with both the default model ({exc}) and "
+                    f"the {spec.fallback_model!r} fallback ({fallback_exc})"
+                ) from fallback_exc
+            model_name = spec.fallback_model
+
+        if not output_files:
             raise RuntimeError(
-                f"separation failed with both the default model ({exc}) and "
-                f"the {spec.fallback_model!r} fallback ({fallback_exc})"
-            ) from fallback_exc
-        model_name = spec.fallback_model
+                f"audio-separator produced no stems for {input_wav} with model "
+                f"{model_name!r}"
+            )
 
-    if not output_files:
-        raise RuntimeError(
-            f"audio-separator produced no stems for {input_wav} with model "
-            f"{model_name!r}"
+        # Separator.separate() returns filenames relative to output_dir, not
+        # full paths.
+        produced: list[Path] = []
+        for f in output_files:
+            p = Path(f)
+            if not p.is_absolute():
+                p = stage_dir / p
+            if not p.exists():
+                raise RuntimeError(f"expected separated stem at {p} but it is missing")
+            produced.append(p)
+
+        target_path, other_paths = _partition_stems(produced, target_wav, spec.stem_name)
+        if target_path is None:
+            raise RuntimeError(
+                f"audio-separator produced no '{spec.stem_name}' stem for {input_wav} "
+                f"with model {model_name!r} "
+                f"(stems produced: {[p.name for p in produced]}; "
+                f"does this model have a '{spec.stem_name}' stem?)"
+            )
+        if not other_paths:
+            raise RuntimeError(
+                f"model {model_name!r} produced only a '{spec.stem_name}' "
+                "stem; a backing track needs at least one other stem to combine"
+            )
+
+        # os.replace, so a symlink planted at target_wav is replaced rather
+        # than written through -- the same reason safepath.replace_into
+        # exists, and why the backing track below goes through it.
+        os.replace(target_path, target_wav)
+        _write_backing_track(other_paths, backing_wav)
+
+        # The per-stem files folded into backing.wav aren't part of
+        # separate()'s contract (target_wav + backing_wav), and they never
+        # leave the staging directory that the `finally` below removes.
+        return SeparationResult(
+            target_wav=target_wav, backing_wav=backing_wav, model_used=model_name
         )
-
-    # Separator.separate() returns filenames relative to output_dir, not full paths.
-    produced: list[Path] = []
-    for f in output_files:
-        p = Path(f)
-        if not p.is_absolute():
-            p = work_dir / p
-        if not p.exists():
-            raise RuntimeError(f"expected separated stem at {p} but it is missing")
-        produced.append(p)
-
-    target_path, other_paths = _partition_stems(produced, target_wav, spec.stem_name)
-    if target_path is None:
-        raise RuntimeError(
-            f"audio-separator produced no '{spec.stem_name}' stem for {input_wav} "
-            f"with model {model_name!r} "
-            f"(stems produced: {[p.name for p in produced]}; "
-            f"does this model have a '{spec.stem_name}' stem?)"
-        )
-    if not other_paths:
-        raise RuntimeError(
-            f"model {model_name!r} produced only a '{spec.stem_name}' "
-            "stem; a backing track needs at least one other stem to combine"
-        )
-
-    if target_path != target_wav:
-        target_path.replace(target_wav)
-
-    _write_backing_track(other_paths, backing_wav)
-
-    # The per-stem files folded into backing.wav aren't part of separate()'s
-    # contract (target_wav + backing_wav); drop them so they don't sit around
-    # as dead weight in work_dir.
-    for p in other_paths:
-        p.unlink(missing_ok=True)
-
-    return SeparationResult(target_wav=target_wav, backing_wav=backing_wav, model_used=model_name)
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)

@@ -93,14 +93,14 @@ ENTRYPOINT ["stemlab"]
 FROM build-base AS dev-deps
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project
+    uv sync --frozen --no-install-project --extra web
 
 FROM dev-deps AS dev
 COPY README.md ./
 COPY src ./src
 COPY tests ./tests
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen
+    uv sync --frozen --extra web
 
 ENV PATH="/app/.venv/bin:${PATH}"
 

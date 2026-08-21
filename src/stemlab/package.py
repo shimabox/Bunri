@@ -17,6 +17,7 @@ from rich.console import Console
 from stemlab import audio, cache
 from stemlab.player import render_player
 from stemlab.registry import get_target
+from stemlab.safepath import replace_into, verified_mkdir
 from stemlab.separate import separate
 
 console = Console()
@@ -25,17 +26,45 @@ _NORMALIZE_VERSION = 1
 _SEPARATE_VERSION = 1
 
 
+# `#`/`%` are stripped too: left in, they'd survive into the on-disk slug and
+# make the corresponding /packages/... URL ambiguous (# truncates a URL at the
+# fragment, % starts a percent-escape) -- see web/app.py's URL-encoding fix and
+# player.py's render_player for the other half of that story. Only the slug is
+# affected; the *displayed* title (what the player's <h1> shows) keeps these
+# characters verbatim.
+_UNSAFE_FILENAME_CHARS = re.compile(r'[/\\:*?"<>|#%]')
+
+
 def _safe_filename(title: str) -> str:
-    return re.sub(r'[/\\:*?"<>|]', "_", title).strip() or "untitled"
+    # Leading dots are stripped after substitution (not just once) so a title
+    # of ".." (or "...", "....") can never resolve to a package directory
+    # outside out_dir once package_dir.mkdir() runs (".." -> "" -> "untitled",
+    # same fallback as an empty/whitespace-only title). build_package() below
+    # still double-checks containment with Path.is_relative_to() as defense in
+    # depth, but this is what keeps a normal title from ever needing it.
+    slug = _UNSAFE_FILENAME_CHARS.sub("_", title).strip().lstrip(".")
+    if not slug:
+        return "untitled"
+    # "web" is StemLab's own private subdirectory (uploads/job records/logs --
+    # see web/app.py's _block_private_package_paths); a package titled "web"
+    # would otherwise land at out/web and either collide with it or, worse,
+    # get served through the same /packages/web/... path the middleware
+    # blocks, making the song unreachable. Renamed rather than rejected so a
+    # song literally titled "Web" still gets a package.
+    if slug.casefold() == "web":
+        return "web-package"
+    return slug
 
 
 def _export(src: Path, dest: Path) -> Path:
-    shutil.copyfile(src, dest)
+    replace_into(dest, lambda tmp: shutil.copyfile(src, tmp))
     console.print(f"→ [cyan]{dest}[/cyan]")
     return dest
 
 
 def _export_mp3(src: Path, dest: Path) -> Path:
+    # No replace_into here: audio.encode_mp3 does its own, so that a caller
+    # reaching for it directly is protected too.
     audio.encode_mp3(src, dest)
     console.print(f"→ [cyan]{dest}[/cyan]")
     return dest
@@ -55,6 +84,11 @@ def _normalize_step(
     ):
         console.print("[dim]∙ normalize: cached[/dim]")
         return False
+    # The old meta goes before the work starts, not after it succeeds: from
+    # here until write_stage_meta below, this stage's artifacts are being
+    # replaced, and a meta that survives an interruption vouches for a
+    # half-updated set. See cache.clear_stage_meta.
+    cache.clear_stage_meta(cache_dir, "normalize")
     with console.status("[bold]normalize[/bold] running…"):
         audio.normalize_to_wav(
             input_path,
@@ -94,8 +128,21 @@ def build_package(
     safe = _safe_filename(song_title)
 
     digest = cache.file_digest(input_path)
-    cache_dir = out_dir / ".cache" / digest
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    # The output root itself is the user's own `-o`, so creating it (symlink
+    # and all, if that is what they pointed at) is doing as asked. Everything
+    # below it is a different matter.
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # `mkdir(parents=True)` here followed `out/.cache` if it was a symlink and
+    # built the tree on the far side, putting the normalized input, the
+    # separated stems and every meta file outside out_dir -- before a single
+    # one of the write-time protections got a say. Created a component at a
+    # time instead, refusing any that is a link. See stemlab/safepath.py.
+    #
+    # This is also what keeps audio-separator's own writes in bounds: the
+    # files that library creates inside the directory are not ours to route
+    # through replace_into, so the guarantee they rest on is that the
+    # directory they land in is genuinely inside out_dir.
+    cache_dir = verified_mkdir(out_dir, ".cache", digest)
 
     input_wav = cache_dir / "input.wav"
     normalize_ran = _normalize_step(input_path, input_wav, cache_dir, no_cache=no_cache)
@@ -128,6 +175,13 @@ def build_package(
     ):
         console.print("[dim]∙ separate: cached[/dim]")
     else:
+        # Same discipline as normalize above, and this stage is where it
+        # actually bit: separate() moves the target stem into the cache
+        # before writing the backing track, so a failure between the two
+        # leaves a new target beside an old backing. Clearing the meta first
+        # means such a run is simply not cached, and the next one re-separates
+        # instead of packaging the mismatched pair.
+        cache.clear_stage_meta(cache_dir, separate_step)
         # Separation can run for minutes with no other output. Print the model
         # name up front -- outside console.status's own live region, so it
         # can't clash with the spinner -- so something visibly happens even
@@ -155,6 +209,22 @@ def build_package(
         console.print(f"[green]✓[/green] separate ({elapsed:.0f}s)")
 
     package_dir = out_dir / safe
+    # Defense in depth on top of _safe_filename's own sanitizing: even if a
+    # future change to that function (or a caller bypassing it) let a
+    # path-separator-bearing title through, this refuses to write outside
+    # out_dir rather than trusting the string ever looked safe.
+    # is_relative_to() on the *resolved* paths (not a string-prefix compare)
+    # so a `..`-bearing or symlinked component can't slip past the check.
+    # A package folder is a real directory, never a link. Containment alone
+    # does not give that: `out/Song -> out/victim` resolves inside out_dir
+    # and passes the check below, and then every export -- temp file and
+    # os.replace alike -- runs through the link and lands in somebody else's
+    # package. lstat, so the test does not follow what it is testing; and
+    # before mkdir, which would otherwise report success for the target.
+    if package_dir.is_symlink():
+        raise ValueError(f"refusing to write a package through a symlink: {package_dir}")
+    if not package_dir.resolve().is_relative_to(out_dir.resolve()):
+        raise ValueError(f"refusing to write package outside out_dir: {package_dir}")
     package_dir.mkdir(parents=True, exist_ok=True)
 
     # Backing and player are target-scoped like the stem itself: guitar's
@@ -178,16 +248,14 @@ def build_package(
         original_ref = None
 
     player_dest = package_dir / f"{safe}.{spec.target}.player.html"
-    player_dest.write_text(
-        render_player(
-            song_title,
-            original=original_ref,
-            target=target_ref,
-            backing=backing_ref,
-            instrument_label=spec.label_ja,
-        ),
-        encoding="utf-8",
+    player_html = render_player(
+        song_title,
+        original=original_ref,
+        target=target_ref,
+        backing=backing_ref,
+        instrument_label=spec.label_ja,
     )
+    replace_into(player_dest, lambda tmp: tmp.write_text(player_html, encoding="utf-8"))
     console.print(f"→ [cyan]{player_dest}[/cyan]")
 
     return package_dir

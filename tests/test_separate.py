@@ -21,6 +21,13 @@ from stemlab import separate as separate_module
 from stemlab.registry import get_target
 from stemlab.separate import SeparationResult, separate
 
+# A direct binding to the real function, captured before the autouse
+# `_stub_becruily_download` fixture below ever monkeypatches
+# `separate_module._download_if_missing` into a no-op -- the SHA-256
+# verification tests need the genuine implementation, not the stub every
+# other test in this file relies on.
+from stemlab.separate import _download_if_missing as _real_download_if_missing
+
 _SR = 8000  # tiny sample rate: keeps generated WAVs (and test I/O) fast
 _GUITAR_SPEC = get_target("guitar")
 
@@ -213,7 +220,9 @@ def _stub_becruily_download(monkeypatch):
     this again (monkeypatch supports repeated calls within one test) with a
     recording fake to verify it's actually invoked.
     """
-    monkeypatch.setattr(separate_module, "_download_if_missing", lambda url, dest: None)
+    monkeypatch.setattr(
+        separate_module, "_download_if_missing", lambda url, dest, expected_sha256: None
+    )
 
 
 def _prepare(tmp_path: Path, *, create_input: bool = True) -> tuple[Path, Path]:
@@ -255,7 +264,13 @@ def test_run_builds_separator_and_calls_api_correctly(tmp_path, monkeypatch):
     fake = FakeSeparator.instances[0]
 
     assert fake.init_kwargs["model_file_dir"] == str(separate_module._MODEL_DIR)
-    assert fake.init_kwargs["output_dir"] == str(work_dir)
+    # Not work_dir itself: the library writes into a freshly-created,
+    # randomly-named staging directory under it, so there is no predictable
+    # name for a symlink to be planted at (see _new_staging_dir). The results
+    # are moved into work_dir afterwards.
+    output_dir = Path(fake.init_kwargs["output_dir"])
+    assert output_dir.parent == work_dir
+    assert output_dir.name.startswith(".sep-tmp-")
     # No output_single_stem: every stem must come back so the non-guitar ones
     # can be combined into backing.wav.
     assert fake.init_kwargs["output_single_stem"] is None
@@ -437,23 +452,33 @@ def test_run_restores_torch_availability_checks_after_forcing_cpu(tmp_path, monk
 
 def test_run_becruily_default_triggers_bootstrap(tmp_path, monkeypatch):
     monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
-    download_calls: list[tuple[str, Path]] = []
+    download_calls: list[tuple[str, Path, str]] = []
     monkeypatch.setattr(
         separate_module,
         "_download_if_missing",
-        lambda url, dest: download_calls.append((url, dest)),
+        lambda url, dest, expected_sha256: download_calls.append((url, dest, expected_sha256)),
     )
     input_wav, work_dir = _prepare(tmp_path)  # model=None -> becruily default
 
     result = separate(input_wav, work_dir, spec=_GUITAR_SPEC)
 
-    # Both the checkpoint and the YAML config were (attempted to be) fetched.
+    # Both the checkpoint and the YAML config were (attempted to be) fetched,
+    # each with its pinned SHA-256 expectation.
     assert len(download_calls) == 2
-    assert {dest.name for _, dest in download_calls} == {
+    assert {dest.name for _, dest, _ in download_calls} == {
         "mel_band_roformer_guitar_becruily.ckpt",
         "config_mel_band_roformer_guitar_becruily.yaml",
     }
-    assert all(url.startswith("https://huggingface.co/") for url, _ in download_calls)
+    assert all(url.startswith("https://huggingface.co/") for url, _, _ in download_calls)
+    # Pinned to a specific commit, not a movable ref like "main".
+    assert all("/resolve/6409e7f88754b07ef7ca3bd1b76a15f010f1672a/" in url for url, _, _ in download_calls)
+    hashes_by_name = {dest.name: sha for _, dest, sha in download_calls}
+    assert hashes_by_name["mel_band_roformer_guitar_becruily.ckpt"] == (
+        "83472bbf125774af5282d2e0b86df89eaf2dd45e8a4ec8d68e820ebf3e42a83c"
+    )
+    assert hashes_by_name["config_mel_band_roformer_guitar_becruily.yaml"] == (
+        "b681c3f886251b04b666b3f06e87ce65d7ec610e40b5d75915c01782e5444b0e"
+    )
 
     fake = FakeSeparator.instances[0]
     assert fake.loaded_model == _GUITAR_SPEC.default_model
@@ -468,11 +493,11 @@ def test_run_becruily_default_triggers_bootstrap(tmp_path, monkeypatch):
 
 def test_run_htdemucs_model_skips_becruily_bootstrap(tmp_path, monkeypatch):
     monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
-    download_calls: list[tuple[str, Path]] = []
+    download_calls: list[tuple[str, Path, str]] = []
     monkeypatch.setattr(
         separate_module,
         "_download_if_missing",
-        lambda url, dest: download_calls.append((url, dest)),
+        lambda url, dest, expected_sha256: download_calls.append((url, dest, expected_sha256)),
     )
     input_wav, work_dir = _prepare(tmp_path)
 
@@ -480,6 +505,175 @@ def test_run_htdemucs_model_skips_becruily_bootstrap(tmp_path, monkeypatch):
 
     assert download_calls == []
     assert FakeSeparator.instances[0].loaded_model == "htdemucs_6s.yaml"
+
+
+# --- SHA-256 verification of downloaded/cached model files ------------------
+def _sha256_hex(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_download_if_missing_accepts_an_existing_file_with_a_matching_hash(tmp_path):
+    dest = tmp_path / "model.ckpt"
+    content = b"totally real model weights"
+    dest.write_bytes(content)
+
+    # Must not raise, and must not touch the file (no network call needed --
+    # spied via a urlretrieve monkeypatch would over-specify; absence of a
+    # raise plus content unchanged is the actual contract).
+    _real_download_if_missing("https://example.invalid/model.ckpt", dest, _sha256_hex(content))
+
+    assert dest.read_bytes() == content
+
+
+def test_download_if_missing_deletes_and_raises_on_existing_hash_mismatch(tmp_path):
+    dest = tmp_path / "model.ckpt"
+    dest.write_bytes(b"corrupted or tampered bytes")
+
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        _real_download_if_missing(
+            "https://example.invalid/model.ckpt", dest, "0" * 64
+        )
+
+    assert not dest.exists(), "a hash-mismatched existing file must be removed, not left in place"
+
+
+def test_download_if_missing_downloads_verifies_and_atomically_replaces(tmp_path, monkeypatch):
+    dest = tmp_path / "model.ckpt"
+    content = b"freshly downloaded model weights"
+    expected = _sha256_hex(content)
+
+    def fake_urlretrieve(url, filename):
+        Path(filename).write_bytes(content)
+
+    monkeypatch.setattr(separate_module.urllib.request, "urlretrieve", fake_urlretrieve)
+
+    _real_download_if_missing("https://example.invalid/model.ckpt", dest, expected)
+
+    assert dest.read_bytes() == content
+    # No leftover temp file.
+    leftovers = [p for p in tmp_path.iterdir() if p.name != "model.ckpt"]
+    assert leftovers == [], leftovers
+
+
+def test_download_if_missing_never_leaves_a_corrupt_file_on_hash_mismatch(tmp_path, monkeypatch):
+    dest = tmp_path / "model.ckpt"
+
+    def fake_urlretrieve(url, filename):
+        Path(filename).write_bytes(b"wrong bytes entirely")
+
+    monkeypatch.setattr(separate_module.urllib.request, "urlretrieve", fake_urlretrieve)
+
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        _real_download_if_missing(
+            "https://example.invalid/model.ckpt", dest, _sha256_hex(b"expected bytes")
+        )
+
+    assert not dest.exists()
+    assert list(tmp_path.iterdir()) == [], "the failed download's temp file must be cleaned up"
+
+
+def test_download_if_missing_uses_a_unique_temp_filename_not_a_fixed_dot_part(tmp_path, monkeypatch):
+    dest = tmp_path / "model.ckpt"
+    content = b"model weights"
+    captured_tmp_names: list[str] = []
+
+    def fake_urlretrieve(url, filename):
+        captured_tmp_names.append(Path(filename).name)
+        Path(filename).write_bytes(content)
+
+    monkeypatch.setattr(separate_module.urllib.request, "urlretrieve", fake_urlretrieve)
+
+    _real_download_if_missing(
+        "https://example.invalid/model.ckpt", dest, _sha256_hex(content)
+    )
+    # Second, independent call (as if a concurrent bootstrap raced this one)
+    # must pick a different temp name.
+    dest.unlink()
+    _real_download_if_missing(
+        "https://example.invalid/model.ckpt", dest, _sha256_hex(content)
+    )
+
+    assert len(captured_tmp_names) == 2
+    assert captured_tmp_names[0] != captured_tmp_names[1]
+    assert all(name != "model.ckpt.part" for name in captured_tmp_names)
+
+
+# --- device strictness: explicit mps/cuda must be verified, not silently
+# --- swapped for whatever Separator's own autodetection would have picked.
+# Driven through the public separate() entrypoint, same as the existing
+# cpu/auto device tests above.
+def test_run_explicit_mps_device_raises_when_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
+    import torch
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    input_wav, work_dir = _prepare(tmp_path)
+
+    with pytest.raises(RuntimeError, match="mps.*not available"):
+        separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml", device="mps")
+    assert FakeSeparator.instances == []  # never even constructed
+
+
+def test_run_explicit_mps_device_is_actually_selected_when_available(tmp_path, monkeypatch):
+    monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
+    import torch
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # both "available"
+    input_wav, work_dir = _prepare(tmp_path)
+
+    separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml", device="mps")
+
+    fake = FakeSeparator.instances[0]
+    # mps requested and available: mps stays visible, cuda is hidden even
+    # though it also reports available, so Separator's own CUDA>MPS priority
+    # can't silently override the explicit request.
+    assert fake.mps_available_at_init is True
+    assert fake.cuda_available_at_init is False
+
+
+def test_run_explicit_cuda_device_raises_when_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    input_wav, work_dir = _prepare(tmp_path)
+
+    with pytest.raises(RuntimeError, match="cuda.*not available"):
+        separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml", device="cuda")
+    assert FakeSeparator.instances == []
+
+
+def test_run_explicit_cuda_device_is_actually_selected_when_available(tmp_path, monkeypatch):
+    monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    input_wav, work_dir = _prepare(tmp_path)
+
+    separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml", device="cuda")
+
+    fake = FakeSeparator.instances[0]
+    assert fake.cuda_available_at_init is True
+    assert fake.mps_available_at_init is False
+
+
+def test_run_explicit_mps_device_restores_real_availability_checks_afterward(tmp_path, monkeypatch):
+    monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
+    import torch
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    original_cuda_is_available = torch.cuda.is_available
+    original_mps_is_available = torch.backends.mps.is_available
+    input_wav, work_dir = _prepare(tmp_path)
+
+    separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml", device="mps")
+
+    assert torch.cuda.is_available is original_cuda_is_available
+    assert torch.backends.mps.is_available is original_mps_is_available
 
 
 def test_run_becruily_default_falls_back_to_htdemucs_on_load_failure(tmp_path, monkeypatch):
@@ -522,3 +716,65 @@ def test_run_system_exit_from_load_model_becomes_runtime_error(tmp_path, monkeyp
         separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
 
     assert len(SystemExitOnLoadFakeSeparator.instances) == 1
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        "guitar.wav",  # the custom_output_names rename the target stem asks for
+        "mix_(Guitar)_htdemucs_6s.wav",  # audio-separator's own default name
+        "mix_(Bass)_htdemucs_6s.wav",  # a non-target stem, folded into backing
+        "guitar.backing.wav",
+    ],
+)
+def test_separate_never_writes_through_a_symlink_planted_in_work_dir(
+    tmp_path, monkeypatch, planted
+):
+    """audio-separator writes its stems itself, so those writes cannot be
+    routed through safepath.replace_into the way ours are -- and every name it
+    picks is predictable. Pointing it at the cache directory therefore left a
+    symlink planted at one of those names free to be followed, and the
+    separation overwrote whatever it pointed at.
+
+    The library now writes into a randomly-named staging directory instead,
+    where nothing can be planted ahead of time, and the results are moved out
+    by name afterwards.
+    """
+    monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
+    input_wav, work_dir = _prepare(tmp_path)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "precious.dat"
+    victim.write_bytes(b"a file with nothing to do with this separation")
+    original = victim.read_bytes()
+
+    (work_dir / planted).symlink_to(victim)
+
+    result = separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
+
+    assert victim.read_bytes() == original, f"writing {planted} followed the symlink"
+    for produced in (result.target_wav, result.backing_wav):
+        assert produced.exists() and not produced.is_symlink()
+        assert produced.stat().st_size > 0
+
+
+def test_separate_leaves_no_staging_directory_behind(tmp_path, monkeypatch):
+    """On the way out, either way. A staging directory per attempt is only
+    acceptable if they do not accumulate in the user's cache."""
+    monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
+    input_wav, work_dir = _prepare(tmp_path)
+
+    separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
+    assert [p.name for p in work_dir.glob(".sep-tmp-*")] == []
+
+    # And on the failing path: an explicit model never falls back, so this
+    # raises straight out of the attempt.
+    class _FailingSeparator(FakeSeparator):
+        def separate(self, audio_file_path, custom_output_names=None):
+            raise RuntimeError("simulated: the model blew up")
+
+    monkeypatch.setattr(separator_module, "Separator", _FailingSeparator)
+    with pytest.raises(RuntimeError):
+        separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
+    assert [p.name for p in work_dir.glob(".sep-tmp-*")] == []
