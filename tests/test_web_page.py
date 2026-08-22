@@ -131,6 +131,8 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
         # The confirm panel appears with the filename stem as the default title.
         page.wait_for_selector("#sw-confirm:not([hidden])")
         assert page.input_value("#sw-title-input") == "テスト曲"
+        assert page.locator('input[name="targets"]:checked').count() == 1
+        assert page.locator('input[name="targets"]:checked').get_attribute("value") == "guitar"
 
         page.click("#sw-upload-btn")
 
@@ -202,8 +204,34 @@ def test_failed_job_shows_collapsible_log_tail(tmp_path):
 
 
 @_needs_browser
+def test_target_selection_is_required_and_multiple_targets_render_in_one_song(tmp_path):
+    runner = PageFakeRunner()
+    app = create_app(tmp_path / "out", runner=runner)
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        audio_path = tmp_path / "band.mp3"
+        audio_path.write_bytes(b"band-audio")
+        page.set_input_files("#sw-file-input", str(audio_path))
+        page.wait_for_selector("#sw-confirm:not([hidden])")
+
+        page.uncheck('input[name="targets"][value="guitar"]')
+        assert page.locator("#sw-upload-btn").is_disabled()
+        page.check('input[name="targets"][value="vocals"]')
+        page.check('input[name="targets"][value="drums"]')
+        assert page.locator("#sw-upload-btn").is_enabled()
+        page.click("#sw-upload-btn")
+
+        page.wait_for_function("window.__bunriWeb.getSongs().length === 1")
+        page.wait_for_selector('.sw-target-row[data-target="vocals"] a.sw-open-link', timeout=10_000)
+        page.wait_for_selector('.sw-target-row[data-target="drums"] a.sw-open-link', timeout=10_000)
+        assert page.locator("li.sw-job").count() == 1
+        assert page.locator(".sw-target-row").count() == 2
+        assert page.locator('.sw-target-row[data-target="vocals"] .sw-target-label').text_content() == "ボーカル"
+        assert [call["target"] for call in runner.calls] == ["vocals", "drums"]
+
+
+@_needs_browser
 def test_polling_recovers_after_a_failed_fetch(tmp_path):
-    """One failed /api/jobs poll (e.g. the server restarting mid-job -- the
+    """One failed /api/songs poll (e.g. the server restarting mid-job -- the
     exact recovery scenario the job store is built for) must not kill the
     poll chain: the page has to keep retrying and eventually show the done
     state."""
@@ -228,7 +256,7 @@ def test_polling_recovers_after_a_failed_fetch(tmp_path):
             else:
                 route.continue_()
 
-        page.route("**/api/jobs", route_handler)
+        page.route("**/api/songs", route_handler)
         page.wait_for_function(
             "window.__bunriWeb.getJobs().some(function (j) { return j.status === 'done'; })",
             timeout=15_000,
