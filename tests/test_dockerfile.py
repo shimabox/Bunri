@@ -69,3 +69,40 @@ def test_deps_and_cpu_runtime_stages_deliberately_omit_web_extra():
     sync_lines = _uv_sync_lines(_stage_lines(text, "deps"))
     assert sync_lines
     assert all("--extra web" not in line for line in sync_lines), sync_lines
+
+
+# --- StemLab -> Bunri rename regressions ------------------------------------
+#
+# The cpu/cuda stages' ENTRYPOINT, the model-cache env var, and the mount
+# path are all things a copy-paste-driven rename could silently miss (the
+# cuda stage in particular duplicates cpu's ENV/ENTRYPOINT rather than
+# inheriting it -- see the stage comment above it), so pin them explicitly
+# rather than relying on `stemlab -i` staying clean forever.
+
+
+def test_cpu_stage_entrypoint_is_bunri():
+    text = _DOCKERFILE.read_text(encoding="utf-8")
+    lines = _stage_lines(text, "cpu")
+    entrypoints = [line.strip() for line in lines if line.strip().startswith("ENTRYPOINT")]
+    assert entrypoints == ['ENTRYPOINT ["bunri"]'], entrypoints
+
+
+def test_cuda_stage_entrypoint_is_bunri():
+    text = _DOCKERFILE.read_text(encoding="utf-8")
+    lines = _stage_lines(text, "cuda")
+    entrypoints = [line.strip() for line in lines if line.strip().startswith("ENTRYPOINT")]
+    assert entrypoints == ['ENTRYPOINT ["bunri"]'], entrypoints
+
+
+def test_cpu_and_cuda_stages_use_bunri_model_dir():
+    text = _DOCKERFILE.read_text(encoding="utf-8")
+    for stage in ("uv-base", "cuda"):
+        lines = _stage_lines(text, stage)
+        env_text = "\n".join(lines)
+        assert "BUNRI_MODEL_DIR=/root/.cache/bunri/models" in env_text, (stage, lines)
+        assert "STEMLAB_MODEL_DIR" not in env_text, (stage, lines)
+
+
+def test_no_stemlab_entry_point_remains():
+    text = _DOCKERFILE.read_text(encoding="utf-8")
+    assert "stemlab" not in text.lower()

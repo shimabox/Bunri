@@ -17,16 +17,16 @@ import pytest
 import soundfile as sf
 from audio_separator import separator as separator_module
 
-from stemlab import separate as separate_module
-from stemlab.registry import get_target
-from stemlab.separate import SeparationResult, separate
+from bunri import separate as separate_module
+from bunri.registry import get_target
+from bunri.separate import SeparationResult, separate
 
 # A direct binding to the real function, captured before the autouse
 # `_stub_becruily_download` fixture below ever monkeypatches
 # `separate_module._download_if_missing` into a no-op -- the SHA-256
 # verification tests need the genuine implementation, not the stub every
 # other test in this file relies on.
-from stemlab.separate import _download_if_missing as _real_download_if_missing
+from bunri.separate import _download_if_missing as _real_download_if_missing
 
 _SR = 8000  # tiny sample rate: keeps generated WAVs (and test I/O) fast
 _GUITAR_SPEC = get_target("guitar")

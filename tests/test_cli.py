@@ -8,7 +8,7 @@ import re
 import pytest
 from typer.testing import CliRunner
 
-from stemlab.cli import app
+from bunri.cli import app
 
 runner = CliRunner()
 
@@ -76,7 +76,7 @@ def test_unknown_device_is_rejected(audio):
 
 
 def test_model_and_target_reach_build_package(audio, tmp_path, monkeypatch):
-    import stemlab.cli as cli_module
+    import bunri.cli as cli_module
 
     captured = {}
 

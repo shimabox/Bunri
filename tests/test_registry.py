@@ -1,6 +1,6 @@
 import pytest
 
-from stemlab.registry import REGISTRY, TargetSpec, get_target
+from bunri.registry import REGISTRY, TargetSpec, get_target
 
 
 def test_guitar_spec_contents():

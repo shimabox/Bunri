@@ -4,7 +4,7 @@ step, job-list polling, and the "open player" link appearing once a job
 completes.
 
 Runs a real uvicorn server (in a background thread, ephemeral 127.0.0.1
-port) with a fake job runner injected -- never the real `stemlab` CLI/
+port) with a fake job runner injected -- never the real `bunri` CLI/
 separation stack -- and drives it over http with Playwright, the same
 _chromium_available skip pattern tests/test_player_html.py uses.
 """
@@ -20,8 +20,8 @@ from typing import Any
 
 import pytest
 
-from stemlab.web.app import create_app
-from stemlab.web.jobs import safe_filename
+from bunri.web.app import create_app
+from bunri.web.jobs import safe_filename
 
 
 class PageFakeRunner:
@@ -101,7 +101,7 @@ def _open_page(base_url: str):
             page = browser.new_page()
             page.goto(base_url + "/")
             page.wait_for_function(
-                "window.__stemlabWeb && typeof window.__stemlabWeb.getJobs === 'function'",
+                "window.__bunriWeb && typeof window.__bunriWeb.getJobs === 'function'",
                 timeout=10_000,
             )
             yield page
@@ -115,8 +115,8 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
     app = create_app(tmp_path / "out", runner=runner)
     with _running_server(app) as base_url, _open_page(base_url) as page:
         # No jobs yet -> polling is idle.
-        assert page.evaluate("window.__stemlabWeb.getJobs().length") == 0
-        assert page.evaluate("window.__stemlabWeb.isPolling()") is False
+        assert page.evaluate("window.__bunriWeb.getJobs().length") == 0
+        assert page.evaluate("window.__bunriWeb.isPolling()") is False
 
         audio_dir = tmp_path / "src"
         audio_dir.mkdir()
@@ -137,8 +137,8 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
         # Confirm panel closes; the job shows up in the list and polling
         # kicks in while it's queued/running.
         page.wait_for_function("document.getElementById('sw-confirm').hidden === true")
-        page.wait_for_function("window.__stemlabWeb.getJobs().length === 1")
-        page.wait_for_function("window.__stemlabWeb.isPolling() === true", timeout=5_000)
+        page.wait_for_function("window.__bunriWeb.getJobs().length === 1")
+        page.wait_for_function("window.__bunriWeb.isPolling() === true", timeout=5_000)
 
         badge = page.locator(".sw-badge").first
         assert badge.text_content() in ("待機中", ) or "処理中" in badge.text_content()
@@ -154,7 +154,7 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
         )
         assert page.get_attribute("a.sw-open-link", "target") == "_blank"
 
-        page.wait_for_function("window.__stemlabWeb.isPolling() === false", timeout=5_000)
+        page.wait_for_function("window.__bunriWeb.isPolling() === false", timeout=5_000)
 
         final_badge = page.locator(".sw-badge").first
         assert final_badge.text_content() == "完了"
@@ -215,7 +215,7 @@ def test_polling_recovers_after_a_failed_fetch(tmp_path):
         page.set_input_files("#sw-file-input", str(audio_path))
         page.wait_for_selector("#sw-confirm:not([hidden])")
         page.click("#sw-upload-btn")
-        page.wait_for_function("window.__stemlabWeb.getJobs().length === 1")
+        page.wait_for_function("window.__bunriWeb.getJobs().length === 1")
 
         # Fail exactly one poll while the job is still running, then let the
         # rest through.
@@ -230,7 +230,7 @@ def test_polling_recovers_after_a_failed_fetch(tmp_path):
 
         page.route("**/api/jobs", route_handler)
         page.wait_for_function(
-            "window.__stemlabWeb.getJobs().some(function (j) { return j.status === 'done'; })",
+            "window.__bunriWeb.getJobs().some(function (j) { return j.status === 'done'; })",
             timeout=15_000,
         )
         assert state["failed"], "the test never actually exercised a failed fetch"

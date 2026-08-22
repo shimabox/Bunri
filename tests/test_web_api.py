@@ -15,9 +15,9 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-import stemlab.web.app as app_module
-from stemlab.web.app import create_app
-from stemlab.web.jobs import safe_filename
+import bunri.web.app as app_module
+from bunri.web.app import create_app
+from bunri.web.jobs import safe_filename
 
 
 class ApiFakeRunner:
@@ -29,7 +29,7 @@ class ApiFakeRunner:
     def __call__(self, upload_path: Path, out_dir: Path, title: str, target: str, log_path: Path) -> int:
         self.calls.append({"title": title, "target": target})
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text("fake stemlab run\n" * 3, encoding="utf-8")
+        log_path.write_text("fake bunri run\n" * 3, encoding="utf-8")
         if self.write_player:
             safe = safe_filename(title)
             pkg_dir = out_dir / safe
@@ -159,7 +159,7 @@ def test_index_page_serves_html(client):
     res = client.get("/")
     assert res.status_code == 200
     assert "text/html" in res.headers["content-type"]
-    assert "StemLab" in res.text
+    assert "Bunri" in res.text
 
 
 def test_failed_job_reports_log_tail_as_error(client):
@@ -171,7 +171,7 @@ def test_failed_job_reports_log_tail_as_error(client):
         _wait_until(lambda: _job_status(c, job_id) == "error")
         detail = c.get(f"/api/jobs/{job_id}").json()
         assert detail["error"] is not None
-        assert "fake stemlab run" in detail["error"]
+        assert "fake bunri run" in detail["error"]
         assert detail["package_url"] is None
 
 
