@@ -1,17 +1,17 @@
 services:
-  stemlab:
+  bunri:
     build:
       context: .
       target: cpu
-    image: stemlab:cpu
+    image: bunri:cpu
     volumes:
       - ./songs:/in:ro
       - ./out:/out
-      - stemlab-models:/root/.cache/stemlab/models
+      - bunri-models:/root/.cache/bunri/models
     # Usage:
-    #   docker compose run --rm stemlab /in/song.mp3 -o /out
-    # (entrypoint is `stemlab`; args after the service name are passed straight
+    #   docker compose run --rm bunri /in/song.mp3 -o /out
+    # (entrypoint is `bunri`; args after the service name are passed straight
     # through to the CLI)
 
 volumes:
-  stemlab-models:
+  bunri-models:
