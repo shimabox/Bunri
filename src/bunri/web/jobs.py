@@ -29,6 +29,7 @@ never accidentally grows slow or heavy as those modules evolve.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -43,6 +44,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from bunri.registry import REGISTRY
 
 from bunri.safepath import (
     UnsafeOutputPath,
@@ -595,6 +598,20 @@ class Job:
     def from_dict(cls, data: dict) -> "Job":
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass(frozen=True)
+class Song:
+    """A response-time view of jobs sharing one source digest."""
+
+    id: str
+    title: str
+    created_at: str
+    targets: tuple[Job, ...]
+
+
+def song_id(digest: str) -> str:
+    return hashlib.sha256(digest.encode("utf-8")).hexdigest()
 
 
 _VALID_STATUSES = {"queued", "running", "done", "error"}
@@ -1329,6 +1346,38 @@ class JobStore:
         with self._lock:
             return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
 
+    def list_songs(self) -> list[Song]:
+        """Group jobs by digest without introducing a persisted song record."""
+        with self._lock:
+            groups: dict[str, list[Job]] = {}
+            for job in self._jobs.values():
+                groups.setdefault(job.digest, []).append(job)
+
+        registry_order = {target: index for index, target in enumerate(REGISTRY)}
+        songs: list[Song] = []
+        for digest, jobs in groups.items():
+            latest = max(jobs, key=lambda job: (job.created_at, job.id))
+            latest_by_target: dict[str, Job] = {}
+            for job in jobs:
+                current = latest_by_target.get(job.target)
+                if current is None or (job.created_at, job.id) > (current.created_at, current.id):
+                    latest_by_target[job.target] = job
+            targets = tuple(sorted(
+                latest_by_target.values(),
+                key=lambda job: (
+                    0 if job.target in registry_order else 1,
+                    registry_order.get(job.target, 0),
+                    job.target if job.target not in registry_order else "",
+                ),
+            ))
+            songs.append(Song(
+                id=song_id(digest),
+                title=latest.title,
+                created_at=latest.created_at,
+                targets=targets,
+            ))
+        return sorted(songs, key=lambda song: (song.created_at, song.id), reverse=True)
+
     def get_job(self, job_id: str) -> Optional[Job]:
         with self._lock:
             return self._jobs.get(job_id)
@@ -1401,6 +1450,26 @@ class JobStore:
         """Returns (job, created). created is False when an existing
         done/queued/running job for this digest+target was reused instead of
         starting a new one."""
+        return self.create_jobs(upload_path, digest, requested_title, [target])[0]
+
+    def create_jobs(
+        self,
+        upload_path: Path,
+        digest: str,
+        requested_title: str,
+        targets: list[str],
+    ) -> list[tuple[Job, bool]]:
+        """Create or reuse one job per target, in registry order."""
+        if not targets:
+            raise ValueError("at least one target is required")
+        if len(set(targets)) != len(targets):
+            raise ValueError("duplicate targets are not allowed")
+        unknown = [target for target in targets if target not in REGISTRY]
+        if unknown:
+            raise ValueError(f"unknown target: {unknown[0]}")
+        requested_targets = set(targets)
+        ordered_targets = [target for target in REGISTRY if target in requested_targets]
+
         # Normalized before it reaches _resolve_title, for one reason with
         # two halves: a title is the only free-text field a caller controls,
         # and the record it lands in must always be *savable*. Bounded, so
@@ -1412,30 +1481,42 @@ class JobStore:
         # out rather than left to blow up at write time.
         requested_title = _storable(requested_title)[:MAX_TITLE_CHARS]
         with self._lock:
-            reusable = self.find_reusable(digest, target)
-            if reusable is not None:
-                return reusable, False
-
-            job_id = new_job_id()
-            title = self._resolve_title(requested_title, digest)
+            existing = [job for job in self._jobs.values() if job.digest == digest]
+            title = (
+                max(existing, key=lambda job: (job.created_at, job.id)).title
+                if existing
+                else self._resolve_title(requested_title, digest)
+            )
             try:
                 upload_rel = str(upload_path.relative_to(self.out_dir))
             except ValueError:
                 upload_rel = str(upload_path)
-            job = Job(
-                id=job_id,
-                digest=digest,
-                title=title,
-                target=target,
-                status="queued",
-                created_at=_now_iso(),
-                log=str(Path("web") / "logs" / f"{job_id}.log"),
-                upload=upload_rel,
-            )
-            self._jobs[job_id] = job
-            self._write_job(job)
-            self._queue.put(job_id)
-            return job, True
+
+            results: list[tuple[Job, bool]] = []
+            created_ids: list[str] = []
+            for target in ordered_targets:
+                reusable = self.find_reusable(digest, target)
+                if reusable is not None:
+                    results.append((reusable, False))
+                    continue
+                job_id = new_job_id()
+                job = Job(
+                    id=job_id,
+                    digest=digest,
+                    title=title,
+                    target=target,
+                    status="queued",
+                    created_at=_now_iso(),
+                    log=str(Path("web") / "logs" / f"{job_id}.log"),
+                    upload=upload_rel,
+                )
+                self._jobs[job_id] = job
+                self._write_job(job)
+                results.append((job, True))
+                created_ids.append(job_id)
+            for job_id in created_ids:
+                self._queue.put(job_id)
+            return results
 
     # -- worker -------------------------------------------------------------
     def _worker_loop(self) -> None:
