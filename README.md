@@ -1,4 +1,4 @@
-# StemLab
+# Bunri
 
 音源から特定の楽器パート(まずはギター)の stem を抽出し、練習用パッケージ
 (楽器のみ / 楽器なし(カラオケ) / 原曲 + オフラインで再生できる HTML プレイヤー)
@@ -12,7 +12,7 @@ Windows の方は「[Windows で使う](#windows-で使う)」を見てくださ
 
 ```bash
 # 1. このフォルダを取得して移動(git clone または zip 展開)
-cd StemLab
+cd Bunri
 
 # 2. セットアップ(uv / ffmpeg の確認と依存の導入。初回は数分)
 make setup
@@ -24,7 +24,7 @@ make web
 停止はターミナルで Ctrl+C。作った練習パッケージは `out/曲名/` に残り、
 中の `◯◯.player.html` はサーバーなしでもダブルクリックでそのまま使えます。
 
-`make` が無い環境では `./setup.sh` → `uv run stemlab-web` でも同じです。
+`make` が無い環境では `./setup.sh` → `uv run bunri-web` でも同じです。
 
 ### 注意事項(自己責任でご利用ください)
 
@@ -32,11 +32,11 @@ make web
 - 音源はローカルで処理されますが、**権利を持っている音源または私的利用の
   範囲**でお使いください。分離結果の公開・配布は権利上の問題が生じ得ます
 - 初回の分離時に、分離モデル(約45MB〜、対象楽器による)がこのフォルダ内の
-  `models/` へ自動ダウンロードされます(`STEMLAB_MODEL_DIR` 環境変数で変更可能)。
-  標準設定では、StemLab自身が作るモデル・出力・仮想環境はすべてこのフォルダ内に
+  `models/` へ自動ダウンロードされます(`BUNRI_MODEL_DIR` 環境変数で変更可能)。
+  標準設定では、Bunri自身が作るモデル・出力・仮想環境はすべてこのフォルダ内に
   あるため、フォルダを丸ごと削除すれば除去できます。ただし、`make setup` で新たに
   導入したuvやffmpegはシステム側に残るため、不要なら各ツールの方法で別途削除して
-  ください。また、`STEMLAB_MODEL_DIR`を変更した場合、その保存先も別途削除が必要です
+  ください。また、`BUNRI_MODEL_DIR`を変更した場合、その保存先も別途削除が必要です
 - 分離には Apple Silicon の GPU(MPS)でも1曲あたり数分〜20分程度かかります
 
 ## セットアップ(手動でやる場合)
@@ -50,7 +50,7 @@ uv sync --extra web   # CLI だけでよければ --extra web は不要
 ## 使い方
 
 ```bash
-stemlab song.mp3
+bunri song.mp3
 ```
 
 実行すると `song.mp3` からギター stem を抽出し、`out/song/` に練習用パッケージ
@@ -78,12 +78,12 @@ out/song/
 ### 主なオプション
 
 ```bash
-stemlab song.mp3 --target vocals             # 抽出対象(既定: guitar)
-stemlab song.mp3 --model htdemucs_6s.yaml     # 分離モデルを明示指定(失敗時のフォールバックなし)
-stemlab song.mp3 --device cpu                 # auto(既定) | cpu | mps | cuda
-stemlab song.mp3 --no-mp3                     # wav のみ出力(mp3 変換をスキップ)
-stemlab song.mp3 --no-cache                   # キャッシュを無視して全段再計算
-stemlab song.mp3 -o path/to/out               # 出力先ディレクトリ
+bunri song.mp3 --target vocals             # 抽出対象(既定: guitar)
+bunri song.mp3 --model htdemucs_6s.yaml     # 分離モデルを明示指定(失敗時のフォールバックなし)
+bunri song.mp3 --device cpu                 # auto(既定) | cpu | mps | cuda
+bunri song.mp3 --no-mp3                     # wav のみ出力(mp3 変換をスキップ)
+bunri song.mp3 --no-cache                   # キャッシュを無視して全段再計算
+bunri song.mp3 -o path/to/out               # 出力先ディレクトリ
 ```
 
 `--device` に `mps`/`cuda` を明示した場合、そのデバイスが実際に使えるか
@@ -114,7 +114,7 @@ stemlab song.mp3 -o path/to/out               # 出力先ディレクトリ
 
 ```bash
 uv sync --extra web
-uv run stemlab-web
+uv run bunri-web
 ```
 
 起動すると `http://127.0.0.1:8330/` がブラウザで自動的に開きます
@@ -122,7 +122,7 @@ uv run stemlab-web
 
 - 音源をドロップ(またはクリックして選択)すると曲名確認欄が出るので、
   必要なら曲名を編集してアップロードします。分離はサーバー側で
-  `stemlab` CLI をサブプロセスとして実行する形で行われるため、ブラウザを
+  `bunri` CLI をサブプロセスとして実行する形で行われるため、ブラウザを
   閉じてもジョブは継続します
 - ジョブ一覧は「待機中 / 処理中(経過時間)/ 完了 / 失敗」を表示し、
   完了したジョブには「プレイヤーを開く」リンクが表示されます
@@ -133,9 +133,9 @@ uv run stemlab-web
 ### 主なオプション
 
 ```bash
-stemlab-web --port 8330       # 待ち受けポート(既定: 8330)
-stemlab-web -o path/to/out    # 出力先ディレクトリ(既定: out。stemlab CLI と共有可能)
-stemlab-web --no-open         # 起動時のブラウザ自動オープンを無効化
+bunri-web --port 8330       # 待ち受けポート(既定: 8330)
+bunri-web -o path/to/out    # 出力先ディレクトリ(既定: out。bunri CLI と共有可能)
+bunri-web --no-open         # 起動時のブラウザ自動オープンを無効化
 ```
 
 ## Docker で使う
@@ -147,30 +147,30 @@ ffmpeg・Python 3.13・分離モデルをまとめて動かしたいだけなら
 ### ワンライナー
 
 ```bash
-docker build --target cpu -t stemlab:cpu .
+docker build --target cpu -t bunri:cpu .
 
 docker run --rm \
   -v ./songs:/in \
   -v ./out:/out \
-  -v stemlab-models:/root/.cache/stemlab/models \
-  stemlab:cpu /in/song.mp3 -o /out
+  -v bunri-models:/root/.cache/bunri/models \
+  bunri:cpu /in/song.mp3 -o /out
 ```
 
-- `stemlab-models` という名前付きボリュームに分離モデルを永続化します。初回
+- `bunri-models` という名前付きボリュームに分離モデルを永続化します。初回
   起動時に becruily モデル(約45MB)がここへダウンロードされ、以降の実行
   (同じボリュームを指定する限り)では再ダウンロードされません。
-- `ENTRYPOINT` は `stemlab` なので、`docker run` の末尾に渡す引数はそのまま
+- `ENTRYPOINT` は `bunri` なので、`docker run` の末尾に渡す引数はそのまま
   CLI オプションとして扱われます(`--target` / `--model` / `--device` など、
   「主なオプション」節と同じものが使えます)。
 
 ### compose で使う
 
 ```bash
-docker compose run --rm stemlab /in/song.mp3 -o /out
+docker compose run --rm bunri /in/song.mp3 -o /out
 ```
 
 `compose.yaml` は `./songs` を読み取り専用で `/in` に、`./out` を `/out` に、
-`stemlab-models` ボリュームを `/root/.cache/stemlab/models` にマウントします。
+`bunri-models` ボリュームを `/root/.cache/bunri/models` にマウントします。
 `./songs` に音源ファイルを置いてから実行してください。
 
 ### 注意: Mac では GPU が使えない
@@ -191,7 +191,7 @@ NVIDIA CUDA ランタイムベースの GPU 向けイメージを定義してい
 `--platform linux/amd64` の指定が必須):
 
 ```bash
-docker build --platform linux/amd64 --target cuda -t stemlab:cuda .
+docker build --platform linux/amd64 --target cuda -t bunri:cuda .
 ```
 
 このビルドが通ること(torch 2.13.0+cu130 / onnxruntime-gpu 1.27 が解決・
@@ -204,8 +204,8 @@ Silicon)では GPU コンテナを実行できないため、GPU での分離処
 ### dev イメージ(テスト実行用)
 
 ```bash
-docker build --target dev -t stemlab:dev .
-docker run --rm stemlab:dev            # pytest -q を実行
+docker build --target dev -t bunri:dev .
+docker run --rm bunri:dev            # pytest -q を実行
 ```
 
 pytest・playwright(Chromium 込み)を含む開発用イメージです。CI などで
@@ -227,7 +227,7 @@ wsl --install -d Ubuntu
 
 ```bash
 sudo apt update && sudo apt install -y ffmpeg make git
-git clone <このリポジトリ> && cd StemLab   # zip 展開でも可
+git clone <このリポジトリ> && cd Bunri   # zip 展開でも可
 make setup
 make web
 ```
