@@ -1,6 +1,6 @@
 [project]
 name = "bunri"
-version = "0.2.0"
+version = "0.2.1"
 description = "Instrument stem extraction and practice package generator for songs"
 readme = "README.md"
 license = "MIT"
