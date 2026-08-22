@@ -328,6 +328,79 @@ def test_ab_loop_is_reflected_in_state_and_wraps_playback(tmp_path):
 
 
 @_needs_runtime
+def test_ab_loop_at_track_end_keeps_playing_across_multiple_wraps(tmp_path):
+    page_path = _render_dir(
+        tmp_path,
+        target=None,
+        backing=None,
+        create=("original",),
+        dur=1.0,
+    )
+    with _open(page_path) as page:
+        page.wait_for_function("window.__player.state().ready === true", timeout=15_000)
+        # Keep the render loop from winning the race at exactly B: playback is
+        # still real, but reaching the media endpoint must exercise `ended`.
+        page.evaluate("window.requestAnimationFrame=function(){return 1;}")
+        page.evaluate("window.__player.seek(0); window.__player.setA();")
+
+        # Preserve the ordinary no-loop ending behaviour before using the
+        # browser-reported endpoint as B.
+        page.evaluate(
+            "window.__player.seek(window.__player.state().duration - 0.2);"
+            "window.__player.play();"
+        )
+        page.wait_for_function(
+            "document.getElementById('tm-audio-original').ended === true",
+            timeout=8_000,
+        )
+        stopped = page.evaluate(
+            "(()=>{var el=document.getElementById('tm-audio-original');"
+            "return {paused:el.paused, playing:window.__player.state().playing,"
+            "button:document.getElementById('tm-play').textContent, end:el.currentTime};})()"
+        )
+        assert stopped["paused"] is True
+        assert stopped["playing"] is False
+        assert stopped["button"] == "再生"
+
+        page.evaluate("window.__player.setB()")
+        state = page.evaluate("window.__player.state()")
+        assert abs(state["loop"]["a"] - 0) < 0.05
+        assert state["loop"]["active"] is True
+        assert abs(state["loop"]["b"] - stopped["end"]) < 0.05
+        assert abs(state["loop"]["b"] - state["duration"]) < 0.05
+
+        page.evaluate(
+            "window.__player.seek(window.__player.state().duration - 0.2);"
+            "window.__testEndLoopWraps=0;"
+            "document.getElementById('tm-audio-original').addEventListener('seeking',function(){"
+            "if(this.currentTime < 0.05) window.__testEndLoopWraps += 1;});"
+            "window.__player.play();"
+        )
+        page.wait_for_function(
+            "window.__testEndLoopWraps >= 1 &&"
+            "document.getElementById('tm-audio-original').paused === false",
+            timeout=8_000,
+        )
+        page.wait_for_function(
+            "document.getElementById('tm-audio-original').currentTime >"
+            "window.__player.state().loop.a + 0.08",
+            timeout=8_000,
+        )
+        page.wait_for_function("window.__testEndLoopWraps >= 2", timeout=8_000)
+
+        looping = page.evaluate(
+            "({paused:document.getElementById('tm-audio-original').paused,"
+            "playing:window.__player.state().playing,"
+            "button:document.getElementById('tm-play').textContent,"
+            "wraps:window.__testEndLoopWraps})"
+        )
+        assert looping["paused"] is False
+        assert looping["playing"] is True
+        assert looping["button"] == "一時停止"
+        assert looping["wraps"] >= 2
+
+
+@_needs_runtime
 def test_playback_rate_change_sets_preserves_pitch(tmp_path):
     with _open(_render_dir(tmp_path)) as page:
         page.wait_for_function("window.__player.state().ready === true", timeout=15_000)

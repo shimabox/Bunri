@@ -515,7 +515,13 @@
       el.addEventListener("loadedmetadata", function () { onMeta(name); });
       el.addEventListener("error", function () { onErr(name); });
       el.addEventListener("ended", function () {
-        if (name === activeName && !loopActive()) pauseAll();
+        if (name !== activeName) return;
+        if (loopActive()) {
+          seekAll(loopA);
+          playAll();
+        } else {
+          pauseAll();
+        }
       });
       // Metadata may already be present if the file loaded synchronously.
       if (el.readyState >= 1) onMeta(name);
