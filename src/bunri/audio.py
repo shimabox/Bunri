@@ -7,7 +7,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from stemlab.safepath import replace_into
+from bunri.safepath import replace_into
 
 
 def normalize_to_wav(
@@ -34,7 +34,7 @@ def normalize_to_wav(
 
     # ffmpeg writes wherever it is pointed, symlink included, so it is pointed
     # at a temporary and the result renamed over `dest`. See
-    # stemlab/safepath.py; the temporary keeps the suffix ffmpeg needs to pick
+    # bunri/safepath.py; the temporary keeps the suffix ffmpeg needs to pick
     # its muxer.
     replace_into(dest, _run)
 

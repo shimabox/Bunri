@@ -1,4 +1,4 @@
-"""StemLab command line interface."""
+"""Bunri command line interface."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from typing import Optional
 import typer
 from rich.console import Console
 
-from stemlab import __version__
-from stemlab.package import build_package
-from stemlab.registry import REGISTRY
+from bunri import __version__
+from bunri.package import build_package
+from bunri.registry import REGISTRY
 
 app = typer.Typer(add_completion=False, rich_markup_mode="rich")
 console = Console()
@@ -61,7 +61,7 @@ def main(
     target = _validate_target(target)
     device = _validate_device(device)
 
-    console.print(f"[bold]stemlab[/bold] v{__version__} — {title or input_file.stem}")
+    console.print(f"[bold]Bunri[/bold] v{__version__} — {title or input_file.stem}")
     try:
         package_dir = build_package(
             input_file.resolve(),

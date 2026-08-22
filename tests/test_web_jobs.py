@@ -2,9 +2,9 @@
 recovery on restart, dedup, and title-collision numbering.
 
 The subprocess launcher (`runner`) is always a fake here -- see
-stemlab.web.jobs's module docstring for why (this repo's FakeSeparator
+bunri.web.jobs's module docstring for why (this repo's FakeSeparator
 pattern, applied to the web layer's job worker instead of the separator).
-Real `stemlab` CLI execution is never exercised by these tests.
+Real `bunri` CLI execution is never exercised by these tests.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from stemlab.web.jobs import Job, JobStore, safe_filename
+from bunri.web.jobs import Job, JobStore, safe_filename
 
 
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> None:
@@ -125,7 +125,7 @@ def test_a_huge_single_line_log_still_produces_a_loadable_job_record(tmp_path):
     JSON past MAX_JOB_FILE_BYTES. The failure looked normal at the time --
     and then the job vanished on the next start, quarantined by its own
     size check."""
-    from stemlab.web.jobs import MAX_ERROR_CHARS, MAX_JOB_FILE_BYTES
+    from bunri.web.jobs import MAX_ERROR_CHARS, MAX_JOB_FILE_BYTES
 
     upload = _make_upload(tmp_path)
     monster = "boom " * 250_000  # ~1.25 MB, not a single newline in it
@@ -154,7 +154,7 @@ def test_a_huge_single_line_log_still_produces_a_loadable_job_record(tmp_path):
 
 
 def test_an_over_long_title_is_truncated(tmp_path):
-    from stemlab.web.jobs import MAX_TITLE_CHARS
+    from bunri.web.jobs import MAX_TITLE_CHARS
 
     upload = _make_upload(tmp_path)
     store = JobStore(tmp_path, runner=FakeRunner())
@@ -169,7 +169,7 @@ def test_serializing_a_job_never_exceeds_the_record_limit(tmp_path):
     """The belt behind _tail's braces: even handed an error field no code
     path should ever produce, the writer must emit something the loader will
     accept -- and must not mutate the caller's job to get there."""
-    from stemlab.web.jobs import MAX_JOB_FILE_BYTES, _serialize_job_within_limit
+    from bunri.web.jobs import MAX_JOB_FILE_BYTES, _serialize_job_within_limit
 
     oversized = "E" * (MAX_JOB_FILE_BYTES * 2)
     job = Job(
@@ -189,7 +189,7 @@ def test_serializing_a_job_never_exceeds_the_record_limit(tmp_path):
 def test_tail_of_a_normal_multi_line_log_is_unchanged_by_the_byte_cap(tmp_path):
     """The bounded read must not disturb ordinary logs: a small file is read
     whole, and its last n lines come back exactly as before."""
-    from stemlab.web.jobs import _tail
+    from bunri.web.jobs import _tail
 
     log = tmp_path / "small.log"
     log.write_text("\n".join(f"line {i}" for i in range(1, 21)) + "\n", encoding="utf-8")
@@ -209,7 +209,7 @@ def test_tail_drops_the_partial_first_line_when_it_reads_from_an_offset(tmp_path
     """Reading only the tail starts mid-file, so the first thing in the
     window is the back half of a line we never saw the start of. Returning
     it as if it were a whole line would be a lie about the log's content."""
-    from stemlab.web.jobs import LOG_TAIL_READ_BYTES, _tail
+    from bunri.web.jobs import LOG_TAIL_READ_BYTES, _tail
 
     log = tmp_path / "big.log"
     filler = "F" * (LOG_TAIL_READ_BYTES * 2)  # pushes the window past the start
@@ -499,7 +499,7 @@ def test_get_job_returns_none_for_unknown_id(tmp_path):
 
 
 def test_safe_filename_matches_package_py_rule():
-    # Same regex as stemlab.package._safe_filename (duplicated deliberately,
+    # Same regex as bunri.package._safe_filename (duplicated deliberately,
     # see jobs.py's module docstring) -- pin the exact rule here.
     assert safe_filename('a/b\\c:d*e?f"g<h>i|j') == "a_b_c_d_e_f_g_h_i_j"
     assert safe_filename("  ") == "untitled"
@@ -549,7 +549,7 @@ def test_preexisting_cli_package_folder_is_a_collision(tmp_path):
 
 
 def _spawn_marked_sleeper(*, own_group: bool = True):
-    """A throwaway process whose command line contains "stemlab.cli" (inside
+    """A throwaway process whose command line contains "bunri.cli" (inside
     the -c payload), so the sidecar reaper's pid-recycling guard accepts it.
 
     `own_group` mirrors default_runner's start_new_session=True, which makes
@@ -560,13 +560,13 @@ def _spawn_marked_sleeper(*, own_group: bool = True):
     import sys
 
     return subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)  # stemlab.cli"],
+        [sys.executable, "-c", "import time; time.sleep(60)  # bunri.cli"],
         start_new_session=own_group,
     )
 
 
 def test_terminate_pid_from_sidecar_kills_only_matching_processes(tmp_path):
-    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+    from bunri.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
     log = tmp_path / "j-x.log"
     proc = _spawn_marked_sleeper()
@@ -631,13 +631,13 @@ def _spawn_sigterm_ignoring_sleeper():
     code = (
         "import signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "time.sleep(60)  # stemlab.cli\n"
+        "time.sleep(60)  # bunri.cli\n"
     )
     return subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
 
 
 def test_terminate_pid_from_sidecar_escalates_to_sigkill_when_sigterm_is_ignored(tmp_path):
-    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+    from bunri.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
     log = tmp_path / "j-y.log"
     proc = _spawn_sigterm_ignoring_sleeper()
@@ -669,8 +669,8 @@ def test_terminate_pid_from_sidecar_keeps_sidecar_when_sigterm_raises_non_lookup
     next startup's recovery gets a chance to deal with whatever's actually
     there. Regression for a bug where the sidecar was unconditionally removed
     on any OSError from the SIGTERM call."""
-    from stemlab.web import jobs as jobs_module
-    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+    from bunri.web import jobs as jobs_module
+    from bunri.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
     log = tmp_path / "j-perm.log"
     proc = _spawn_marked_sleeper()
@@ -705,8 +705,8 @@ def test_terminate_pid_from_sidecar_removes_stale_sidecar_when_sigterm_finds_pro
     OSError case where the outcome *is* known -- the process is genuinely
     gone, so the sidecar is safe (and correct) to discard immediately,
     unlike the PermissionError case above."""
-    from stemlab.web import jobs as jobs_module
-    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+    from bunri.web import jobs as jobs_module
+    from bunri.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
     log = tmp_path / "j-gone.log"
     proc = _spawn_marked_sleeper()
@@ -776,7 +776,7 @@ def _spawn_marked_parent_with_child(grandchild_pid_file: Path, *, own_group: boo
         "import pathlib, subprocess, sys, time\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
         "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
-        "time.sleep(60)  # stemlab.cli\n"
+        "time.sleep(60)  # bunri.cli\n"
     )
     return subprocess.Popen(
         [sys.executable, "-c", code, str(grandchild_pid_file)], start_new_session=own_group
@@ -792,7 +792,7 @@ def test_terminate_pid_from_sidecar_kills_the_whole_process_tree(tmp_path):
     group so the whole tree can be signalled at once; this checks a real
     two-level process tree is actually gone afterwards.
     """
-    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+    from bunri.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
     log = tmp_path / "j-tree.log"
     grandchild_pid_file = tmp_path / "grandchild.pid"
@@ -851,7 +851,7 @@ def test_legacy_non_group_leader_sidecar_is_held_without_signalling_anything(tmp
     The reaper must therefore leave such a process completely alone, report
     FAILED, keep the sidecar, and let the recovery path hold the job -- which
     self-resolves once the old process exits on its own."""
-    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+    from bunri.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
     upload = _make_upload(tmp_path)
     _write_running_job_file(tmp_path, "j-legacy", upload)
@@ -941,8 +941,8 @@ def test_unverifiable_liveness_holds_the_job_instead_of_assuming_the_process_is_
     ones: a `ps` that launches and then exits unsuccessfully prints nothing
     on stdout either, so judging by output alone reads it as "no such
     process" -- the same fail-open, just further along."""
-    from stemlab.web import jobs as jobs_module
-    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+    from bunri.web import jobs as jobs_module
+    from bunri.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
     upload = _make_upload(tmp_path)
     _write_running_job_file(tmp_path, "j-unknown", upload)
@@ -978,8 +978,8 @@ def test_unreadable_sidecar_holds_the_job_but_a_missing_one_does_not(tmp_path, m
     """The three sidecar-read outcomes must not be lumped together: absent
     means "nothing to stop" (the common, healthy case), while an I/O error
     means we have no idea what the previous run left behind and must hold."""
-    from stemlab.web import jobs as jobs_module
-    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+    from bunri.web import jobs as jobs_module
+    from bunri.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
     logs_dir = tmp_path / "web" / "logs"
     logs_dir.mkdir(parents=True)
@@ -1014,7 +1014,7 @@ def test_garbage_in_the_sidecar_holds_the_job_and_says_it_needs_a_human(tmp_path
     """A sidecar we can read but can't parse is the one held state that will
     never clear itself, so it must both hold the job and say plainly that
     someone has to remove the file."""
-    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+    from bunri.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
     logs_dir = tmp_path / "web" / "logs"
     logs_dir.mkdir(parents=True)
@@ -1034,7 +1034,7 @@ def test_a_confirmed_dead_process_still_yields_nothing_to_stop(tmp_path):
     """The fail-closed handling above must not make the healthy path
     paranoid: when `ps` runs fine and reports no such process, that really is
     a stale sidecar -- drop it and let the job be re-queued."""
-    from stemlab.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
+    from bunri.web.jobs import TerminationOutcome, terminate_pid_from_sidecar
 
     logs_dir = tmp_path / "web" / "logs"
     logs_dir.mkdir(parents=True)
@@ -1059,7 +1059,7 @@ def test_ps_exit_status_decides_alive_vs_gone_vs_unknown(tmp_path, monkeypatch):
     macOS and Linux; anything noisier or stranger is no answer at all."""
     import subprocess
 
-    from stemlab.web import jobs as jobs_module
+    from bunri.web import jobs as jobs_module
 
     def _ps_returning(returncode, stdout, stderr):
         return lambda *a, **kw: subprocess.CompletedProcess(
@@ -1067,9 +1067,9 @@ def test_ps_exit_status_decides_alive_vs_gone_vs_unknown(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(
-        jobs_module.subprocess, "run", _ps_returning(0, "python -m stemlab.cli x\n", "")
+        jobs_module.subprocess, "run", _ps_returning(0, "python -m bunri.cli x\n", "")
     )
-    assert jobs_module._process_command(4242) == "python -m stemlab.cli x"
+    assert jobs_module._process_command(4242) == "python -m bunri.cli x"
 
     monkeypatch.setattr(jobs_module.subprocess, "run", _ps_returning(1, "", ""))
     assert jobs_module._process_command(4242) == "", "rc 1 with a quiet stderr means gone"
@@ -1092,7 +1092,7 @@ def test_recovery_holds_a_job_whose_previous_process_could_not_be_stopped(
     process writing the very same cache/package files the survivor is still
     writing. Such a job must be held back -- left "running", not enqueued --
     and retried on the next start instead."""
-    from stemlab.web import jobs as jobs_module
+    from bunri.web import jobs as jobs_module
 
     upload = _make_upload(tmp_path)
     jobs_dir = tmp_path / "web" / "jobs"
@@ -1266,7 +1266,7 @@ def test_shutdown_retries_termination_until_a_late_pid_sidecar_appears(tmp_path)
     as started, waits before publishing its (real, marker-matching) child's
     pid, and then blocks until that child is actually killed.
     """
-    from stemlab.web.jobs import _pid_sidecar
+    from bunri.web.jobs import _pid_sidecar
 
     upload = _make_upload(tmp_path)
     started = threading.Event()
@@ -1528,7 +1528,7 @@ def test_oversized_job_file_is_quarantined_without_being_parsed(tmp_path):
     """Belt to the RecursionError braces: a job record is a few hundred
     bytes, so anything past the size limit is rejected on its stat alone --
     never read into memory, never handed to the parser."""
-    from stemlab.web.jobs import MAX_JOB_FILE_BYTES
+    from bunri.web.jobs import MAX_JOB_FILE_BYTES
 
     jobs_dir = tmp_path / "web" / "jobs"
     jobs_dir.mkdir(parents=True)
@@ -1555,7 +1555,7 @@ def test_a_job_file_at_exactly_the_size_limit_still_loads(tmp_path):
     fixture would pass even if the check regressed to `>=`, which is exactly
     the mistake this guards against.
     """
-    from stemlab.web.jobs import MAX_JOB_FILE_BYTES
+    from bunri.web.jobs import MAX_JOB_FILE_BYTES
 
     jobs_dir = tmp_path / "web" / "jobs"
     jobs_dir.mkdir(parents=True)
@@ -1584,7 +1584,7 @@ def test_a_job_file_one_byte_over_the_size_limit_is_quarantined(tmp_path):
     """The other half of the boundary: one byte past the limit is rejected.
     Together with the test above this pins the comparison exactly, so
     neither loosening nor tightening it by one can slip through."""
-    from stemlab.web.jobs import MAX_JOB_FILE_BYTES
+    from bunri.web.jobs import MAX_JOB_FILE_BYTES
 
     jobs_dir = tmp_path / "web" / "jobs"
     jobs_dir.mkdir(parents=True)
@@ -1637,7 +1637,7 @@ def test_a_record_that_cannot_be_saved_back_is_quarantined_on_load(tmp_path):
 
     `digest` carries the bulk here rather than `title`, which has a cap of
     its own -- this is specifically the size check, not that one."""
-    from stemlab.web.jobs import MAX_JOB_FILE_BYTES, _serialize_job_within_limit
+    from bunri.web.jobs import MAX_JOB_FILE_BYTES, _serialize_job_within_limit
 
     jobs_dir = tmp_path / "web" / "jobs"
     jobs_dir.mkdir(parents=True)
@@ -1737,7 +1737,7 @@ def _fake_popen_factory(monkeypatch, pid: int = 4242):
     """Make default_runner's spawn a no-op, so its *file* operations -- the
     truncating log open and the pid sidecar write, which are the dangerous
     ones -- run for real without launching the separation CLI (and torch)."""
-    from stemlab.web import jobs as jobs_module
+    from bunri.web import jobs as jobs_module
 
     class _InstantProc:
         def __init__(self):
@@ -1765,7 +1765,7 @@ def test_a_symlink_standing_at_a_canonical_log_path_is_refused(
     is written with the process id, so a link there overwrites its target
     with a number.
     """
-    from stemlab.web.jobs import default_runner
+    from bunri.web.jobs import default_runner
 
     out_dir = tmp_path / "out"
     outside = tmp_path / "outside"
@@ -1817,7 +1817,7 @@ def test_a_relocated_logs_directory_cannot_be_used_to_write_outside_out_dir(
     expected directory is built from out_dir's own resolved location plus the
     literal components, which a relocated `web` or `logs` can never equal.
     """
-    from stemlab.web.jobs import default_runner
+    from bunri.web.jobs import default_runner
 
     out_dir = tmp_path / "out"
     outside = tmp_path / "outside"
@@ -1858,7 +1858,7 @@ def test_a_relocated_logs_directory_cannot_be_used_to_write_outside_out_dir(
 def test_a_relocated_logs_directory_fails_the_job_but_not_the_server(tmp_path):
     """The same attack seen from the outside: the job fails, the log outside
     the tree is untouched, and the server keeps running."""
-    from stemlab.web.jobs import default_runner
+    from bunri.web.jobs import default_runner
 
     out_dir = tmp_path / "out"
     outside = tmp_path / "outside"
@@ -1945,8 +1945,8 @@ def test_a_failed_pid_write_stops_the_subprocess_instead_of_orphaning_it(tmp_pat
     So the write failing stops the process there and then. The job fails,
     which is fine; an orphan is not.
     """
-    from stemlab.web import jobs as jobs_module
-    from stemlab.web.jobs import default_runner
+    from bunri.web import jobs as jobs_module
+    from bunri.web.jobs import default_runner
 
     upload = _make_upload(tmp_path)
     log_path = tmp_path / "web" / "logs" / "j-orphan.log"
@@ -1958,7 +1958,7 @@ def test_a_failed_pid_write_stops_the_subprocess_instead_of_orphaning_it(tmp_pat
         # A harmless, long-lived stand-in for the separation CLI, spawned
         # through the real code path (its own session and all).
         proc = real_popen(
-            [sys.executable, "-c", "import time; time.sleep(60)  # stemlab.cli"], **kwargs
+            [sys.executable, "-c", "import time; time.sleep(60)  # bunri.cli"], **kwargs
         )
         spawned["proc"] = proc
         return proc
@@ -2028,7 +2028,7 @@ def test_a_relocated_web_directory_gets_nothing_created_inside_it(tmp_path):
 
     from fastapi.testclient import TestClient
 
-    from stemlab.web.app import create_app
+    from bunri.web.app import create_app
 
     out_dir = tmp_path / "out"
     outside = tmp_path / "outside"
@@ -2057,7 +2057,7 @@ def test_a_relocated_uploads_directory_refuses_the_upload(tmp_path):
 
     from fastapi.testclient import TestClient
 
-    from stemlab.web.app import create_app
+    from bunri.web.app import create_app
 
     out_dir = tmp_path / "out"
     outside = tmp_path / "outside"
@@ -2129,7 +2129,7 @@ def test_a_multibyte_package_path_is_reserved_in_bytes_not_characters(tmp_path):
 
     Either outcome is acceptable; what must not happen is accepting it and
     then writing it oversized."""
-    from stemlab.web.jobs import MAX_JOB_FILE_BYTES
+    from bunri.web.jobs import MAX_JOB_FILE_BYTES
 
     upload = _make_upload(tmp_path)
     jobs_dir = tmp_path / "web" / "jobs"
@@ -2175,7 +2175,7 @@ def test_an_over_long_title_is_rejected_on_load(tmp_path):
     the job succeeds -- and `error` being the only trimmable field means the
     writer can't recover from it. The cap create_job applies is therefore
     enforced on the way in too. Nothing this app writes can trip it."""
-    from stemlab.web.jobs import MAX_TITLE_CHARS
+    from bunri.web.jobs import MAX_TITLE_CHARS
 
     _write_raw_job_file(
         tmp_path, "j-longtitle",
@@ -2197,7 +2197,7 @@ def test_an_accepted_record_can_always_be_written_back(tmp_path):
     """The property both tests above exist to establish, checked directly on
     the healthy path: whatever the loader admits, _write_job can save --
     within the limit and without an encoding error."""
-    from stemlab.web.jobs import MAX_JOB_FILE_BYTES, _job_record_bytes
+    from bunri.web.jobs import MAX_JOB_FILE_BYTES, _job_record_bytes
 
     _write_raw_job_file(tmp_path, "j-normal", _valid_job_payload(id="j-normal"))
     _write_raw_job_file(
@@ -2263,7 +2263,7 @@ def test_unparseable_datetime_is_quarantined(tmp_path):
 
 
 def test_quarantine_never_overwrites_an_existing_quarantine_file(tmp_path, monkeypatch):
-    from stemlab.web import jobs as jobs_module
+    from bunri.web import jobs as jobs_module
 
     jobs_dir = tmp_path / "web" / "jobs"
     jobs_dir.mkdir(parents=True)
@@ -2286,7 +2286,7 @@ def test_quarantine_never_overwrites_an_existing_quarantine_file(tmp_path, monke
 # default_runner --target passthrough
 # ---------------------------------------------------------------------------
 def test_default_runner_passes_target_to_the_cli(tmp_path, monkeypatch):
-    from stemlab.web import jobs as jobs_module
+    from bunri.web import jobs as jobs_module
 
     captured: dict[str, Any] = {}
 

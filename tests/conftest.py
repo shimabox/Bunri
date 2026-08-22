@@ -17,7 +17,7 @@ from __future__ import annotations
 from hypothesis import HealthCheck, settings
 
 settings.register_profile(
-    "stemlab",
+    "bunri",
     # Enough examples to reach the interesting corners of the strategies
     # (surrogates, size boundaries, path shapes, every status) while keeping
     # the suite quick enough that people actually run it. Most of these draw
@@ -45,4 +45,4 @@ settings.register_profile(
         HealthCheck.filter_too_much,
     ],
 )
-settings.load_profile("stemlab")
+settings.load_profile("bunri")

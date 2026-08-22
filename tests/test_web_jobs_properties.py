@@ -35,7 +35,7 @@ import pytest
 from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
-from stemlab.web.jobs import (
+from bunri.web.jobs import (
     MAX_ERROR_CHARS,
     MAX_JOB_FILE_BYTES,
     MAX_TITLE_CHARS,
@@ -172,7 +172,7 @@ def _plant_sentinels(out_dir: Path, outside: Path) -> dict[Path, Path]:
 def _neuter_spawn(monkeypatch) -> None:
     """Let `default_runner` run its real file handling without launching the
     separation CLI (and torch) behind it."""
-    from stemlab.web import jobs as jobs_module
+    from bunri.web import jobs as jobs_module
 
     class _InstantProc:
         pid = 4242
@@ -773,7 +773,7 @@ def test_p4_any_exception_from_reading_one_file_is_contained(tmp_path, monkeypat
     Together the two are the point: forget to enumerate an exception class
     and the fuzz test catches you; enumerate one and this pins the behaviour.
     """
-    from stemlab.web import jobs as jobs_module
+    from bunri.web import jobs as jobs_module
 
     jobs_dir = _jobs_dir(tmp_path)
     (jobs_dir / "j-prop-0001.json").write_text("{}", encoding="utf-8")
@@ -826,7 +826,7 @@ def test_p5_a_job_is_re_run_exactly_when_its_old_process_is_accounted_for(
     the thing that must not happen; a terminal status means there is nothing
     to re-run at all.
     """
-    from stemlab.web import jobs as jobs_module
+    from bunri.web import jobs as jobs_module
 
     upload = _make_upload(tmp_path)
     jobs_dir = _jobs_dir(tmp_path)
@@ -1063,7 +1063,7 @@ def test_p5_a_failed_verdict_never_reaches_the_runner(tmp_path_factory, monkeypa
     """The one-line version of the table above, as a property: FAILED implies
     the runner is never called. Stated separately because it is the part
     whose violation costs real data -- two processes writing one cache."""
-    from stemlab.web import jobs as jobs_module
+    from bunri.web import jobs as jobs_module
 
     tmp_path = tmp_path_factory.mktemp("p5b")
     upload = _make_upload(tmp_path)

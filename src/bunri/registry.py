@@ -3,7 +3,7 @@ model (and stem name) that extracts it, plus the fallback model and player
 label to use for it.
 
 Phase 1 only registers "guitar"; the shape is deliberately generic so future
-targets (vocals, bass, drums, piano -- see the StemLab founding plan) can be
+targets (vocals, bass, drums, piano -- see the Bunri founding plan) can be
 added as new REGISTRY entries without touching separate.py/package.py.
 """
 

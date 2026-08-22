@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# StemLab セットアップスクリプト(macOS / Linux)
+# Bunri セットアップスクリプト(macOS / Linux)
 #
 # やること:
 #   1. uv(Python パッケージマネージャ)があるか確認。無ければ公式インストーラの
@@ -16,7 +16,7 @@ say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 ok()   { printf '  ✓ %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*"; }
 
-say "StemLab セットアップを開始します"
+say "Bunri セットアップを開始します"
 
 # --- 1. uv -----------------------------------------------------------------
 if command -v uv >/dev/null 2>&1; then

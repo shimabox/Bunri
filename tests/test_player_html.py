@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from stemlab.player import render_player
+from bunri.player import render_player
 
 _LABEL = "ギター"  # instrument_label used throughout: matches tab-maker's guitar-only wording
 

@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from stemlab.safepath import is_real_file_in, replace_into
+from bunri.safepath import is_real_file_in, replace_into
 
 
 def file_digest(path: Path) -> str:
@@ -96,7 +96,7 @@ def write_stage_meta(
     # Written through replace_into like every other file this app produces:
     # the name is derivable from the input digest and the stage, so a symlink
     # can be waiting at it, and write_text would follow the link and overwrite
-    # whatever it points at. See stemlab/safepath.py.
+    # whatever it points at. See bunri/safepath.py.
     replace_into(
         _meta_path(cache_dir, stage_name),
         lambda tmp: tmp.write_text(payload, encoding="utf-8"),

@@ -25,7 +25,7 @@ from jinja2 import Environment, PackageLoader, select_autoescape
 # title and the audio filenames are escaped into inert attribute/text content
 # by Jinja.
 _env = Environment(
-    loader=PackageLoader("stemlab", "templates"),
+    loader=PackageLoader("bunri", "templates"),
     autoescape=select_autoescape(("html", "j2", "xml")),
 )
 

@@ -1,4 +1,4 @@
-# StemLab — よく使う操作の入り口。詳しくは README.md を参照。
+# Bunri — よく使う操作の入り口。詳しくは README.md を参照。
 
 .PHONY: setup web test separate
 
@@ -8,14 +8,14 @@ setup:
 
 # ブラウザ画面を起動(http://127.0.0.1:8330/ が自動で開く。停止は Ctrl+C)
 web:
-	uv run stemlab-web
+	uv run bunri-web
 
 # コマンドラインで直接分離: make separate FILE=path/to/song.mp3
 separate:
 ifndef FILE
 	$(error FILE を指定してください: make separate FILE=path/to/song.mp3)
 endif
-	uv run stemlab "$(FILE)"
+	uv run bunri "$(FILE)"
 
 # 開発用: 全テスト実行
 test:

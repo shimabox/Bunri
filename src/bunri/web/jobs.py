@@ -1,4 +1,4 @@
-"""Job store + worker for the StemLab web UI.
+"""Job store + worker for the Bunri web UI.
 
 Design (see .claude/plans/stemlab-web-plan.md):
 
@@ -8,7 +8,7 @@ Design (see .claude/plans/stemlab-web-plan.md):
 * A single daemon worker thread drains a queue and runs jobs strictly
   sequentially (MPS has nothing to gain from parallel separations, per the
   plan). The actual separation happens in a subprocess running the existing,
-  already-tested `stemlab` CLI (`python -m stemlab.cli ...`) -- never
+  already-tested `bunri` CLI (`python -m bunri.cli ...`) -- never
   in-process -- so this module never needs to import torch / audio_separator
   and a crash in the separator can't take the web server down with it.
 * The subprocess launcher (``runner``) is constructor-injectable, mirroring
@@ -23,7 +23,7 @@ This module deliberately duplicates package.py's ``_safe_filename`` regex
 rather than importing it: package.py transitively pulls in separate.py,
 audio.py etc., and while none of *those* import torch at module scope
 either, keeping the web layer's import graph fully disjoint from the
-separation stack is the simplest way to guarantee `import stemlab.web.app`
+separation stack is the simplest way to guarantee `import bunri.web.app`
 never accidentally grows slow or heavy as those modules evolve.
 """
 
@@ -44,7 +44,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from stemlab.safepath import (
+from bunri.safepath import (
     UnsafeOutputPath,
     is_really as _is_really,
     real_subdir as _real_subdir,
@@ -93,13 +93,13 @@ _TRUNCATION_NOTE = "... (truncated)\n"
 # the filesystem's business, unchanged by this cap.)
 MAX_TITLE_CHARS = 200
 
-# Same rule as stemlab.package._safe_filename -- see module docstring for why
+# Same rule as bunri.package._safe_filename -- see module docstring for why
 # this is duplicated rather than imported.
 _UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|#%]')
 
 
 def safe_filename(title: str) -> str:
-    # See stemlab.package._safe_filename's comments for why leading dots are
+    # See bunri.package._safe_filename's comments for why leading dots are
     # stripped after substitution and why a "web" result is renamed --
     # identical rule, duplicated here on purpose.
     slug = _UNSAFE_CHARS.sub("_", title).strip().lstrip(".")
@@ -296,7 +296,7 @@ def terminate_pid_from_sidecar(
     log_path: Path,
     *,
     expected_logs_dir: Path,
-    marker: str = "stemlab.cli",
+    marker: str = "bunri.cli",
     grace_seconds: float = 5.0,
     poll_interval: float = 0.1,
 ) -> TerminationOutcome:
@@ -367,7 +367,7 @@ def terminate_pid_from_sidecar(
         # Either way the answer is the same -- we learned nothing about the
         # old process, so the job is held.
         _warn(
-            f"[stemlab-web] cannot read pid sidecar {sidecar.name} ({exc}); "
+            f"[bunri-web] cannot read pid sidecar {sidecar.name} ({exc}); "
             "assuming its process may still be running"
         )
         return TerminationOutcome.FAILED
@@ -382,16 +382,16 @@ def terminate_pid_from_sidecar(
         # resolve itself on a later start -- the file will still be garbage
         # -- so say plainly that a human has to clear it.
         _warn(
-            f"[stemlab-web] pid sidecar {sidecar.name} does not contain a usable pid "
+            f"[bunri-web] pid sidecar {sidecar.name} does not contain a usable pid "
             f"({raw.strip()!r}); the job it belongs to will stay held. Check for a "
-            f"leftover stemlab process, then delete {sidecar} by hand to release it."
+            f"leftover bunri process, then delete {sidecar} by hand to release it."
         )
         return TerminationOutcome.FAILED
 
     alive = _process_liveness(pid, marker)
     if alive is None:
         _warn(
-            f"[stemlab-web] could not check whether pid {pid} (from {sidecar.name}) "
+            f"[bunri-web] could not check whether pid {pid} (from {sidecar.name}) "
             "is still running; assuming it is"
         )
         return TerminationOutcome.FAILED
@@ -405,7 +405,7 @@ def terminate_pid_from_sidecar(
     leads_group = _leads_own_process_group(pid)
     if leads_group is not True:
         _warn(
-            f"[stemlab-web] pid {pid} (from {sidecar.name}) "
+            f"[bunri-web] pid {pid} (from {sidecar.name}) "
             + (
                 "does not lead its own process group -- it predates this server's "
                 "process-group handling, so stopping it would leave its own children "
@@ -456,7 +456,7 @@ def terminate_pid_from_sidecar(
         # Don't destroy the recovery information: leave the sidecar in
         # place so the next startup's recovery gets another chance at it,
         # same as the "still alive after SIGKILL" case below.
-        _warn(f"[stemlab-web] could not signal pid {pid} (from {sidecar.name}): {exc}")
+        _warn(f"[bunri-web] could not signal pid {pid} (from {sidecar.name}): {exc}")
         return TerminationOutcome.FAILED
 
     if not _wait_until_gone(time.monotonic() + grace_seconds):
@@ -469,7 +469,7 @@ def terminate_pid_from_sidecar(
             # -- leave the sidecar for the next startup's recovery to retry,
             # and tell the caller this job's old process is not safely gone.
             _warn(
-                f"[stemlab-web] pid {pid} (from {sidecar.name}) is not confirmed gone "
+                f"[bunri-web] pid {pid} (from {sidecar.name}) is not confirmed gone "
                 "after SIGKILL; its job stays held"
             )
             return TerminationOutcome.FAILED
@@ -503,9 +503,9 @@ def default_runner(
     *,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> int:
-    """Run the existing `stemlab` CLI as a subprocess (never in-process --
+    """Run the existing `bunri` CLI as a subprocess (never in-process --
     see module docstring). PATH-independent: uses sys.executable -m rather
-    than relying on a `stemlab` script being on PATH.
+    than relying on a `bunri` script being on PATH.
 
     ``start_new_session=True`` puts the CLI in a brand-new session, so it
     leads its own process group and every descendant it spawns (ffmpeg,
@@ -517,7 +517,7 @@ def default_runner(
     cmd = [
         sys.executable,
         "-m",
-        "stemlab.cli",
+        "bunri.cli",
         str(upload_path),
         "-o",
         str(out_dir),
@@ -563,7 +563,7 @@ def default_runner(
         except subprocess.TimeoutExpired:
             _kill_process_group(proc)
             log_f.write(
-                f"\n[stemlab-web] timed out after {timeout}s; process killed\n".encode()
+                f"\n[bunri-web] timed out after {timeout}s; process killed\n".encode()
             )
             return 124
         finally:
@@ -975,7 +975,7 @@ class JobStore:
 
     One instance is created per running server (see web/app.py's
     create_app). `out_dir` is where practice packages, uploads, job records
-    and logs all live -- the same directory the `stemlab` CLI's `-o` points
+    and logs all live -- the same directory the `bunri` CLI's `-o` points
     at, so packages produced by jobs land exactly where the API expects to
     find and serve them.
     """
@@ -996,7 +996,7 @@ class JobStore:
                 # Not fatal: every user of these directories checks again at
                 # the point of use and refuses there, so the server comes up
                 # and says what is wrong rather than failing to start.
-                _warn(f"[stemlab-web] cannot prepare web/{name}: {exc}")
+                _warn(f"[bunri-web] cannot prepare web/{name}: {exc}")
 
         self._runner = runner
         self._lock = threading.RLock()
@@ -1008,7 +1008,7 @@ class JobStore:
 
         self._load_and_recover()
 
-        self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="stemlab-web-worker")
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="bunri-web-worker")
         self._worker.start()
 
     def _real_logs_dir(self) -> Path:
@@ -1049,7 +1049,7 @@ class JobStore:
             # recovery path, and neither should die over this. The job keeps
             # whatever in-memory state it has and its record on disk -- which
             # is somebody else's file -- is left exactly as it was.
-            _warn(f"[stemlab-web] job {job.id}: not saving its record -- {exc}")
+            _warn(f"[bunri-web] job {job.id}: not saving its record -- {exc}")
             return
         path = self._job_path(job.id)
         encoded = _serialize_job_within_limit(job)
@@ -1060,7 +1060,7 @@ class JobStore:
             # and killing the worker mid-job -- but it means a cap upstream
             # has been outflanked, so say so.
             _warn(
-                f"[stemlab-web] job {job.id}: record exceeds the "
+                f"[bunri-web] job {job.id}: record exceeds the "
                 f"{MAX_JOB_FILE_BYTES}-byte limit even with its error dropped; "
                 "writing it anyway, but it will not survive a restart"
             )
@@ -1074,7 +1074,7 @@ class JobStore:
             # record keeps the server up, where the exception would abort
             # startup (from the recovery path) or the job (from the worker).
             _warn(
-                f"[stemlab-web] job {job.id}: record holds text that is not valid "
+                f"[bunri-web] job {job.id}: record holds text that is not valid "
                 f"UTF-8 ({exc}); saving it with the offending characters escaped"
             )
             tmp.write_bytes(encoded.encode("utf-8", errors="backslashreplace"))
@@ -1089,7 +1089,7 @@ class JobStore:
         try:
             self._verified_jobs_dir()
         except UnsafeOutputPath as exc:
-            _warn(f"[stemlab-web] not quarantining {path.name} -- {exc}")
+            _warn(f"[bunri-web] not quarantining {path.name} -- {exc}")
             return
         while True:
             dest = path.with_name(f"{path.name}.bad-{secrets.token_hex(4)}")
@@ -1098,10 +1098,10 @@ class JobStore:
         try:
             path.rename(dest)
         except OSError as exc:
-            print(f"[stemlab-web] failed to quarantine {path.name}: {exc}", file=sys.stderr)
+            print(f"[bunri-web] failed to quarantine {path.name}: {exc}", file=sys.stderr)
             return
         print(
-            f"[stemlab-web] quarantined invalid job file {path.name} -> {dest.name}: {reason}",
+            f"[bunri-web] quarantined invalid job file {path.name} -> {dest.name}: {reason}",
             file=sys.stderr,
         )
 
@@ -1169,7 +1169,7 @@ class JobStore:
             # rewriting a stranger's JSON files is not. Loud, because this is
             # a misconfiguration (or worse) that a person has to resolve.
             _warn(
-                f"[stemlab-web] {exc}; loading no job records and leaving that "
+                f"[bunri-web] {exc}; loading no job records and leaving that "
                 "directory untouched. Jobs will not be listed until it is restored."
             )
             return
@@ -1219,7 +1219,7 @@ class JobStore:
                 # disk and not enqueued, which is the same conservative hold
                 # a failed reap gets: the next start tries again.
                 _warn(
-                    f"[stemlab-web] job {job.id}: could not be recovered ({exc!r}); "
+                    f"[bunri-web] job {job.id}: could not be recovered ({exc!r}); "
                     "leaving it as it stands and continuing with the others"
                 )
 
@@ -1242,7 +1242,7 @@ class JobStore:
                 # in-flight is the behaviour we want, since a duplicate
                 # upload must not start a competing run either.
                 print(
-                    f"[stemlab-web] job {job.id}: previous run's process could not be "
+                    f"[bunri-web] job {job.id}: previous run's process could not be "
                     f"confirmed stopped (pid sidecar kept); leaving it 'running' and "
                     f"NOT re-running it -- will retry on the next start",
                     file=sys.stderr,
@@ -1468,7 +1468,7 @@ class JobStore:
                 # allowed to end this loop. (_run_job handles its own
                 # expected failures -- this catches the unexpected, e.g. a
                 # hand-edited record whose paths the filesystem rejects.)
-                _warn(f"[stemlab-web] job {job_id}: worker raised {exc!r}; marking it failed")
+                _warn(f"[bunri-web] job {job_id}: worker raised {exc!r}; marking it failed")
                 self._force_error(job, f"internal error: {exc!r}")
 
     def _force_error(self, job: Job, message: str) -> None:
@@ -1483,7 +1483,7 @@ class JobStore:
                 job.finished_at = _now_iso()
                 self._write_job(job)
         except Exception as exc:
-            _warn(f"[stemlab-web] job {job.id}: could not even record its failure: {exc!r}")
+            _warn(f"[bunri-web] job {job.id}: could not even record its failure: {exc!r}")
 
     def _log_path_for(self, job: Job) -> Path:
         """The absolute path this job's log is written to: always
@@ -1594,12 +1594,12 @@ class JobStore:
                 with _open_in_logs_dir(
                     log_path, expected_logs_dir=self._real_logs_dir(), mode="ab"
                 ) as f:
-                    f.write(f"\n[stemlab-web] runner raised: {exc!r}\n".encode())
+                    f.write(f"\n[bunri-web] runner raised: {exc!r}\n".encode())
             except (OSError, ValueError) as log_exc:
                 # Reporting a failure must not itself become one: the job is
                 # already failing, and the error tail below will just say the
                 # log is unavailable.
-                _warn(f"[stemlab-web] job {job.id}: could not write to its log: {log_exc}")
+                _warn(f"[bunri-web] job {job.id}: could not write to its log: {log_exc}")
 
         package_rel = _derived_package(job.title, job.target)
         succeeded = rc == 0 and (self.out_dir / package_rel).exists()

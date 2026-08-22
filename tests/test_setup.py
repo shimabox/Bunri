@@ -47,7 +47,7 @@ if [ "${1:-}" = "--version" ]; then
   echo "uv 0.test"
   exit 0
 fi
-printf '%s\\n' "$*" >> "$STEMLAB_TEST_LOG"
+printf '%s\\n' "$*" >> "$BUNRI_TEST_LOG"
 """.strip(),
     )
 
@@ -69,7 +69,7 @@ exit 2
 def _run_setup(bin_dir: Path, log_path: Path, *, stdin: str = "") -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PATH"] = str(bin_dir)
-    env["STEMLAB_TEST_LOG"] = str(log_path)
+    env["BUNRI_TEST_LOG"] = str(log_path)
     return subprocess.run(
         ["/bin/bash", str(_SETUP_SCRIPT)],
         cwd=_REPO_ROOT,

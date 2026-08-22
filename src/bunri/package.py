@@ -2,7 +2,7 @@
 
 Ported from tab-maker's pipeline.py run_stage cache-check pattern and its
 --stem-only export path, collapsed into a single build_package() call since
-StemLab has no downstream (transcription/tab) stages to sequence.
+Bunri has no downstream (transcription/tab) stages to sequence.
 """
 
 from __future__ import annotations
@@ -14,11 +14,11 @@ from pathlib import Path
 
 from rich.console import Console
 
-from stemlab import audio, cache
-from stemlab.player import render_player
-from stemlab.registry import get_target
-from stemlab.safepath import replace_into, verified_mkdir
-from stemlab.separate import separate
+from bunri import audio, cache
+from bunri.player import render_player
+from bunri.registry import get_target
+from bunri.safepath import replace_into, verified_mkdir
+from bunri.separate import separate
 
 console = Console()
 
@@ -45,7 +45,7 @@ def _safe_filename(title: str) -> str:
     slug = _UNSAFE_FILENAME_CHARS.sub("_", title).strip().lstrip(".")
     if not slug:
         return "untitled"
-    # "web" is StemLab's own private subdirectory (uploads/job records/logs --
+    # "web" is Bunri's own private subdirectory (uploads/job records/logs --
     # see web/app.py's _block_private_package_paths); a package titled "web"
     # would otherwise land at out/web and either collide with it or, worse,
     # get served through the same /packages/web/... path the middleware
@@ -136,7 +136,7 @@ def build_package(
     # built the tree on the far side, putting the normalized input, the
     # separated stems and every meta file outside out_dir -- before a single
     # one of the write-time protections got a say. Created a component at a
-    # time instead, refusing any that is a link. See stemlab/safepath.py.
+    # time instead, refusing any that is a link. See bunri/safepath.py.
     #
     # This is also what keeps audio-separator's own writes in bounds: the
     # files that library creates inside the directory are not ours to route

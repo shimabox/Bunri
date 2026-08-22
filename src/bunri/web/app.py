@@ -1,7 +1,7 @@
 """FastAPI app: upload endpoint, job list/detail, static package serving, and
 the single-page UI. Deliberately free of torch / audio_separator imports (see
-web/jobs.py's docstring) so `import stemlab.web.app` stays fast -- the actual
-separation always happens in a subprocess of the existing `stemlab` CLI.
+web/jobs.py's docstring) so `import bunri.web.app` stays fast -- the actual
+separation always happens in a subprocess of the existing `bunri` CLI.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from stemlab.web.jobs import Job, JobStore, Runner, safe_filename
+from bunri.web.jobs import Job, JobStore, Runner, safe_filename
 
 # Audio formats plus the mp4/mov video containers, case-insensitive: the
 # pipeline normalizes through ffmpeg, which extracts the audio track from a
@@ -66,7 +66,7 @@ def _serialize_job(job: Job) -> dict:
 
 def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
     """Build a configured FastAPI app. `out_dir` is where practice packages,
-    uploads, job records and logs all live (the same directory the `stemlab`
+    uploads, job records and logs all live (the same directory the `bunri`
     CLI's `-o` points at). `runner` lets tests inject a fake subprocess
     launcher instead of actually running the CLI (see web/jobs.py)."""
     out_dir = Path(out_dir).resolve()
@@ -82,7 +82,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         # JobStore.shutdown / the sidecar reaping in jobs.py.
         store.shutdown()
 
-    app = FastAPI(title="StemLab Web", lifespan=lifespan)
+    app = FastAPI(title="Bunri Web", lifespan=lifespan)
     app.state.job_store = store
     app.state.out_dir = out_dir
 

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # Build targets (select with `docker build --target <name>`):
-#   cpu   (default) — runtime image, ENTRYPOINT ["stemlab"]
+#   cpu   (default) — runtime image, ENTRYPOINT ["bunri"]
 #   dev   — cpu + dev dependencies (pytest, playwright+chromium) for running the test suite
 #   cuda  — GPU runtime image (nvidia CUDA base). Build-only on this project: no arm64/macOS
 #           Docker host can actually run a GPU container, so this target has never been
@@ -28,13 +28,13 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/app/.venv \
     PYTHONUNBUFFERED=1 \
-    STEMLAB_MODEL_DIR=/root/.cache/stemlab/models
-# STEMLAB_MODEL_DIR pins the container's model location explicitly: on the
+    BUNRI_MODEL_DIR=/root/.cache/bunri/models
+# BUNRI_MODEL_DIR pins the container's model location explicitly: on the
 # host the default is now <project>/models (delete the folder, delete
-# everything), but containers persist weights in the stemlab-models named
-# volume, whose canonical mount point stays /root/.cache/stemlab/models.
+# everything), but containers persist weights in the bunri-models named
+# volume, whose canonical mount point stays /root/.cache/bunri/models.
 
-# ffmpeg: required by stemlab's audio pipeline (mp3 <-> wav conversion).
+# ffmpeg: required by bunri's audio pipeline (mp3 <-> wav conversion).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -63,8 +63,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 ##############################################################################
 # app-build: add the project source on top of the cached deps layer and
-# install stemlab itself (still on build-base, in case any dep needs to
-# recompile against it — stemlab itself is pure Python/uv_build, no compiler
+# install bunri itself (still on build-base, in case any dep needs to
+# recompile against it — bunri itself is pure Python/uv_build, no compiler
 # needed for this step alone).
 ##############################################################################
 FROM deps AS app-build
@@ -82,7 +82,7 @@ COPY --from=app-build /app/.venv /app/.venv
 COPY --from=app-build /app/src /app/src
 
 ENV PATH="/app/.venv/bin:${PATH}"
-ENTRYPOINT ["stemlab"]
+ENTRYPOINT ["bunri"]
 
 ##############################################################################
 # dev-deps / dev: same lineage but with the dev dependency group (pytest,
@@ -149,7 +149,7 @@ ENV UV_LINK_MODE=copy \
     UV_PYTHON_INSTALL_DIR=/opt/uv/python \
     UV_TORCH_BACKEND=cu130 \
     PYTHONUNBUFFERED=1 \
-    STEMLAB_MODEL_DIR=/root/.cache/stemlab/models
+    BUNRI_MODEL_DIR=/root/.cache/bunri/models
 
 WORKDIR /app
 
@@ -178,4 +178,4 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-deps -e .
 
-ENTRYPOINT ["stemlab"]
+ENTRYPOINT ["bunri"]

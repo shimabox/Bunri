@@ -3,7 +3,7 @@ with a fake Separator (no real model download/inference) but real ffmpeg for
 normalization and mp3 encoding.
 
 Ported in spirit from tab-maker's tests/test_pipeline.py stem_only tests,
-adapted to StemLab's single-call build_package() API (no Stage/Context, no
+adapted to Bunri's single-call build_package() API (no Stage/Context, no
 tab/transcription steps to sequence around).
 """
 
@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from stemlab.package import build_package
+from bunri.package import build_package
 
 _NEED_FFMPEG = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
 
@@ -304,7 +304,7 @@ def test_build_package_refuses_to_write_outside_out_dir_if_safe_filename_is_bypa
     still refuse to write a package directory that resolves outside out_dir.
     Forced here by directly patching _safe_filename to hand back a
     traversal string, isolating this check from the sanitizer itself."""
-    import stemlab.package as package_module
+    import bunri.package as package_module
 
     monkeypatch.setattr(package_module, "_safe_filename", lambda title: "../escaped")
     out_dir = tmp_path / "out"
@@ -418,7 +418,7 @@ def test_build_package_never_writes_through_a_planted_cache_symlink(
     """Same rule as the package exports, applied to the cache: every name in
     there is derivable from the input digest, so a symlink can be waiting at
     one, and write_text (the meta) or ffmpeg (input.wav) would follow it."""
-    from stemlab.cache import file_digest
+    from bunri.cache import file_digest
 
     out_dir = tmp_path / "out"
     outside = tmp_path / "outside"
@@ -449,7 +449,7 @@ def test_build_package_does_not_trust_a_cached_artifact_that_is_a_symlink(
     meta in place and swapping a cached artifact for a link elsewhere read as
     "cached" -- and the link's target was copied into the package the user
     shares."""
-    from stemlab.cache import file_digest
+    from bunri.cache import file_digest
 
     out_dir = tmp_path / "out"
     build_package(song_input, out_dir, title="song")
@@ -486,7 +486,7 @@ def test_build_package_does_not_trust_a_cached_artifact_that_is_a_symlink(
 def test_build_package_does_not_trust_a_cache_meta_that_is_a_symlink(tmp_path, song_input):
     """The meta is read for the same reason and gets the same treatment: a
     link standing where it belongs cannot be what decides a stage is fresh."""
-    from stemlab.cache import file_digest
+    from bunri.cache import file_digest
 
     out_dir = tmp_path / "out"
     build_package(song_input, out_dir, title="song")
@@ -517,7 +517,7 @@ def test_build_package_reseparates_after_a_run_that_died_between_the_two_stems(
 
     The meta is cleared before a stage recomputes, so an interrupted run
     leaves nothing claiming to be cached."""
-    from stemlab.cache import file_digest
+    from bunri.cache import file_digest
 
     out_dir = tmp_path / "out"
     build_package(song_input, out_dir, title="song")

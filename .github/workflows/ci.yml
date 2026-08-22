@@ -12,7 +12,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # ffmpeg is required by stemlab's audio pipeline (mp3<->wav conversion,
+      # ffmpeg is required by bunri's audio pipeline (mp3<->wav conversion,
       # normalize step) -- without it, tests that exercise build_package()
       # (test_package.py) silently skip instead of actually running, and CI
       # would never catch a real regression there.
