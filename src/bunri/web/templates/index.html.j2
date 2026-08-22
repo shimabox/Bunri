@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>StemLab</title>
+<title>Bunri</title>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -186,7 +186,7 @@
 </head>
 <body>
 <header class="sw-header">
-  <h1 class="sw-title">StemLab</h1>
+  <h1 class="sw-title">Bunri</h1>
   <p class="sw-sub">音源からギター練習パッケージを作る</p>
 </header>
 
@@ -222,7 +222,7 @@
 </main>
 
 <footer class="sw-footer">
-  StemLab はローカル専用です(127.0.0.1 でのみ待ち受け)。
+  Bunri はローカル専用です(127.0.0.1 でのみ待ち受け)。
 </footer>
 
 <script>
@@ -438,7 +438,7 @@
   // read-only introspection so a headless test can assert on real state
   // (current job list, whether polling is active) instead of guessing from
   // timing.
-  window.__stemlabWeb = {
+  window.__bunriWeb = {
     getJobs: function () { return jobsCache; },
     isPolling: function () { return pollTimer !== null; },
     refresh: refreshJobs

@@ -26,8 +26,8 @@ import numpy as np
 import soundfile as sf
 from rich.console import Console
 
-from stemlab.registry import TargetSpec
-from stemlab.safepath import replace_into
+from bunri.registry import TargetSpec
+from bunri.safepath import replace_into
 
 console = Console()
 
@@ -46,9 +46,9 @@ console = Console()
 _STEM_LABEL_RE = re.compile(r"_\(([^)]+)\)")
 
 def _default_model_dir() -> Path:
-    """Where model weights live when STEMLAB_MODEL_DIR isn't set.
+    """Where model weights live when BUNRI_MODEL_DIR isn't set.
 
-    StemLab is distributed as a folder (clone + make setup), and the user's
+    Bunri is distributed as a folder (clone + make setup), and the user's
     requirement is that deleting the folder removes *everything* -- so when
     we can find the project root (the nearest ancestor with a pyproject.toml,
     which covers both the editable install and a venv living inside the
@@ -59,15 +59,15 @@ def _default_model_dir() -> Path:
     for parent in Path(__file__).resolve().parents:
         if (parent / "pyproject.toml").exists():
             return parent / "models"
-    return Path.home() / ".cache" / "stemlab" / "models"
+    return Path.home() / ".cache" / "bunri" / "models"
 
 
 # Kept outside work_dir and never cleared by this function: model weights are
 # hundreds of MB, and this directory is reused across inputs/out_dirs so they
-# are only ever downloaded once per machine. STEMLAB_MODEL_DIR lets Docker
+# are only ever downloaded once per machine. BUNRI_MODEL_DIR lets Docker
 # images and tests point this at a different location (e.g. a mounted named
 # volume, or a throwaway dir) without touching the project folder.
-_MODEL_DIR = Path(os.environ.get("STEMLAB_MODEL_DIR") or _default_model_dir())
+_MODEL_DIR = Path(os.environ.get("BUNRI_MODEL_DIR") or _default_model_dir())
 
 
 @dataclass(frozen=True)
@@ -452,7 +452,7 @@ def _write_backing_track(stem_paths: list[Path], dest: Path) -> None:
         total = total / peak
     # Renamed into place rather than written directly: soundfile follows a
     # symlink at `dest` like everything else does, and the backing track's
-    # name is derivable from the target. See stemlab/safepath.py.
+    # name is derivable from the target. See bunri/safepath.py.
     replace_into(dest, lambda tmp: sf.write(str(tmp), total, samplerate, subtype="PCM_16"))
 
 
