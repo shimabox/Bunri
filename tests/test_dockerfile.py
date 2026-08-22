@@ -77,7 +77,7 @@ def test_deps_and_cpu_runtime_stages_deliberately_omit_web_extra():
 # path are all things a copy-paste-driven rename could silently miss (the
 # cuda stage in particular duplicates cpu's ENV/ENTRYPOINT rather than
 # inheriting it -- see the stage comment above it), so pin them explicitly
-# rather than relying on `stemlab -i` staying clean forever.
+# rather than relying on `git grep -i stemlab` staying clean forever.
 
 
 def test_cpu_stage_entrypoint_is_bunri():
