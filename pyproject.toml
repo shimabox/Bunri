@@ -1,6 +1,6 @@
 [project]
-name = "stemlab"
-version = "0.1.0"
+name = "bunri"
+version = "0.2.0"
 description = "Instrument stem extraction and practice package generator for songs"
 readme = "README.md"
 authors = [
@@ -26,8 +26,8 @@ web = [
 ]
 
 [project.scripts]
-stemlab = "stemlab.cli:app"
-stemlab-web = "stemlab.web.cli:app"
+bunri = "bunri.cli:app"
+bunri-web = "bunri.web.cli:app"
 
 [build-system]
 requires = ["uv_build>=0.11.14,<0.12.0"]
