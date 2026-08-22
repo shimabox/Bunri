@@ -3,6 +3,8 @@ name = "bunri"
 version = "0.2.0"
 description = "Instrument stem extraction and practice package generator for songs"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "MODEL_LICENSES.md"]
 authors = [
     { name = "shimabox", email = "shimabox@gmail.com" }
 ]
