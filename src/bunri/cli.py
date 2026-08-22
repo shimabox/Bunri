@@ -61,7 +61,7 @@ def main(
     target = _validate_target(target)
     device = _validate_device(device)
 
-    console.print(f"[bold]bunri[/bold] v{__version__} — {title or input_file.stem}")
+    console.print(f"[bold]Bunri[/bold] v{__version__} — {title or input_file.stem}")
     try:
         package_dir = build_package(
             input_file.resolve(),
