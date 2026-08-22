@@ -1,6 +1,6 @@
 """Job store + worker for the Bunri web UI.
 
-Design (see .claude/plans/bunri-web-plan.md):
+Design (see .claude/plans/stemlab-web-plan.md):
 
 * Jobs are persisted as one JSON file per job under ``<out>/web/jobs/`` so
   they survive server restarts and browser closes/reopens. Writes go to a
