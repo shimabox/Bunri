@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import os
 import secrets
+import shutil
+import stat
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 
 class UnsafeOutputPath(OSError):
@@ -31,6 +34,100 @@ class UnsafeOutputPath(OSError):
     a missing or unreadable file, so a refusal degrades along a path that
     already exists instead of needing a new one.
     """
+
+
+@dataclass(frozen=True)
+class DeleteTarget:
+    """One literal path below an output directory and its expected type."""
+
+    relative: Path
+    kind: Literal["file", "directory"]
+
+
+def _literal_delete_path(base: Path, target: DeleteTarget) -> Path:
+    relative = target.relative
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise UnsafeOutputPath(f"unsafe deletion path: {relative}")
+    if any(part in ("", ".") for part in relative.parts):
+        raise UnsafeOutputPath(f"unsafe deletion path: {relative}")
+    return base.resolve().joinpath(*relative.parts)
+
+
+def _validate_tree(path: Path, *, final: bool = True) -> bool:
+    """Validate a deletion tree without following any symlink.
+
+    Returns False when the path is already absent. A symlink is permitted
+    only below a directory being recursively removed; the link itself will
+    be unlinked, never traversed.
+    """
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(mode):
+        if final:
+            raise UnsafeOutputPath(f"{path} is a symlink; refusing to delete it")
+        return True
+    if stat.S_ISDIR(mode):
+        try:
+            children = list(path.iterdir())
+        except OSError as exc:
+            raise UnsafeOutputPath(f"cannot inspect {path}: {exc}") from exc
+        for child in children:
+            _validate_tree(child, final=False)
+        return True
+    if stat.S_ISREG(mode):
+        return True
+    raise UnsafeOutputPath(f"{path} is not a regular file or directory")
+
+
+def _validate_delete_target(base: Path, target: DeleteTarget) -> tuple[Path, bool]:
+    path = _literal_delete_path(base, target)
+    current = base.resolve()
+    for part in target.relative.parts[:-1]:
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return path, False
+        if stat.S_ISLNK(mode):
+            raise UnsafeOutputPath(f"{current} is a symlink; refusing to delete through it")
+        if not stat.S_ISDIR(mode):
+            raise UnsafeOutputPath(f"{current} is not a directory")
+
+    exists = _validate_tree(path)
+    if not exists:
+        return path, False
+    mode = path.lstat().st_mode
+    expected = stat.S_ISREG(mode) if target.kind == "file" else stat.S_ISDIR(mode)
+    if not expected:
+        raise UnsafeOutputPath(f"{path} is not the expected {target.kind}")
+    return path, True
+
+
+def delete_output_targets(base: Path, targets: list[DeleteTarget]) -> None:
+    """Delete verified output paths in order, never following symlinks.
+
+    Every target is inspected before anything changes. Each target is then
+    inspected again immediately before removal so a changed final component
+    or parent is refused. Missing paths are successful no-ops.
+    """
+    resolved_base = base.resolve()
+    if not resolved_base.is_dir():
+        raise UnsafeOutputPath(f"{base} is not a directory")
+    for target in targets:
+        _validate_delete_target(base, target)
+    for target in targets:
+        path, exists = _validate_delete_target(base, target)
+        if not exists:
+            continue
+        if target.kind == "directory":
+            # rmtree uses its fd-based, symlink-attack-resistant walker on
+            # macOS and Linux. It unlinks internal links without traversing
+            # them and independently refuses a link at `path` itself.
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
 
 def real_subdir(base: Path, *parts: str) -> Path:
