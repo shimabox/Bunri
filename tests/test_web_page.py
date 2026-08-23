@@ -109,6 +109,19 @@ def _open_page(base_url: str):
             browser.close()
 
 
+def _upload_from_page(page, audio_path: Path, *, targets: tuple[str, ...] = ("guitar",)) -> None:
+    audio_path.write_bytes(b"fake-audio-bytes")
+    page.set_input_files("#sw-file-input", str(audio_path))
+    page.wait_for_selector("#sw-confirm:not([hidden])")
+    for value in ("guitar", "bass", "drums", "vocals", "piano"):
+        checkbox = page.locator(f'input[name="targets"][value="{value}"]')
+        if value in targets:
+            checkbox.check()
+        else:
+            checkbox.uncheck()
+    page.click("#sw-upload-btn")
+
+
 @_needs_browser
 def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
     runner = PageFakeRunner()
@@ -374,3 +387,119 @@ def test_polling_recovers_after_a_failed_fetch(tmp_path):
             timeout=15_000,
         )
         assert state["failed"], "the test never actually exercised a failed fetch"
+
+
+@_needs_browser
+def test_active_song_delete_button_is_disabled(tmp_path):
+    runner = PageFakeRunner(delay=4.0)
+    app = create_app(tmp_path / "out", runner=runner)
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        _upload_from_page(page, tmp_path / "active.mp3")
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs().some(function (j) { return j.status === 'running'; })",
+            timeout=5_000,
+        )
+        button = page.locator("button.sw-delete-song-btn")
+        assert button.is_visible()
+        assert button.is_disabled()
+
+
+@_needs_browser
+def test_delete_dialog_content_and_cancel_restore_focus_after_redraw(tmp_path):
+    app = create_app(tmp_path / "out", runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        _upload_from_page(page, tmp_path / "Band Practice.mp3", targets=("guitar", "vocals"))
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs().length === 2 && "
+            "window.__bunriWeb.getJobs().every(function (j) { return j.status === 'done'; })",
+            timeout=10_000,
+        )
+        delete_button = page.locator("button.sw-delete-song-btn")
+        assert delete_button.evaluate(
+            "button => button.closest('.sw-job-content').lastElementChild.contains(button)"
+        )
+        delete_button.click()
+        dialog = page.locator("#sw-delete-dialog")
+        assert dialog.evaluate("dialog => dialog.open")
+        assert page.locator("#sw-delete-song-name").text_content() == "Band Practice"
+        assert page.locator("#sw-delete-targets").text_content() == "2楽器: ギター、ボーカル"
+        summary = page.locator(".sw-delete-summary").text_content()
+        assert "練習パッケージ" in summary
+        assert "全ジョブ履歴とログ" in summary
+        assert "共有していないアップロード元とキャッシュ" in summary
+        assert "web/uploads" not in dialog.text_content()
+
+        # Rebuild the card while the modal is open; cancel must find the new
+        # button for the same song instead of retaining a stale DOM node.
+        page.evaluate("window.__bunriWeb.refresh()")
+        page.wait_for_timeout(100)
+        page.click("#sw-delete-cancel")
+        assert not dialog.evaluate("dialog => dialog.open")
+        assert page.locator("li.sw-job").count() == 1
+        assert page.locator("button.sw-delete-song-btn").evaluate(
+            "button => document.activeElement === button"
+        )
+
+
+@_needs_browser
+def test_delete_dialog_prevents_duplicate_submit_and_recovers_from_api_error(tmp_path):
+    app = create_app(tmp_path / "out", runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        _upload_from_page(page, tmp_path / "retry.mp3")
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs()[0] && window.__bunriWeb.getJobs()[0].status === 'done'",
+            timeout=10_000,
+        )
+        page.click("button.sw-delete-song-btn")
+        page.evaluate(
+            "window.__realFetch = window.fetch; window.__deleteFetchCount = 0; "
+            "window.fetch = function (url, options) { "
+            "  if (options && options.method === 'DELETE') { "
+            "    window.__deleteFetchCount += 1; "
+            "    return new Promise(function (resolve) { window.__resolveDelete = resolve; }); "
+            "  } "
+            "  return window.__realFetch(url, options); "
+            "};"
+        )
+        page.evaluate(
+            "document.getElementById('sw-delete-confirm').click(); "
+            "document.getElementById('sw-delete-confirm').click();"
+        )
+        assert page.evaluate("window.__deleteFetchCount") == 1
+        assert page.locator("#sw-delete-confirm").text_content() == "削除中…"
+        assert page.locator("#sw-delete-confirm").is_disabled()
+        assert page.locator("#sw-delete-cancel").is_disabled()
+        page.keyboard.press("Escape")
+        assert page.locator("#sw-delete-dialog").evaluate("dialog => dialog.open")
+
+        page.evaluate(
+            "window.__resolveDelete({ok: false, status: 500, "
+            "json: function () { return Promise.resolve({detail: '削除できませんでした'}); }});"
+        )
+        page.wait_for_function(
+            "document.getElementById('sw-delete-error').textContent === '削除できませんでした'"
+        )
+        assert page.locator("#sw-delete-confirm").is_enabled()
+        assert page.locator("#sw-delete-cancel").is_enabled()
+        assert page.locator("#sw-delete-confirm").text_content() == "削除する"
+        assert page.locator("li.sw-job").count() == 1
+
+
+@_needs_browser
+def test_successful_delete_closes_dialog_updates_empty_state_and_focus(tmp_path):
+    app = create_app(tmp_path / "out", runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        _upload_from_page(page, tmp_path / "gone.mp3")
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs()[0] && window.__bunriWeb.getJobs()[0].status === 'done'",
+            timeout=10_000,
+        )
+        page.click("button.sw-delete-song-btn")
+        page.click("#sw-delete-confirm")
+        page.wait_for_function("window.__bunriWeb.getSongs().length === 0", timeout=10_000)
+        assert not page.locator("#sw-delete-dialog").evaluate("dialog => dialog.open")
+        assert page.locator("li.sw-job").count() == 0
+        assert page.locator("#sw-empty").is_visible()
+        assert page.locator("#sw-songs-heading").evaluate(
+            "heading => document.activeElement === heading"
+        )

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -222,6 +223,80 @@ def test_songs_group_digest_and_use_latest_jobs_in_target_order(tmp_path):
 def test_unknown_job_id_is_404(client):
     res = client.get("/api/jobs/j-does-not-exist")
     assert res.status_code == 404
+
+
+def test_delete_song_returns_204_and_removes_it_from_both_lists(client):
+    created = _upload(client, title="Delete me")
+    job_id = created.json()["job_id"]
+    _wait_until(lambda: _job_status(client, job_id) == "done")
+    song_id = client.get("/api/songs").json()[0]["id"]
+
+    deleted = client.delete(f"/api/songs/{song_id}")
+
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+    assert client.get("/api/songs").json() == []
+    assert client.get("/api/jobs").json() == []
+    assert client.delete(f"/api/songs/{song_id}").status_code == 404
+
+
+def test_delete_unknown_song_is_404(client):
+    assert client.delete("/api/songs/not-a-song").status_code == 404
+
+
+def test_delete_active_song_is_409_without_side_effects(tmp_path):
+    hold = threading.Event()
+    release = threading.Event()
+
+    class HoldingRunner(ApiFakeRunner):
+        def __call__(self, *args, **kwargs):
+            hold.set()
+            release.wait(timeout=5)
+            return super().__call__(*args, **kwargs)
+
+    app = create_app(tmp_path, runner=HoldingRunner())
+    with TestClient(app) as c:
+        created = _upload(c, title="Active")
+        job_id = created.json()["job_id"]
+        assert hold.wait(timeout=5)
+        song_id = c.get("/api/songs").json()[0]["id"]
+        response = c.delete(f"/api/songs/{song_id}")
+        assert response.status_code == 409
+        assert c.get(f"/api/jobs/{job_id}").status_code == 200
+        release.set()
+
+
+def test_delete_shared_package_is_409_without_side_effects(tmp_path):
+    shared = "Shared/Shared.guitar.player.html"
+    _write_job_file(tmp_path, "j-one", digest="one", title="One", package=shared)
+    _write_job_file(tmp_path, "j-two", digest="two", title="Two", package=shared)
+    (tmp_path / "Shared").mkdir()
+    marker = tmp_path / "Shared/marker"
+    marker.write_text("keep", encoding="utf-8")
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        song = next(song for song in c.get("/api/songs").json() if song["title"] == "One")
+        response = c.delete(f"/api/songs/{song['id']}")
+        assert response.status_code == 409
+        assert len(c.get("/api/jobs").json()) == 2
+    assert marker.exists()
+
+
+def test_delete_path_refusal_is_500_and_keeps_job(client):
+    created = _upload(client, title="Unsafe")
+    job_id = created.json()["job_id"]
+    _wait_until(lambda: _job_status(client, job_id) == "done")
+    package = client.out_dir / "Unsafe"  # type: ignore[attr-defined]
+    outside = client.out_dir / "outside"  # type: ignore[attr-defined]
+    package.rename(outside)
+    package.symlink_to(outside, target_is_directory=True)
+    song_id = client.get("/api/songs").json()[0]["id"]
+
+    response = client.delete(f"/api/songs/{song_id}")
+
+    assert response.status_code == 500
+    assert client.get(f"/api/jobs/{job_id}").status_code == 200
+    assert (outside / "Unsafe.guitar.player.html").exists()
 
 
 def test_job_list_is_newest_first(client):
@@ -498,6 +573,32 @@ def _post_job(client, *, origin: str | None):
         files={"file": ("song.mp3", io.BytesIO(b"abc"), "audio/mpeg")},
         headers=headers,
     )
+
+
+def _completed_song_id(client) -> str:
+    created = _upload(client, content=b"delete-origin-test", title="Origin")
+    _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+    return client.get("/api/songs").json()[0]["id"]
+
+
+@pytest.mark.parametrize("origin", [None, "http://testserver"])
+def test_delete_allows_missing_or_same_origin(client, origin):
+    song_id = _completed_song_id(client)
+    headers = {"origin": origin} if origin is not None else {}
+    assert client.delete(f"/api/songs/{song_id}", headers=headers).status_code == 204
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["http://evil.example.com", "http://testserver:9999", "http://testserver:not-a-port"],
+)
+def test_delete_rejects_bad_origins_without_side_effects(client, origin):
+    song_id = _completed_song_id(client)
+    before_jobs = client.get("/api/jobs").json()
+    response = client.delete(f"/api/songs/{song_id}", headers={"origin": origin})
+    assert response.status_code == 403
+    assert client.get("/api/jobs").json() == before_jobs
+    assert client.get("/api/songs").json()[0]["id"] == song_id
 
 
 def test_same_origin_post_is_allowed(client):

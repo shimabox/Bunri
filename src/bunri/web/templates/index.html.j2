@@ -235,6 +235,56 @@
     margin: 8px 0 0;
     font-size: 0.75rem;
   }
+  .sw-delete-area {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid #f1e8da;
+  }
+  button.sw-delete-song-btn {
+    color: #a63d31;
+    border-color: #e8b8af;
+    background: #fffafa;
+  }
+  button.sw-delete-song-btn:hover:not(:disabled) {
+    color: #8f2e24;
+    border-color: #c9502f;
+    background: #fbe9e6;
+  }
+  dialog.sw-delete-dialog {
+    width: min(480px, calc(100% - 32px));
+    border: 1px solid #e8b8af;
+    border-radius: 18px;
+    padding: 0;
+    color: #3a322c;
+    background: #fffdfa;
+    box-shadow: 0 20px 60px rgba(85, 44, 32, 0.24);
+  }
+  dialog.sw-delete-dialog::backdrop { background: rgba(58, 50, 44, 0.38); }
+  .sw-delete-dialog-inner { padding: 22px; }
+  .sw-delete-dialog h2 { margin: 0 0 8px; font-size: 1.15rem; }
+  .sw-delete-song-name { margin: 0 0 4px; font-weight: 700; word-break: break-word; }
+  .sw-delete-targets { margin: 0 0 16px; color: #6f665c; font-size: 0.85rem; }
+  .sw-delete-summary {
+    margin: 0;
+    padding: 14px 16px 14px 34px;
+    border-left: 4px solid #c9502f;
+    background: #fbe9e6;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    line-height: 1.65;
+  }
+  .sw-delete-warning { margin: 14px 0; color: #8f2e24; font-size: 0.85rem; font-weight: 700; }
+  .sw-delete-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  button.sw-btn-danger {
+    background: #a63d31;
+    border-color: #a63d31;
+    color: #fff;
+    font-weight: 700;
+  }
+  button.sw-btn-danger:hover:not(:disabled) { background: #8f2e24; border-color: #8f2e24; }
+  .sw-delete-error { min-height: 1.3em; margin: 12px 0 0; color: #c0392b; font-size: 0.82rem; }
   p.sw-empty { color: #b3a99c; font-size: 0.85rem; }
 
   footer.sw-footer {
@@ -285,11 +335,30 @@
   </section>
 
   <section class="sw-section">
-    <h2 class="sw-h2">曲一覧</h2>
+    <h2 id="sw-songs-heading" class="sw-h2" tabindex="-1">曲一覧</h2>
     <p id="sw-empty" class="sw-empty">まだ曲はありません。</p>
     <ul id="sw-job-list" class="sw-job-list"></ul>
   </section>
 </main>
+
+<dialog id="sw-delete-dialog" class="sw-delete-dialog" aria-labelledby="sw-delete-dialog-title">
+  <div class="sw-delete-dialog-inner">
+    <h2 id="sw-delete-dialog-title">この曲を削除しますか？</h2>
+    <p id="sw-delete-song-name" class="sw-delete-song-name"></p>
+    <p id="sw-delete-targets" class="sw-delete-targets"></p>
+    <ul class="sw-delete-summary">
+      <li>練習パッケージ</li>
+      <li>この曲の全ジョブ履歴とログ</li>
+      <li>ほかの曲と共有していないアップロード元とキャッシュ</li>
+    </ul>
+    <p class="sw-delete-warning">この操作は取り消せません。</p>
+    <div class="sw-delete-actions">
+      <button type="button" id="sw-delete-cancel" class="sw-btn">キャンセル</button>
+      <button type="button" id="sw-delete-confirm" class="sw-btn sw-btn-danger">削除する</button>
+    </div>
+    <p id="sw-delete-error" class="sw-delete-error" role="alert"></p>
+  </div>
+</dialog>
 
 <footer class="sw-footer">
   Bunri はローカル専用です(127.0.0.1 でのみ待ち受け)。
@@ -316,11 +385,20 @@
   );
   var jobListEl = document.getElementById("sw-job-list");
   var emptyMsg = document.getElementById("sw-empty");
+  var songsHeading = document.getElementById("sw-songs-heading");
+  var deleteDialog = document.getElementById("sw-delete-dialog");
+  var deleteSongName = document.getElementById("sw-delete-song-name");
+  var deleteTargets = document.getElementById("sw-delete-targets");
+  var deleteCancel = document.getElementById("sw-delete-cancel");
+  var deleteConfirm = document.getElementById("sw-delete-confirm");
+  var deleteError = document.getElementById("sw-delete-error");
 
   var pendingFile = null;
   var pollTimer = null;
   var songsCache = [];
   var songExpandedStates = Object.create(null);
+  var deleteDialogSong = null;
+  var deleteSubmitting = false;
 
   function stem(name) {
     var idx = name.lastIndexOf(".");
@@ -455,6 +533,76 @@
     return songExpandedStates[song.id];
   }
 
+  function deleteButtonFor(songId) {
+    var cards = jobListEl.querySelectorAll("li.sw-job");
+    for (var i = 0; i < cards.length; i += 1) {
+      if (cards[i].dataset.songId === songId) {
+        return cards[i].querySelector("button.sw-delete-song-btn");
+      }
+    }
+    return null;
+  }
+
+  function openDeleteDialog(song) {
+    if (deleteSubmitting) return;
+    deleteDialogSong = song;
+    deleteSongName.textContent = song.title;
+    var labels = song.targets.map(function (job) { return job.target_label; });
+    deleteTargets.textContent = labels.length + "楽器: " + labels.join("、");
+    deleteError.textContent = "";
+    deleteCancel.disabled = false;
+    deleteConfirm.disabled = false;
+    deleteConfirm.textContent = "削除する";
+    deleteDialog.showModal();
+  }
+
+  function closeDeleteDialog(restoreFocus) {
+    var songId = deleteDialogSong && deleteDialogSong.id;
+    deleteDialog.close();
+    deleteDialogSong = null;
+    if (restoreFocus && songId) {
+      var button = deleteButtonFor(songId);
+      if (button) button.focus({ preventScroll: true });
+    }
+  }
+
+  deleteCancel.addEventListener("click", function () {
+    if (!deleteSubmitting) closeDeleteDialog(true);
+  });
+  deleteDialog.addEventListener("cancel", function (event) {
+    event.preventDefault();
+    if (!deleteSubmitting) closeDeleteDialog(true);
+  });
+  deleteConfirm.addEventListener("click", function () {
+    if (deleteSubmitting || !deleteDialogSong) return;
+    var song = deleteDialogSong;
+    deleteSubmitting = true;
+    deleteCancel.disabled = true;
+    deleteConfirm.disabled = true;
+    deleteConfirm.textContent = "削除中…";
+    deleteError.textContent = "";
+    fetch(API_SONGS + "/" + encodeURIComponent(song.id), { method: "DELETE" })
+      .then(function (res) {
+        if (!res.ok) {
+          return res.json().catch(function () { return {}; }).then(function (body) {
+            throw new Error(body.detail || ("削除に失敗しました (" + res.status + ")"));
+          });
+        }
+        deleteDialog.close();
+        deleteDialogSong = null;
+        delete songExpandedStates[song.id];
+        return refreshSongs().then(function () { songsHeading.focus(); });
+      })
+      .catch(function (err) {
+        deleteSubmitting = false;
+        deleteError.textContent = err.message || "削除に失敗しました";
+        deleteCancel.disabled = false;
+        deleteConfirm.disabled = false;
+        deleteConfirm.textContent = "削除する";
+      })
+      .finally(function () { deleteSubmitting = false; });
+  });
+
   function renderSongs(songs) {
     var focusedSongId = null;
     var activeElement = document.activeElement;
@@ -557,6 +705,20 @@
           content.appendChild(details);
         }
       });
+
+      var deleteArea = document.createElement("div");
+      deleteArea.className = "sw-delete-area";
+      var deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "sw-btn sw-delete-song-btn";
+      deleteButton.textContent = "この曲を削除";
+      deleteButton.disabled = songHasActiveJobs(song);
+      if (deleteButton.disabled) {
+        deleteButton.title = "待機中または処理中のジョブがある曲は削除できません";
+      }
+      deleteButton.addEventListener("click", function () { openDeleteDialog(song); });
+      deleteArea.appendChild(deleteButton);
+      content.appendChild(deleteArea);
 
       li.appendChild(content);
 
