@@ -227,6 +227,51 @@ def test_song_toggle_survives_polling_redraw(tmp_path):
 
 
 @_needs_browser
+def test_song_toggle_focus_survives_polling_redraw(tmp_path):
+    runner = PageFakeRunner(delay=4.0)
+    app = create_app(tmp_path / "out", runner=runner)
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        audio_path = tmp_path / "focus-song.mp3"
+        audio_path.write_bytes(b"fake-audio-bytes")
+        page.set_input_files("#sw-file-input", str(audio_path))
+        page.wait_for_selector("#sw-confirm:not([hidden])")
+        page.click("#sw-upload-btn")
+        page.wait_for_function("window.__bunriWeb.getJobs().length === 1")
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs()[0].status === 'running'",
+            timeout=5_000,
+        )
+
+        toggle = page.locator("button.sw-job-toggle")
+        song_id = page.locator("li.sw-job").get_attribute("data-song-id")
+        toggle.focus()
+        assert toggle.evaluate("button => document.activeElement === button")
+
+        page.evaluate(
+            "window.__focusedToggleBeforePoll = "
+            "document.querySelector('button.sw-job-toggle')"
+        )
+        page.wait_for_function(
+            "window.__focusedToggleBeforePoll && "
+            "!window.__focusedToggleBeforePoll.isConnected",
+            timeout=6_000,
+        )
+        assert page.evaluate(
+            "songId => {"
+            "  const active = document.activeElement;"
+            "  const card = active && active.closest('li.sw-job');"
+            "  return active && active.matches('button.sw-job-toggle') && "
+            "    card && card.dataset.songId === songId;"
+            "}",
+            song_id,
+        )
+
+        before = toggle.get_attribute("aria-expanded")
+        page.keyboard.press("Enter")
+        assert toggle.get_attribute("aria-expanded") != before
+
+
+@_needs_browser
 def test_dragover_highlights_dropzone(tmp_path):
     app = create_app(tmp_path / "out", runner=PageFakeRunner())
     with _running_server(app) as base_url, _open_page(base_url) as page:

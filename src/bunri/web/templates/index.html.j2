@@ -456,6 +456,15 @@
   }
 
   function renderSongs(songs) {
+    var focusedSongId = null;
+    var activeElement = document.activeElement;
+    if (activeElement && activeElement.matches("button.sw-job-toggle")) {
+      var focusedCard = activeElement.closest("li.sw-job");
+      if (focusedCard && jobListEl.contains(focusedCard)) {
+        focusedSongId = focusedCard.dataset.songId;
+      }
+    }
+
     songsCache = songs;
     jobListEl.innerHTML = "";
     emptyMsg.hidden = songs.length !== 0;
@@ -553,6 +562,16 @@
 
       jobListEl.appendChild(li);
     });
+
+    if (focusedSongId !== null) {
+      var replacementCard = Array.prototype.find.call(
+        jobListEl.querySelectorAll("li.sw-job"),
+        function (card) { return card.dataset.songId === focusedSongId; }
+      );
+      if (replacementCard) {
+        replacementCard.querySelector("button.sw-job-toggle").focus({ preventScroll: true });
+      }
+    }
   }
 
   function hasActiveJobs(songs) {
