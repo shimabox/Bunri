@@ -48,7 +48,9 @@ from typing import Any, Callable, Optional
 from bunri.registry import REGISTRY
 
 from bunri.safepath import (
+    DeleteTarget,
     UnsafeOutputPath,
+    delete_output_targets,
     is_really as _is_really,
     real_subdir as _real_subdir,
     replace_into as _replace_into,
@@ -99,6 +101,15 @@ MAX_TITLE_CHARS = 200
 # Same rule as bunri.package._safe_filename -- see module docstring for why
 # this is duplicated rather than imported.
 _UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|#%]')
+_SHA1_DIGEST = re.compile(r"[0-9a-f]{40}")
+
+
+class SongNotFoundError(LookupError):
+    """No loaded job belongs to the requested song."""
+
+
+class SongDeleteConflict(RuntimeError):
+    """Deleting a song would affect active or shared data."""
 
 
 def safe_filename(title: str) -> str:
@@ -1400,6 +1411,84 @@ class JobStore:
             if j.status in ("queued", "running"):
                 return j
         return None
+
+    def delete_song(self, requested_song_id: str) -> None:
+        """Delete every loaded job and owned artifact for one song.
+
+        Selection, conflict checks, filesystem changes, and the final
+        in-memory removal share the worker's lock. Job records are removed
+        last so a failed partial deletion remains visible and retryable.
+        """
+        with self._lock:
+            targets = [
+                job for job in self._jobs.values()
+                if song_id(job.digest) == requested_song_id
+            ]
+            if not targets:
+                raise SongNotFoundError(requested_song_id)
+            if any(job.status in ("queued", "running") for job in targets):
+                raise SongDeleteConflict("song has queued or running jobs")
+
+            target_ids = {job.id for job in targets}
+            remaining = [job for job in self._jobs.values() if job.id not in target_ids]
+            for job in self._jobs.values():
+                problem = _validate_job_record(job.to_dict(), job.id)
+                if problem is not None:
+                    raise UnsafeOutputPath(f"job {job.id} is unsafe to delete: {problem}")
+
+            def referenced_package_dir(job: Job) -> Path:
+                if job.package is not None:
+                    return Path(job.package).parent
+                return Path(safe_filename(job.title))
+
+            package_dirs = {
+                Path(job.package).parent
+                for job in targets
+                if job.package is not None
+            }
+            remaining_package_keys = {
+                referenced_package_dir(job).name.casefold() for job in remaining
+            }
+            if any(path.name.casefold() in remaining_package_keys for path in package_dirs):
+                raise SongDeleteConflict("a package directory is shared by another song")
+
+            remaining_uploads = {
+                Path(job.upload) for job in remaining if job.upload is not None
+            }
+            uploads = {
+                Path(job.upload) for job in targets
+                if job.upload is not None and Path(job.upload) not in remaining_uploads
+            }
+
+            cache_dirs: set[Path] = set()
+            for digest in {job.digest for job in targets}:
+                if _SHA1_DIGEST.fullmatch(digest) is None:
+                    continue
+                prefix = digest[:12]
+                if any(
+                    _SHA1_DIGEST.fullmatch(job.digest) is not None
+                    and job.digest[:12] == prefix
+                    for job in remaining
+                ):
+                    continue
+                cache_dirs.add(Path(".cache") / prefix)
+
+            candidates: list[DeleteTarget] = []
+            candidates.extend(DeleteTarget(path, "directory") for path in sorted(package_dirs))
+            for job in sorted(targets, key=lambda item: item.id):
+                log = Path(_log_relpath(job.id))
+                candidates.append(DeleteTarget(log, "file"))
+                candidates.append(DeleteTarget(log.with_suffix(".pid"), "file"))
+            candidates.extend(DeleteTarget(path, "file") for path in sorted(uploads))
+            candidates.extend(DeleteTarget(path, "directory") for path in sorted(cache_dirs))
+            candidates.extend(
+                DeleteTarget(Path("web") / "jobs" / f"{job.id}.json", "file")
+                for job in sorted(targets, key=lambda item: item.id)
+            )
+
+            delete_output_targets(self.out_dir, candidates)
+            for job_id in target_ids:
+                del self._jobs[job_id]
 
     # -- title / folder collision handling -------------------------------
     def _resolve_title(self, requested_title: str, digest: str) -> str:

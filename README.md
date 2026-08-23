@@ -2,9 +2,9 @@
 
 Bunri (分離, "separation") extracts a single instrument stem (guitar by default; bass, drums, vocals, piano also supported) from a song and builds a practice package: the instrument alone, the backing track without it, the original, and an offline HTML player with A-B loop and pitch-preserving slow-down. Audio processing runs locally on your machine; your audio is never uploaded. Documentation is in Japanese.
 
-| メイン | 練習プレイヤー |
-|---|---|
-| ![曲一覧](docs/images/web-ui.png) | ![練習プレイヤー](docs/images/player.png) |
+| アップロード | 曲一覧 | 練習プレイヤー |
+|---|---|---|
+| ![アップロード](docs/images/upload.png) | ![曲一覧](docs/images/web-ui.png) | ![練習プレイヤー](docs/images/player.png) |
 
 音源から特定の楽器パート(まずはギター)の stem を抽出し、練習用パッケージ(その楽器だけ / その楽器を抜いた伴奏 / 原曲 + オフラインで再生できる HTML プレイヤー)を生成するツールです。処理はすべてお使いのマシン内で完結し、音源が外部に送信されることはありません。
 
@@ -81,6 +81,7 @@ uv run bunri-web
 - 音源をドロップ(またはクリックして選択)すると曲名確認欄が出るので、必要なら曲名を編集し、ギター / ベース / ドラム / ボーカル / ピアノから分離する楽器を複数選んでアップロードします。選択した楽器はサーバー側で1件ずつ順番に処理され、ブラウザを閉じてもジョブは継続します
 - 曲一覧には1曲ごとに楽器別の「待機中 / 処理中(経過時間)/ 完了 / 失敗」が表示され、完了した楽器にはそれぞれの「プレイヤーを開く」リンクが表示されます(次回アクセス時もこの一覧・リンクは残ります)
 - 同じ音源(内容が同一)と同じ楽器の組み合わせを再アップロードしても再分離はされず、既存の結果が再利用されます
+- 曲を開いて「この曲を削除」を選ぶと、その曲の練習パッケージ、全ジョブ履歴とログ、ほかの曲と共有していないアップロード元とキャッシュをまとめて削除できます。待機中または処理中のジョブを含む曲は削除できません。削除は取り消せないため、確認画面の内容を確認してから実行してください
 
 ### 主なオプション
 

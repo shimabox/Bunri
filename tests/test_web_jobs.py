@@ -19,7 +19,8 @@ from typing import Any
 
 import pytest
 
-from bunri.web.jobs import Job, JobStore, safe_filename
+from bunri.safepath import UnsafeOutputPath
+from bunri.web.jobs import Job, JobStore, SongDeleteConflict, safe_filename, song_id
 
 
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> None:
@@ -339,6 +340,245 @@ def _write_job_file(out_dir: Path, job: Job) -> None:
     jobs_dir = out_dir / "web" / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
     (jobs_dir / f"{job.id}.json").write_text(json.dumps(job.to_dict()), encoding="utf-8")
+
+
+def _write_terminal_job(
+    out_dir: Path,
+    job_id: str,
+    digest: str,
+    title: str,
+    *,
+    target: str = "guitar",
+    status: str = "done",
+    package_dir: str | None = None,
+    upload: str = "web/uploads/song.mp3",
+) -> Job:
+    package = None
+    if status == "done":
+        folder = package_dir or safe_filename(title)
+        package = f"{folder}/{folder}.{target}.player.html"
+    job = Job(
+        id=job_id,
+        digest=digest,
+        title=title,
+        target=target,
+        status=status,
+        created_at=f"2026-01-01T00:00:{len(job_id) % 60:02d}+00:00",
+        finished_at="2026-01-01T00:01:00+00:00",
+        error="failed" if status == "error" else None,
+        package=package,
+        log=f"web/logs/{job_id}.log",
+        upload=upload,
+    )
+    _write_job_file(out_dir, job)
+    return job
+
+
+def test_delete_song_removes_all_history_legacy_packages_and_owned_artifacts(tmp_path):
+    digest = "a" * 40
+    first = _write_terminal_job(tmp_path, "j-delete-1", digest, "Old", package_dir="Legacy")
+    second = _write_terminal_job(
+        tmp_path, "j-delete-2", digest, "New", target="vocals", package_dir="Current"
+    )
+    third = _write_terminal_job(tmp_path, "j-delete-3", digest, "New", status="error")
+    for folder in ("Legacy", "Current", "New"):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / "artifact.txt").write_text("owned", encoding="utf-8")
+    external = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    external.write_text("keep", encoding="utf-8")
+    (tmp_path / "Current" / "external-link").symlink_to(external)
+    for job in (first, second, third):
+        log = tmp_path / job.log
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("log", encoding="utf-8")
+        log.with_suffix(".pid").write_text("pid", encoding="utf-8")
+    upload = tmp_path / "web/uploads/song.mp3"
+    upload.parent.mkdir(parents=True, exist_ok=True)
+    upload.write_bytes(b"source")
+    orphan_upload = upload.with_name("orphan.mp3")
+    orphan_upload.write_bytes(b"unowned")
+    cache = tmp_path / ".cache" / digest[:12]
+    cache.mkdir(parents=True)
+    (cache / "stem.wav").write_bytes(b"cache")
+    bad = tmp_path / "web/jobs/j-old.json.bad-kept"
+    bad.write_text("bad", encoding="utf-8")
+    cli_output = tmp_path / "CliOnly"
+    cli_output.mkdir()
+    (cli_output / "player.html").write_text("keep", encoding="utf-8")
+
+    store = JobStore(tmp_path, runner=FakeRunner())
+    store.delete_song(song_id(digest))
+
+    assert store.list_jobs() == []
+    assert not any((tmp_path / folder).exists() for folder in ("Legacy", "Current"))
+    assert (tmp_path / "New" / "artifact.txt").read_text(encoding="utf-8") == "owned"
+    assert not upload.exists()
+    assert orphan_upload.read_bytes() == b"unowned"
+    assert not cache.exists()
+    assert not list((tmp_path / "web/jobs").glob("*.json"))
+    assert bad.read_text(encoding="utf-8") == "bad"
+    assert external.read_text(encoding="utf-8") == "keep"
+    assert (cli_output / "player.html").read_text(encoding="utf-8") == "keep"
+
+
+def test_delete_song_without_package_preserves_same_title_cli_output(tmp_path):
+    digest = "8" * 40
+    job = _write_terminal_job(
+        tmp_path, "j-failed", digest, "Same Name", status="error"
+    )
+    cli_output = tmp_path / "Same Name"
+    cli_output.mkdir()
+    marker = cli_output / "cli-output.txt"
+    marker.write_text("keep", encoding="utf-8")
+    log = tmp_path / job.log
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("failed", encoding="utf-8")
+    record = tmp_path / "web/jobs/j-failed.json"
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    store.delete_song(song_id(digest))
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert not log.exists()
+    assert not record.exists()
+    assert store.get_job(job.id) is None
+
+
+@pytest.mark.parametrize("status", ["queued", "running"])
+def test_delete_song_rejects_active_history_without_changes(tmp_path, status):
+    digest = "b" * 40
+    job = _write_terminal_job(tmp_path, "j-active", digest, "Active")
+    record = tmp_path / "web/jobs/j-active.json"
+    store = JobStore(tmp_path, runner=FakeRunner())
+    store.get_job(job.id).status = status
+    before = record.read_bytes()
+    with pytest.raises(SongDeleteConflict):
+        store.delete_song(song_id(digest))
+    assert store.get_job(job.id).status == status
+    assert record.read_bytes() == before
+
+
+def test_delete_song_preserves_shared_upload_and_cache_prefix(tmp_path):
+    digest = "123456789abc" + "0" * 28
+    other_digest = "123456789abc" + "f" * 28
+    _write_terminal_job(tmp_path, "j-delete", digest, "Delete")
+    _write_terminal_job(tmp_path, "j-keep", other_digest, "Keep")
+    for folder in ("Delete", "Keep"):
+        (tmp_path / folder).mkdir()
+    upload = tmp_path / "web/uploads/song.mp3"
+    upload.parent.mkdir(parents=True, exist_ok=True)
+    upload.write_bytes(b"shared")
+    cache = tmp_path / ".cache" / digest[:12]
+    cache.mkdir(parents=True)
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    store.delete_song(song_id(digest))
+
+    assert upload.exists()
+    assert cache.exists()
+    assert store.get_job("j-keep") is not None
+
+
+def test_delete_song_does_not_infer_cache_for_legacy_digest(tmp_path):
+    digest = "legacy-digest"
+    _write_terminal_job(tmp_path, "j-legacy", digest, "Legacy")
+    (tmp_path / "Legacy").mkdir()
+    guessed = tmp_path / ".cache" / digest[:12]
+    guessed.mkdir(parents=True)
+    store = JobStore(tmp_path, runner=FakeRunner())
+    store.delete_song(song_id(digest))
+    assert guessed.exists()
+
+
+def test_delete_song_rejects_package_shared_with_another_song(tmp_path):
+    digest = "c" * 40
+    _write_terminal_job(tmp_path, "j-delete", digest, "Same", package_dir="Shared")
+    _write_terminal_job(tmp_path, "j-keep", "d" * 40, "Other", package_dir="Shared")
+    shared = tmp_path / "Shared"
+    shared.mkdir()
+    marker = shared / "marker"
+    marker.write_text("keep", encoding="utf-8")
+    store = JobStore(tmp_path, runner=FakeRunner())
+    with pytest.raises(SongDeleteConflict):
+        store.delete_song(song_id(digest))
+    assert marker.exists()
+    assert len(store.list_jobs()) == 2
+
+
+def test_delete_song_rejects_final_and_fixed_parent_symlinks(tmp_path):
+    digest = "e" * 40
+    _write_terminal_job(tmp_path, "j-delete", digest, "Song")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    outside_marker = outside / "marker"
+    outside_marker.write_text("keep", encoding="utf-8")
+    (tmp_path / "Song").symlink_to(outside, target_is_directory=True)
+    store = JobStore(tmp_path, runner=FakeRunner())
+    with pytest.raises(UnsafeOutputPath):
+        store.delete_song(song_id(digest))
+    assert outside_marker.exists()
+    assert store.get_job("j-delete") is not None
+
+    (tmp_path / "Song").unlink()
+    (tmp_path / "Song").mkdir()
+    jobs = tmp_path / "web/jobs"
+    saved_jobs = tmp_path / "saved-jobs"
+    jobs.rename(saved_jobs)
+    jobs.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(UnsafeOutputPath):
+        store.delete_song(song_id(digest))
+    assert outside_marker.exists()
+    assert (saved_jobs / "j-delete.json").exists()
+
+
+def test_delete_song_rejects_non_regular_candidate_before_any_deletion(tmp_path):
+    digest = "9" * 40
+    _write_terminal_job(tmp_path, "j-fifo", digest, "Song")
+    package = tmp_path / "Song"
+    package.mkdir()
+    log = tmp_path / "web/logs/j-fifo.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(log)
+    record = tmp_path / "web/jobs/j-fifo.json"
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    with pytest.raises(UnsafeOutputPath):
+        store.delete_song(song_id(digest))
+
+    assert package.exists()
+    assert record.exists()
+    assert store.get_job("j-fifo") is not None
+
+
+def test_delete_song_allows_missing_files_and_keeps_json_on_io_failure(tmp_path, monkeypatch):
+    digest = "f" * 40
+    _write_terminal_job(tmp_path, "j-delete", digest, "Song")
+    package = tmp_path / "Song"
+    package.mkdir()
+    log = tmp_path / "web/logs/j-delete.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("log", encoding="utf-8")
+    record = tmp_path / "web/jobs/j-delete.json"
+    store = JobStore(tmp_path, runner=FakeRunner())
+    original_unlink = Path.unlink
+
+    def fail_log(path, *args, **kwargs):
+        if path == log:
+            raise OSError("simulated delete failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_log)
+    with pytest.raises(OSError, match="simulated"):
+        store.delete_song(song_id(digest))
+    assert not package.exists()
+    assert record.exists()
+    assert store.get_job("j-delete") is not None
+
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    log.unlink(missing_ok=True)
+    store.delete_song(song_id(digest))
+    assert not record.exists()
+    assert store.get_job("j-delete") is None
 
 
 def test_running_job_from_a_previous_crash_is_requeued_on_startup(tmp_path):

@@ -16,13 +16,21 @@ from typing import Optional
 from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from bunri.registry import REGISTRY
-from bunri.web.jobs import Job, JobStore, Runner, Song, safe_filename
+from bunri.web.jobs import (
+    Job,
+    JobStore,
+    Runner,
+    Song,
+    SongDeleteConflict,
+    SongNotFoundError,
+    safe_filename,
+)
 
 # Audio formats plus the mp4/mov video containers, case-insensitive: the
 # pipeline normalizes through ffmpeg, which extracts the audio track from a
@@ -321,6 +329,18 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
     @app.get("/api/songs")
     def list_songs() -> list[dict]:
         return [_serialize_song(song) for song in store.list_songs()]
+
+    @app.delete("/api/songs/{song_id}", status_code=204)
+    def delete_song(song_id: str) -> Response:
+        try:
+            store.delete_song(song_id)
+        except SongNotFoundError:
+            raise HTTPException(status_code=404, detail="song not found")
+        except SongDeleteConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"song deletion failed: {exc}")
+        return Response(status_code=204)
 
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: str) -> dict:
