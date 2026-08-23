@@ -484,7 +484,12 @@
         var badge = badgeFor(job);
         var badgeEl = document.createElement("span");
         badgeEl.className = "sw-badge sw-summary-badge " + badge.cls;
-        badgeEl.textContent = job.target_label + " " + badge.text;
+        badgeEl.textContent = job.target_label;
+        if (job.status === "done") {
+          badgeEl.setAttribute("aria-label", job.target_label + " 完了");
+        } else {
+          badgeEl.textContent += " " + badge.text;
+        }
         summary.appendChild(badgeEl);
       });
       head.appendChild(summary);

@@ -177,7 +177,8 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
         assert page.locator(".sw-job-content").is_hidden()
         summary_badge = page.locator(".sw-job-summary .sw-summary-badge")
         assert summary_badge.is_visible()
-        assert summary_badge.text_content() == "ギター 完了"
+        assert summary_badge.text_content() == "ギター"
+        assert summary_badge.get_attribute("aria-label") == "ギター 完了"
 
 
 @_needs_browser
@@ -191,12 +192,19 @@ def test_song_toggle_survives_polling_redraw(tmp_path):
         page.wait_for_selector("#sw-confirm:not([hidden])")
         page.click("#sw-upload-btn")
         page.wait_for_function("window.__bunriWeb.getJobs().length === 1")
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs()[0].status === 'running'",
+            timeout=5_000,
+        )
 
         toggle = page.locator("button.sw-job-toggle")
         assert toggle.get_attribute("aria-expanded") == "true"
         toggle.click()
         assert toggle.get_attribute("aria-expanded") == "false"
         assert page.locator(".sw-job-content").is_hidden()
+        summary_badge = page.locator(".sw-job-summary .sw-summary-badge")
+        assert summary_badge.text_content().startswith("ギター 処理中 (")
+        assert summary_badge.text_content().endswith(")")
 
         page.evaluate(
             "window.__toggleBeforePoll = document.querySelector('button.sw-job-toggle')"
