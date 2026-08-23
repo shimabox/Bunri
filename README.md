@@ -2,9 +2,9 @@
 
 Bunri (分離, "separation") extracts a single instrument stem (guitar by default; bass, drums, vocals, piano also supported) from a song and builds a practice package: the instrument alone, the backing track without it, the original, and an offline HTML player with A-B loop and pitch-preserving slow-down. Audio processing runs locally on your machine; your audio is never uploaded. Documentation is in Japanese.
 
-| メイン | 練習プレイヤー |
-|---|---|
-| ![曲一覧](docs/images/web-ui.png) | ![練習プレイヤー](docs/images/player.png) |
+| アップロード | 曲一覧 | 練習プレイヤー |
+|---|---|---|
+| ![アップロード](docs/images/upload.png) | ![曲一覧](docs/images/web-ui.png) | ![練習プレイヤー](docs/images/player.png) |
 
 音源から特定の楽器パート(まずはギター)の stem を抽出し、練習用パッケージ(その楽器だけ / その楽器を抜いた伴奏 / 原曲 + オフラインで再生できる HTML プレイヤー)を生成するツールです。処理はすべてお使いのマシン内で完結し、音源が外部に送信されることはありません。
 
