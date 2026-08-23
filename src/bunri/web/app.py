@@ -21,7 +21,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from bunri.web.jobs import Job, JobStore, Runner, safe_filename
+from bunri.registry import REGISTRY
+from bunri.web.jobs import Job, JobStore, Runner, Song, safe_filename
 
 # Audio formats plus the mp4/mov video containers, case-insensitive: the
 # pipeline normalizes through ffmpeg, which extracts the audio track from a
@@ -61,6 +62,23 @@ def _serialize_job(job: Job) -> dict:
         # contain those characters even though the slug itself never does.
         "package_url": f"/packages/{quote(job.package)}" if job.package else None,
         "error": job.error,
+    }
+
+
+def _serialize_song(song: Song) -> dict:
+    targets = []
+    for job in song.targets:
+        serialized = _serialize_job(job)
+        serialized.pop("title")
+        serialized["target_label"] = (
+            REGISTRY[job.target].label_ja if job.target in REGISTRY else job.target
+        )
+        targets.append(serialized)
+    return {
+        "id": song.id,
+        "title": song.title,
+        "created_at": song.created_at,
+        "targets": targets,
     }
 
 
@@ -217,8 +235,18 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
 
     @app.post("/api/jobs")
     async def create_job(
-        file: UploadFile = File(...), title: Optional[str] = Form(None)
+        file: UploadFile = File(...),
+        title: Optional[str] = Form(None),
+        targets: Optional[list[str]] = Form(None),
     ) -> JSONResponse:
+        requested_targets = ["guitar"] if targets is None else targets
+        if (
+            not requested_targets
+            or any(not target or target not in REGISTRY for target in requested_targets)
+            or len(set(requested_targets)) != len(requested_targets)
+        ):
+            raise HTTPException(status_code=400, detail="targets must be unique registered values")
+
         filename = file.filename or ""
         ext = Path(filename).suffix.lower()
         if ext not in ALLOWED_EXTENSIONS:
@@ -274,16 +302,25 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
             os.replace(tmp_path, dest)  # atomic rename on the same filesystem
 
         requested_title = (title or "").strip() or Path(filename).stem or "untitled"
-        job, created = store.create_job(dest, digest, requested_title, target="guitar")
+        results = store.create_jobs(dest, digest, requested_title, requested_targets)
+        jobs = [
+            {"id": job.id, "target": job.target, "dedup": not created}
+            for job, created in results
+        ]
+        all_dedup = all(not created for _, created in results)
 
         return JSONResponse(
-            {"job_id": job.id, "dedup": not created},
-            status_code=202 if created else 200,
+            {"job_id": results[0][0].id, "dedup": all_dedup, "jobs": jobs},
+            status_code=200 if all_dedup else 202,
         )
 
     @app.get("/api/jobs")
     def list_jobs() -> list[dict]:
         return [_serialize_job(j) for j in store.list_jobs()]
+
+    @app.get("/api/songs")
+    def list_songs() -> list[dict]:
+        return [_serialize_song(song) for song in store.list_songs()]
 
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: str) -> dict:

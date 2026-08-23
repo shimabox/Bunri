@@ -95,6 +95,19 @@
     border: 1px solid #e6d9c4;
     border-radius: 10px;
   }
+  fieldset.sw-targets {
+    border: 0;
+    padding: 0;
+    margin: 0 0 12px;
+  }
+  fieldset.sw-targets legend {
+    color: #6f665c;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-bottom: 7px;
+  }
+  .sw-target-options { display: flex; flex-wrap: wrap; gap: 8px 14px; }
+  .sw-target-option { font-size: 0.85rem; white-space: nowrap; }
   button.sw-btn {
     font: inherit;
     font-size: 0.9rem;
@@ -124,18 +137,64 @@
   li.sw-job {
     border: 1px solid #f1e8da;
     border-radius: 14px;
-    padding: 14px 16px;
     margin-bottom: 10px;
     background: #ffffff;
     box-shadow: 0 2px 10px rgba(120, 90, 60, 0.05);
+    overflow: hidden;
   }
-  .sw-job-head {
+  button.sw-job-toggle {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button.sw-job-toggle:hover { background: #fffaf3; }
+  button.sw-job-toggle:focus-visible {
+    outline: 2px solid #e2674e;
+    outline-offset: -2px;
+  }
+  .sw-job-title {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 700;
+    font-size: 0.95rem;
+  }
+  .sw-job-summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .sw-job-summary::-webkit-scrollbar { display: none; }
+  button.sw-job-toggle[aria-expanded="true"] .sw-job-summary { display: none; }
+  .sw-job-chevron {
+    margin-left: auto;
+    color: #8a7f74;
+    font-size: 0.8rem;
+  }
+  button.sw-job-toggle[aria-expanded="true"] .sw-job-chevron { transform: rotate(180deg); }
+  .sw-job-content { padding: 0 16px 14px; }
+  .sw-job-content[hidden] { display: none; }
+  .sw-target-row {
     display: flex;
     align-items: center;
     gap: 10px;
     flex-wrap: wrap;
+    padding-top: 10px;
   }
-  .sw-job-title { font-weight: 700; font-size: 0.95rem; }
+  .sw-target-label { min-width: 5em; font-size: 0.85rem; font-weight: 600; }
   .sw-badge {
     font-size: 0.78rem;
     padding: 3px 12px;
@@ -149,6 +208,7 @@
   .sw-badge-running { background: #fdeee8; color: #c9502f; }
   .sw-badge-done { background: #e3f3ef; color: #1f6f64; }
   .sw-badge-error { background: #fbe9e6; color: #c0392b; }
+  .sw-summary-badge { padding: 2px 8px; font-size: 0.72rem; }
   a.sw-open-link {
     font-size: 0.85rem;
     color: #2f8f83;
@@ -187,7 +247,7 @@
 <body>
 <header class="sw-header">
   <h1 class="sw-title">Bunri</h1>
-  <p class="sw-sub">音源からギター練習パッケージを作る</p>
+  <p class="sw-sub">音源から楽器別の練習パッケージを作る</p>
 </header>
 
 <main class="sw-main">
@@ -206,6 +266,16 @@
         <label for="sw-title-input">曲名</label>
         <input id="sw-title-input" class="sw-title-input" type="text" maxlength="200">
       </div>
+      <fieldset class="sw-targets">
+        <legend>分離する楽器</legend>
+        <div class="sw-target-options">
+          <label class="sw-target-option"><input type="checkbox" name="targets" value="guitar"> ギター</label>
+          <label class="sw-target-option"><input type="checkbox" name="targets" value="bass"> ベース</label>
+          <label class="sw-target-option"><input type="checkbox" name="targets" value="drums"> ドラム</label>
+          <label class="sw-target-option"><input type="checkbox" name="targets" value="vocals"> ボーカル</label>
+          <label class="sw-target-option"><input type="checkbox" name="targets" value="piano"> ピアノ</label>
+        </div>
+      </fieldset>
       <div class="sw-row">
         <button type="button" id="sw-upload-btn" class="sw-btn sw-btn-primary">アップロードして分離開始</button>
         <button type="button" id="sw-cancel-btn" class="sw-btn">キャンセル</button>
@@ -230,6 +300,7 @@
   "use strict";
 
   var API_JOBS = "/api/jobs";
+  var API_SONGS = "/api/songs";
   var POLL_INTERVAL_MS = 2000;
 
   var dropzone = document.getElementById("sw-dropzone");
@@ -240,12 +311,16 @@
   var uploadBtn = document.getElementById("sw-upload-btn");
   var cancelBtn = document.getElementById("sw-cancel-btn");
   var uploadError = document.getElementById("sw-upload-error");
+  var targetInputs = Array.prototype.slice.call(
+    document.querySelectorAll('input[name="targets"]')
+  );
   var jobListEl = document.getElementById("sw-job-list");
   var emptyMsg = document.getElementById("sw-empty");
 
   var pendingFile = null;
   var pollTimer = null;
-  var jobsCache = [];
+  var songsCache = [];
+  var songExpandedStates = Object.create(null);
 
   function stem(name) {
     var idx = name.lastIndexOf(".");
@@ -257,7 +332,9 @@
     confirmFilename.textContent = file.name;
     titleInput.value = stem(file.name);
     uploadError.textContent = "";
+    targetInputs.forEach(function (input) { input.checked = input.value === "guitar"; });
     confirmPanel.hidden = false;
+    updateUploadEnabled();
   }
 
   function hideConfirm() {
@@ -296,13 +373,32 @@
 
   cancelBtn.addEventListener("click", hideConfirm);
 
+  function selectedTargets() {
+    return targetInputs.filter(function (input) { return input.checked; });
+  }
+
+  function updateUploadEnabled() {
+    uploadBtn.disabled = !pendingFile || selectedTargets().length === 0;
+  }
+
+  targetInputs.forEach(function (input) {
+    input.addEventListener("change", updateUploadEnabled);
+  });
+
   uploadBtn.addEventListener("click", function () {
     if (!pendingFile) return;
+    var targets = selectedTargets();
+    if (targets.length === 0) {
+      uploadError.textContent = "分離する楽器を1つ以上選択してください";
+      updateUploadEnabled();
+      return;
+    }
     uploadBtn.disabled = true;
     uploadError.textContent = "";
     var fd = new FormData();
     fd.append("file", pendingFile);
     fd.append("title", titleInput.value || stem(pendingFile.name));
+    targets.forEach(function (input) { fd.append("targets", input.value); });
     fetch(API_JOBS, { method: "POST", body: fd })
       .then(function (res) {
         if (!res.ok) {
@@ -314,13 +410,13 @@
       })
       .then(function () {
         hideConfirm();
-        return refreshJobs();
+        return refreshSongs();
       })
       .catch(function (err) {
         uploadError.textContent = err.message || "アップロードに失敗しました";
       })
       .finally(function () {
-        uploadBtn.disabled = false;
+        updateUploadEnabled();
       });
   });
 
@@ -346,60 +442,142 @@
     }
   }
 
-  function renderJobs(jobs) {
-    jobsCache = jobs;
-    jobListEl.innerHTML = "";
-    emptyMsg.hidden = jobs.length !== 0;
-
-    jobs.forEach(function (job) {
-      var li = document.createElement("li");
-      li.className = "sw-job";
-      li.dataset.jobId = job.id;
-
-      var head = document.createElement("div");
-      head.className = "sw-job-head";
-
-      var title = document.createElement("span");
-      title.className = "sw-job-title";
-      title.textContent = job.title;
-      head.appendChild(title);
-
-      var badge = badgeFor(job);
-      var badgeEl = document.createElement("span");
-      badgeEl.className = "sw-badge " + badge.cls;
-      badgeEl.textContent = badge.text;
-      head.appendChild(badgeEl);
-
-      if (job.status === "done" && job.package_url) {
-        var link = document.createElement("a");
-        link.href = job.package_url;
-        link.target = "_blank";
-        link.rel = "noopener";
-        link.className = "sw-open-link";
-        link.textContent = "プレイヤーを開く";
-        head.appendChild(link);
-      }
-
-      li.appendChild(head);
-
-      if (job.status === "error" && job.error) {
-        var details = document.createElement("details");
-        details.className = "sw-error-details";
-        var summary = document.createElement("summary");
-        summary.textContent = "失敗の詳細(ログ末尾)";
-        details.appendChild(summary);
-        var pre = document.createElement("pre");
-        pre.textContent = job.error;
-        details.appendChild(pre);
-        li.appendChild(details);
-      }
-
-      jobListEl.appendChild(li);
+  function songHasActiveJobs(song) {
+    return song.targets.some(function (job) {
+      return job.status === "queued" || job.status === "running";
     });
   }
 
-  function hasActiveJobs(jobs) {
-    return jobs.some(function (j) { return j.status === "queued" || j.status === "running"; });
+  function expandedFor(song) {
+    if (!Object.prototype.hasOwnProperty.call(songExpandedStates, song.id)) {
+      songExpandedStates[song.id] = songHasActiveJobs(song);
+    }
+    return songExpandedStates[song.id];
+  }
+
+  function renderSongs(songs) {
+    var focusedSongId = null;
+    var activeElement = document.activeElement;
+    if (activeElement && activeElement.matches("button.sw-job-toggle")) {
+      var focusedCard = activeElement.closest("li.sw-job");
+      if (focusedCard && jobListEl.contains(focusedCard)) {
+        focusedSongId = focusedCard.dataset.songId;
+      }
+    }
+
+    songsCache = songs;
+    jobListEl.innerHTML = "";
+    emptyMsg.hidden = songs.length !== 0;
+
+    songs.forEach(function (song) {
+      var li = document.createElement("li");
+      li.className = "sw-job";
+      li.dataset.songId = song.id;
+
+      var expanded = expandedFor(song);
+      var contentId = "sw-song-content-" + song.id;
+      var head = document.createElement("button");
+      head.type = "button";
+      head.className = "sw-job-toggle";
+      head.setAttribute("aria-expanded", String(expanded));
+      head.setAttribute("aria-controls", contentId);
+
+      var title = document.createElement("span");
+      title.className = "sw-job-title";
+      title.textContent = song.title;
+      head.appendChild(title);
+
+      var summary = document.createElement("span");
+      summary.className = "sw-job-summary";
+      song.targets.forEach(function (job) {
+        var badge = badgeFor(job);
+        var badgeEl = document.createElement("span");
+        badgeEl.className = "sw-badge sw-summary-badge " + badge.cls;
+        badgeEl.textContent = job.target_label;
+        if (job.status === "done") {
+          badgeEl.setAttribute("aria-label", job.target_label + " 完了");
+        } else {
+          badgeEl.textContent += " " + badge.text;
+        }
+        summary.appendChild(badgeEl);
+      });
+      head.appendChild(summary);
+
+      var chevron = document.createElement("span");
+      chevron.className = "sw-job-chevron";
+      chevron.setAttribute("aria-hidden", "true");
+      chevron.textContent = "▼";
+      head.appendChild(chevron);
+      li.appendChild(head);
+
+      var content = document.createElement("div");
+      content.className = "sw-job-content";
+      content.id = contentId;
+      content.hidden = !expanded;
+
+      head.addEventListener("click", function () {
+        var nextExpanded = head.getAttribute("aria-expanded") !== "true";
+        songExpandedStates[song.id] = nextExpanded;
+        head.setAttribute("aria-expanded", String(nextExpanded));
+        content.hidden = !nextExpanded;
+      });
+
+      song.targets.forEach(function (job) {
+        var row = document.createElement("div");
+        row.className = "sw-target-row";
+        row.dataset.target = job.target;
+        var label = document.createElement("span");
+        label.className = "sw-target-label";
+        label.textContent = job.target_label;
+        row.appendChild(label);
+        var badge = badgeFor(job);
+        var badgeEl = document.createElement("span");
+        badgeEl.className = "sw-badge " + badge.cls;
+        badgeEl.textContent = badge.text;
+        row.appendChild(badgeEl);
+        if (job.status === "done" && job.package_url) {
+          var link = document.createElement("a");
+          link.href = job.package_url;
+          link.target = "_blank";
+          link.rel = "noopener";
+          link.className = "sw-open-link";
+          link.textContent = "プレイヤーを開く";
+          row.appendChild(link);
+        }
+        content.appendChild(row);
+        if (job.status === "error" && job.error) {
+          var details = document.createElement("details");
+          details.className = "sw-error-details";
+          var summary = document.createElement("summary");
+          summary.textContent = "失敗の詳細(ログ末尾)";
+          details.appendChild(summary);
+          var pre = document.createElement("pre");
+          pre.textContent = job.error;
+          details.appendChild(pre);
+          content.appendChild(details);
+        }
+      });
+
+      li.appendChild(content);
+
+      jobListEl.appendChild(li);
+    });
+
+    if (focusedSongId !== null) {
+      var replacementCard = Array.prototype.find.call(
+        jobListEl.querySelectorAll("li.sw-job"),
+        function (card) { return card.dataset.songId === focusedSongId; }
+      );
+      if (replacementCard) {
+        replacementCard.querySelector("button.sw-job-toggle").focus({ preventScroll: true });
+      }
+    }
+  }
+
+  function hasActiveJobs(songs) {
+    return songs.some(function (song) {
+      return songHasActiveJobs(song);
+    });
   }
 
   function schedulePoll(jobs) {
@@ -408,17 +586,17 @@
       pollTimer = null;
     }
     if (hasActiveJobs(jobs)) {
-      pollTimer = setTimeout(function () { refreshJobs(); }, POLL_INTERVAL_MS);
+      pollTimer = setTimeout(function () { refreshSongs(); }, POLL_INTERVAL_MS);
     }
   }
 
-  function refreshJobs() {
-    return fetch(API_JOBS)
+  function refreshSongs() {
+    return fetch(API_SONGS)
       .then(function (res) { return res.json(); })
-      .then(function (jobs) {
-        renderJobs(jobs);
-        schedulePoll(jobs);
-        return jobs;
+      .then(function (songs) {
+        renderSongs(songs);
+        schedulePoll(songs);
+        return songs;
       })
       .catch(function () {
         // Transient failure (e.g. server restarting -- exactly the
@@ -426,12 +604,12 @@
         // screen and RESCHEDULE ourselves. Without this the poll chain dies
         // on a single failed fetch and a finished job never shows its link.
         if (pollTimer !== null) clearTimeout(pollTimer);
-        pollTimer = setTimeout(function () { refreshJobs(); }, POLL_INTERVAL_MS);
+        pollTimer = setTimeout(function () { refreshSongs(); }, POLL_INTERVAL_MS);
       });
   }
 
   document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "visible") refreshJobs();
+    if (document.visibilityState === "visible") refreshSongs();
   });
 
   // Test/automation hook, same idea as the player's window.__player: exposes
@@ -439,12 +617,15 @@
   // (current job list, whether polling is active) instead of guessing from
   // timing.
   window.__bunriWeb = {
-    getJobs: function () { return jobsCache; },
+    getSongs: function () { return songsCache; },
+    getJobs: function () {
+      return songsCache.reduce(function (jobs, song) { return jobs.concat(song.targets); }, []);
+    },
     isPolling: function () { return pollTimer !== null; },
-    refresh: refreshJobs
+    refresh: refreshSongs
   };
 
-  refreshJobs();
+  refreshSongs();
 })();
 </script>
 </body>

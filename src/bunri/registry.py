@@ -3,7 +3,7 @@ model (and stem name) that extracts it, plus the fallback model and player
 label to use for it.
 
 Phase 1 only registers "guitar"; the shape is deliberately generic so future
-targets (vocals, bass, drums, piano -- see the Bunri founding plan) can be
+targets (bass, drums, vocals, piano -- see the Bunri founding plan) can be
 added as new REGISTRY entries without touching separate.py/package.py.
 """
 
@@ -41,19 +41,6 @@ REGISTRY: dict[str, TargetSpec] = {
         fallback_model="htdemucs_6s.yaml",
         label_ja="ギター",
     ),
-    "vocals": TargetSpec(
-        target="vocals",
-        stem_name="Vocals",
-        # Top vocals model in audio-separator's own catalog by measured SDR
-        # (12.60, vs 12.52 for the next Mel-Roformer and 10.79 for
-        # htdemucs_ft) as of 0.44.3. A catalog built-in, so audio-separator
-        # downloads it itself -- none of the becruily bootstrap applies. Its
-        # two stems are vocals/other, so the backing track is simply the
-        # "other" stem: a ready-made karaoke mix.
-        default_model="vocals_mel_band_roformer.ckpt",
-        fallback_model="htdemucs_6s.yaml",
-        label_ja="ボーカル",
-    ),
     # bass/drums/piano reuse the 6-stem Demucs: no single-instrument
     # specialist for them ships in the catalog with a better measured score,
     # and htdemucs_6s is already this project's proven fallback model. No
@@ -71,6 +58,19 @@ REGISTRY: dict[str, TargetSpec] = {
         default_model="htdemucs_6s.yaml",
         fallback_model=None,
         label_ja="ドラム",
+    ),
+    "vocals": TargetSpec(
+        target="vocals",
+        stem_name="Vocals",
+        # Top vocals model in audio-separator's own catalog by measured SDR
+        # (12.60, vs 12.52 for the next Mel-Roformer and 10.79 for
+        # htdemucs_ft) as of 0.44.3. A catalog built-in, so audio-separator
+        # downloads it itself -- none of the becruily bootstrap applies. Its
+        # two stems are vocals/other, so the backing track is simply the
+        # "other" stem: a ready-made karaoke mix.
+        default_model="vocals_mel_band_roformer.ckpt",
+        fallback_model="htdemucs_6s.yaml",
+        label_ja="ボーカル",
     ),
     "piano": TargetSpec(
         target="piano",

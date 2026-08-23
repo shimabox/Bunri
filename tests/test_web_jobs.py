@@ -80,6 +80,62 @@ def _make_upload(out_dir: Path, name: str = "song.mp3", content: bytes = b"fake-
     return path
 
 
+def test_create_jobs_shares_latest_digest_title_and_registry_order(tmp_path):
+    upload = _make_upload(tmp_path)
+    runner = FakeRunner()
+    store = JobStore(tmp_path, runner=runner)
+    original, _ = store.create_job(upload, "same", "Original", target="guitar")
+    _wait_until(lambda: store.get_job(original.id).status == "done")
+
+    results = store.create_jobs(upload, "same", "Ignored rename", ["piano", "vocals", "bass"])
+    assert [job.target for job, _ in results] == ["bass", "vocals", "piano"]
+    assert {job.title for job, _ in results} == {"Original"}
+    _wait_until(lambda: len(runner.calls) == 4)
+    assert [call["target"] for call in runner.calls] == ["guitar", "bass", "vocals", "piano"]
+
+
+def test_create_jobs_dedups_per_target_and_retries_error(tmp_path):
+    upload = _make_upload(tmp_path)
+    store = JobStore(tmp_path, runner=FakeRunner(returncode=1, write_player=False))
+    failed, _ = store.create_job(upload, "same", "Song", target="vocals")
+    _wait_until(lambda: store.get_job(failed.id).status == "error")
+
+    retried = store.create_jobs(upload, "same", "Song", ["vocals"])
+    assert retried[0][1] is True
+    assert retried[0][0].id != failed.id
+
+
+@pytest.mark.parametrize("targets", [[], ["guitar", "guitar"], ["violin"]])
+def test_create_jobs_rejects_invalid_targets(tmp_path, targets):
+    upload = _make_upload(tmp_path)
+    store = JobStore(tmp_path, runner=FakeRunner())
+    with pytest.raises(ValueError):
+        store.create_jobs(upload, "digest", "Song", targets)
+    assert store.list_jobs() == []
+
+
+def test_create_jobs_run_strictly_sequentially(tmp_path):
+    upload = _make_upload(tmp_path)
+    intervals: list[tuple[str, float, float]] = []
+
+    def timed_runner(upload_path, out_dir, title, target, log_path):
+        started = time.monotonic()
+        time.sleep(0.04)
+        safe = safe_filename(title)
+        package_dir = out_dir / safe
+        package_dir.mkdir(parents=True, exist_ok=True)
+        (package_dir / f"{safe}.{target}.player.html").write_text("player", encoding="utf-8")
+        log_path.write_text("ok", encoding="utf-8")
+        intervals.append((target, started, time.monotonic()))
+        return 0
+
+    store = JobStore(tmp_path, runner=timed_runner)
+    results = store.create_jobs(upload, "digest", "Song", ["drums", "guitar", "bass"])
+    _wait_until(lambda: all(store.get_job(job.id).status == "done" for job, _ in results))
+    assert [target for target, _, _ in intervals] == ["guitar", "bass", "drums"]
+    assert all(current[2] <= following[1] for current, following in zip(intervals, intervals[1:]))
+
+
 # ---------------------------------------------------------------------------
 # basic state machine
 # ---------------------------------------------------------------------------

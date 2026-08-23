@@ -8,6 +8,7 @@ apart from test_separate.py's).
 from __future__ import annotations
 
 import io
+import hashlib
 import time
 from pathlib import Path
 from typing import Any
@@ -59,8 +60,10 @@ def client(tmp_path):
         yield c
 
 
-def _upload(client, *, name="song.mp3", content=b"fake-audio-bytes", title=None):
+def _upload(client, *, name="song.mp3", content=b"fake-audio-bytes", title=None, targets=None):
     data = {"title": title} if title is not None else {}
+    if targets is not None:
+        data["targets"] = targets
     return client.post(
         "/api/jobs",
         files={"file": (name, io.BytesIO(content), "audio/mpeg")},
@@ -78,6 +81,7 @@ def test_upload_returns_202_and_job_appears_queued_or_running(client):
     assert res.status_code == 202
     body = res.json()
     assert body["dedup"] is False
+    assert body["jobs"] == [{"id": body["job_id"], "target": "guitar", "dedup": False}]
     job_id = body["job_id"]
 
     listed = client.get("/api/jobs").json()
@@ -139,6 +143,80 @@ def test_reuploading_identical_content_dedups_once_done(client):
     assert body["dedup"] is True
     assert body["job_id"] == job_id
     assert len(client.fake_runner.calls) == 1
+
+
+def test_multiple_targets_are_normalized_and_returned_per_target(client):
+    res = _upload(client, title="Band", targets=["piano", "guitar", "vocals", "bass"])
+    assert res.status_code == 202
+    body = res.json()
+    assert [job["target"] for job in body["jobs"]] == ["guitar", "bass", "vocals", "piano"]
+    assert body["job_id"] == body["jobs"][0]["id"]
+    assert body["dedup"] is False
+    assert all(job["dedup"] is False for job in body["jobs"])
+    _wait_until(lambda: len(client.fake_runner.calls) == 4)
+    assert [call["target"] for call in client.fake_runner.calls] == [
+        "guitar", "bass", "vocals", "piano",
+    ]
+
+
+@pytest.mark.parametrize("targets", [[""], ["guitar", "guitar"], ["violin"]])
+def test_invalid_targets_are_rejected_before_upload_or_job_creation(client, targets):
+    res = _upload(client, targets=targets)
+    assert res.status_code == 400
+    assert list((client.out_dir / "web" / "uploads").iterdir()) == []
+    assert client.get("/api/jobs").json() == []
+
+
+def test_partial_target_dedup_creates_only_the_missing_target(client):
+    first = _upload(client, content=b"same", targets=["guitar"])
+    first_id = first.json()["job_id"]
+    _wait_until(lambda: _job_status(client, first_id) == "done")
+
+    second = _upload(client, content=b"same", targets=["vocals", "guitar"])
+    assert second.status_code == 202
+    assert second.json()["dedup"] is False
+    jobs = second.json()["jobs"]
+    assert jobs[0] == {"id": first_id, "target": "guitar", "dedup": True}
+    assert jobs[1]["target"] == "vocals"
+    assert jobs[1]["dedup"] is False
+
+
+def test_songs_group_digest_and_use_latest_jobs_in_target_order(tmp_path):
+    _write_job_file(
+        tmp_path, "j-old-guitar", digest="digest-a", title="Old title", target="guitar",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    _write_job_file(
+        tmp_path, "j-new-guitar", digest="digest-a", title="New title", target="guitar",
+        created_at="2026-01-02T00:00:00+00:00",
+    )
+    _write_job_file(
+        tmp_path, "j-vocals", digest="digest-a", title="New title", target="vocals",
+        created_at="2026-01-02T00:00:00+00:00",
+    )
+    _write_job_file(
+        tmp_path, "j-legacy", digest="digest-a", title="New title", target="zither",
+        created_at="2026-01-01T12:00:00+00:00",
+    )
+    _write_job_file(
+        tmp_path, "j-other", digest="digest-b", title="Other", target="bass",
+        created_at="2025-12-01T00:00:00+00:00",
+    )
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        songs = c.get("/api/songs").json()
+        legacy = c.get("/api/jobs/j-legacy").json()
+
+    assert [song["title"] for song in songs] == ["New title", "Other"]
+    song = songs[0]
+    assert song["id"] == hashlib.sha256(b"digest-a").hexdigest()
+    assert song["created_at"] == "2026-01-02T00:00:00+00:00"
+    assert [target["target"] for target in song["targets"]] == ["guitar", "vocals", "zither"]
+    assert song["targets"][0]["id"] == "j-new-guitar"
+    assert [target["target_label"] for target in song["targets"]] == ["ギター", "ボーカル", "zither"]
+    assert "title" not in song["targets"][0]
+    assert legacy["status"] == "done"
+    assert legacy["package_url"] == "/packages/New%20title/New%20title.zither.player.html"
 
 
 def test_unknown_job_id_is_404(client):

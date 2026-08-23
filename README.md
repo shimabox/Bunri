@@ -1,6 +1,6 @@
 # Bunri
 
-Bunri (分離, "separation") extracts a single instrument stem (guitar by default; vocals, bass, drums, piano also supported) from a song and builds a practice package: the instrument alone, the backing track without it, the original, and an offline HTML player with A-B loop and pitch-preserving slow-down. Audio processing runs locally on your machine; your audio is never uploaded. Documentation is in Japanese.
+Bunri (分離, "separation") extracts a single instrument stem (guitar by default; bass, drums, vocals, piano also supported) from a song and builds a practice package: the instrument alone, the backing track without it, the original, and an offline HTML player with A-B loop and pitch-preserving slow-down. Audio processing runs locally on your machine; your audio is never uploaded. Documentation is in Japanese.
 
 | メイン | 練習プレイヤー |
 |---|---|
@@ -78,9 +78,9 @@ uv run bunri-web
 
 起動すると `http://127.0.0.1:8330/` がブラウザで自動的に開きます(**127.0.0.1 のみで待ち受け**。LAN 公開や認証には対応していません)。
 
-- 音源をドロップ(またはクリックして選択)すると曲名確認欄が出るので、必要なら曲名を編集してアップロードします。分離はサーバー側で `bunri` CLI をサブプロセスとして実行する形で行われるため、ブラウザを閉じてもジョブは継続します
-- 曲一覧には「待機中 / 処理中(経過時間)/ 完了 / 失敗」が表示され、完了した曲には「プレイヤーを開く」リンクが表示されます(次回アクセス時もこの一覧・リンクは残ります)
-- 同じ音源(内容が同一)を再アップロードしても再分離はされず、既存の結果が再利用されます
+- 音源をドロップ(またはクリックして選択)すると曲名確認欄が出るので、必要なら曲名を編集し、ギター / ベース / ドラム / ボーカル / ピアノから分離する楽器を複数選んでアップロードします。選択した楽器はサーバー側で1件ずつ順番に処理され、ブラウザを閉じてもジョブは継続します
+- 曲一覧には1曲ごとに楽器別の「待機中 / 処理中(経過時間)/ 完了 / 失敗」が表示され、完了した楽器にはそれぞれの「プレイヤーを開く」リンクが表示されます(次回アクセス時もこの一覧・リンクは残ります)
+- 同じ音源(内容が同一)と同じ楽器の組み合わせを再アップロードしても再分離はされず、既存の結果が再利用されます
 
 ### 主なオプション
 
@@ -148,8 +148,10 @@ bunri song.mp3 -o path/to/out               # 出力先ディレクトリ
 | target | 既定モデル | 備考 |
 |---|---|---|
 | `guitar`(既定) | ギター特化 Mel-Band Roformer(becruily) | 実測比較で選定(ボーカル混入が htdemucs_6s の 1/3) |
+| `bass` | htdemucs_6s(6-stem Demucs) | 専用モデルなし。6 stem 分離から該当パートを抽出 |
+| `drums` | htdemucs_6s(6-stem Demucs) | 専用モデルなし。6 stem 分離から該当パートを抽出 |
 | `vocals` | vocals_mel_band_roformer | カタログ実測 SDR 首位(12.60)。「ボーカルなし」はそのままカラオケ音源 |
-| `bass` / `drums` / `piano` | htdemucs_6s(6-stem Demucs) | 専用モデルなし。6 stem 分離から該当パートを抽出 |
+| `piano` | htdemucs_6s(6-stem Demucs) | 専用モデルなし。6 stem 分離から該当パートを抽出 |
 
 同じ曲でも `--target` ごとに分離キャッシュは独立しているため、対象を切り替えても過去の分離結果はそのまま再利用されます。
 
