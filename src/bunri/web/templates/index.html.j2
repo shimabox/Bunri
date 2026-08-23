@@ -137,18 +137,56 @@
   li.sw-job {
     border: 1px solid #f1e8da;
     border-radius: 14px;
-    padding: 14px 16px;
     margin-bottom: 10px;
     background: #ffffff;
     box-shadow: 0 2px 10px rgba(120, 90, 60, 0.05);
+    overflow: hidden;
   }
-  .sw-job-head {
+  button.sw-job-toggle {
+    width: 100%;
     display: flex;
     align-items: center;
     gap: 10px;
-    flex-wrap: wrap;
+    padding: 14px 16px;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
   }
-  .sw-job-title { font-weight: 700; font-size: 0.95rem; }
+  button.sw-job-toggle:hover { background: #fffaf3; }
+  button.sw-job-toggle:focus-visible {
+    outline: 2px solid #e2674e;
+    outline-offset: -2px;
+  }
+  .sw-job-title {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 700;
+    font-size: 0.95rem;
+  }
+  .sw-job-summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .sw-job-summary::-webkit-scrollbar { display: none; }
+  button.sw-job-toggle[aria-expanded="true"] .sw-job-summary { display: none; }
+  .sw-job-chevron {
+    margin-left: auto;
+    color: #8a7f74;
+    font-size: 0.8rem;
+  }
+  button.sw-job-toggle[aria-expanded="true"] .sw-job-chevron { transform: rotate(180deg); }
+  .sw-job-content { padding: 0 16px 14px; }
+  .sw-job-content[hidden] { display: none; }
   .sw-target-row {
     display: flex;
     align-items: center;
@@ -170,6 +208,7 @@
   .sw-badge-running { background: #fdeee8; color: #c9502f; }
   .sw-badge-done { background: #e3f3ef; color: #1f6f64; }
   .sw-badge-error { background: #fbe9e6; color: #c0392b; }
+  .sw-summary-badge { padding: 2px 8px; font-size: 0.72rem; }
   a.sw-open-link {
     font-size: 0.85rem;
     color: #2f8f83;
@@ -281,6 +320,7 @@
   var pendingFile = null;
   var pollTimer = null;
   var songsCache = [];
+  var songExpandedStates = Object.create(null);
 
   function stem(name) {
     var idx = name.lastIndexOf(".");
@@ -402,6 +442,19 @@
     }
   }
 
+  function songHasActiveJobs(song) {
+    return song.targets.some(function (job) {
+      return job.status === "queued" || job.status === "running";
+    });
+  }
+
+  function expandedFor(song) {
+    if (!Object.prototype.hasOwnProperty.call(songExpandedStates, song.id)) {
+      songExpandedStates[song.id] = songHasActiveJobs(song);
+    }
+    return songExpandedStates[song.id];
+  }
+
   function renderSongs(songs) {
     songsCache = songs;
     jobListEl.innerHTML = "";
@@ -412,14 +465,48 @@
       li.className = "sw-job";
       li.dataset.songId = song.id;
 
-      var head = document.createElement("div");
-      head.className = "sw-job-head";
+      var expanded = expandedFor(song);
+      var contentId = "sw-song-content-" + song.id;
+      var head = document.createElement("button");
+      head.type = "button";
+      head.className = "sw-job-toggle";
+      head.setAttribute("aria-expanded", String(expanded));
+      head.setAttribute("aria-controls", contentId);
 
       var title = document.createElement("span");
       title.className = "sw-job-title";
       title.textContent = song.title;
       head.appendChild(title);
+
+      var summary = document.createElement("span");
+      summary.className = "sw-job-summary";
+      song.targets.forEach(function (job) {
+        var badge = badgeFor(job);
+        var badgeEl = document.createElement("span");
+        badgeEl.className = "sw-badge sw-summary-badge " + badge.cls;
+        badgeEl.textContent = job.target_label + " " + badge.text;
+        summary.appendChild(badgeEl);
+      });
+      head.appendChild(summary);
+
+      var chevron = document.createElement("span");
+      chevron.className = "sw-job-chevron";
+      chevron.setAttribute("aria-hidden", "true");
+      chevron.textContent = "▼";
+      head.appendChild(chevron);
       li.appendChild(head);
+
+      var content = document.createElement("div");
+      content.className = "sw-job-content";
+      content.id = contentId;
+      content.hidden = !expanded;
+
+      head.addEventListener("click", function () {
+        var nextExpanded = head.getAttribute("aria-expanded") !== "true";
+        songExpandedStates[song.id] = nextExpanded;
+        head.setAttribute("aria-expanded", String(nextExpanded));
+        content.hidden = !nextExpanded;
+      });
 
       song.targets.forEach(function (job) {
         var row = document.createElement("div");
@@ -443,7 +530,7 @@
           link.textContent = "プレイヤーを開く";
           row.appendChild(link);
         }
-        li.appendChild(row);
+        content.appendChild(row);
         if (job.status === "error" && job.error) {
           var details = document.createElement("details");
           details.className = "sw-error-details";
@@ -453,9 +540,11 @@
           var pre = document.createElement("pre");
           pre.textContent = job.error;
           details.appendChild(pre);
-          li.appendChild(details);
+          content.appendChild(details);
         }
       });
+
+      li.appendChild(content);
 
       jobListEl.appendChild(li);
     });
@@ -463,9 +552,7 @@
 
   function hasActiveJobs(songs) {
     return songs.some(function (song) {
-      return song.targets.some(function (job) {
-        return job.status === "queued" || job.status === "running";
-      });
+      return songHasActiveJobs(song);
     });
   }
 

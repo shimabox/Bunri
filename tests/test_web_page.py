@@ -142,7 +142,12 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
         page.wait_for_function("window.__bunriWeb.getJobs().length === 1")
         page.wait_for_function("window.__bunriWeb.isPolling() === true", timeout=5_000)
 
-        badge = page.locator(".sw-badge").first
+        # Active songs start expanded.
+        toggle = page.locator("button.sw-job-toggle")
+        assert toggle.get_attribute("aria-expanded") == "true"
+        assert page.locator(".sw-job-content").is_visible()
+
+        badge = page.locator(".sw-target-row .sw-badge").first
         assert badge.text_content() in ("待機中", ) or "処理中" in badge.text_content()
 
         # Once the fake runner finishes, a "プレイヤーを開く" link appears
@@ -158,8 +163,59 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
 
         page.wait_for_function("window.__bunriWeb.isPolling() === false", timeout=5_000)
 
-        final_badge = page.locator(".sw-badge").first
+        final_badge = page.locator(".sw-target-row .sw-badge").first
         assert final_badge.text_content() == "完了"
+
+        # Finishing does not collapse a song that was already open. A page
+        # reload forgets in-memory state and applies the initial-state rule,
+        # so this completed-only song then starts collapsed.
+        assert toggle.get_attribute("aria-expanded") == "true"
+        page.reload()
+        page.wait_for_function("window.__bunriWeb.getJobs().length === 1")
+        toggle = page.locator("button.sw-job-toggle")
+        assert toggle.get_attribute("aria-expanded") == "false"
+        assert page.locator(".sw-job-content").is_hidden()
+        summary_badge = page.locator(".sw-job-summary .sw-summary-badge")
+        assert summary_badge.is_visible()
+        assert summary_badge.text_content() == "ギター 完了"
+
+
+@_needs_browser
+def test_song_toggle_survives_polling_redraw(tmp_path):
+    runner = PageFakeRunner(delay=4.0)
+    app = create_app(tmp_path / "out", runner=runner)
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        audio_path = tmp_path / "long-song.mp3"
+        audio_path.write_bytes(b"fake-audio-bytes")
+        page.set_input_files("#sw-file-input", str(audio_path))
+        page.wait_for_selector("#sw-confirm:not([hidden])")
+        page.click("#sw-upload-btn")
+        page.wait_for_function("window.__bunriWeb.getJobs().length === 1")
+
+        toggle = page.locator("button.sw-job-toggle")
+        assert toggle.get_attribute("aria-expanded") == "true"
+        toggle.click()
+        assert toggle.get_attribute("aria-expanded") == "false"
+        assert page.locator(".sw-job-content").is_hidden()
+
+        page.evaluate(
+            "window.__toggleBeforePoll = document.querySelector('button.sw-job-toggle')"
+        )
+        page.wait_for_function(
+            "window.__toggleBeforePoll && !window.__toggleBeforePoll.isConnected",
+            timeout=6_000,
+        )
+        assert toggle.get_attribute("aria-expanded") == "false"
+
+        # Clicking the rebuilt heading opens and closes it in both directions.
+        toggle.click()
+        assert toggle.get_attribute("aria-expanded") == "true"
+        toggle.click()
+        assert toggle.get_attribute("aria-expanded") == "false"
+
+        # A native button is keyboard-operable; Enter opens it again.
+        toggle.press("Enter")
+        assert toggle.get_attribute("aria-expanded") == "true"
 
 
 @_needs_browser
@@ -193,8 +249,8 @@ def test_failed_job_shows_collapsible_log_tail(tmp_path):
         page.wait_for_selector("#sw-confirm:not([hidden])")
         page.click("#sw-upload-btn")
 
-        page.wait_for_selector(".sw-badge-error", timeout=10_000)
-        assert "失敗" in page.locator(".sw-badge-error").first.text_content()
+        page.wait_for_selector(".sw-target-row .sw-badge-error", timeout=10_000)
+        assert "失敗" in page.locator(".sw-target-row .sw-badge-error").text_content()
 
         details = page.locator("details.sw-error-details")
         assert details.count() == 1
