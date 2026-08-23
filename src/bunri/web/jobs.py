@@ -1436,14 +1436,18 @@ class JobStore:
                 if problem is not None:
                     raise UnsafeOutputPath(f"job {job.id} is unsafe to delete: {problem}")
 
-            def package_dir(job: Job) -> Path:
+            def referenced_package_dir(job: Job) -> Path:
                 if job.package is not None:
                     return Path(job.package).parent
                 return Path(safe_filename(job.title))
 
-            package_dirs = {package_dir(job) for job in targets}
+            package_dirs = {
+                Path(job.package).parent
+                for job in targets
+                if job.package is not None
+            }
             remaining_package_keys = {
-                package_dir(job).name.casefold() for job in remaining
+                referenced_package_dir(job).name.casefold() for job in remaining
             }
             if any(path.name.casefold() in remaining_package_keys for path in package_dirs):
                 raise SongDeleteConflict("a package directory is shared by another song")

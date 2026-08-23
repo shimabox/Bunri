@@ -410,7 +410,8 @@ def test_delete_song_removes_all_history_legacy_packages_and_owned_artifacts(tmp
     store.delete_song(song_id(digest))
 
     assert store.list_jobs() == []
-    assert not any((tmp_path / folder).exists() for folder in ("Legacy", "Current", "New"))
+    assert not any((tmp_path / folder).exists() for folder in ("Legacy", "Current"))
+    assert (tmp_path / "New" / "artifact.txt").read_text(encoding="utf-8") == "owned"
     assert not upload.exists()
     assert orphan_upload.read_bytes() == b"unowned"
     assert not cache.exists()
@@ -418,6 +419,29 @@ def test_delete_song_removes_all_history_legacy_packages_and_owned_artifacts(tmp
     assert bad.read_text(encoding="utf-8") == "bad"
     assert external.read_text(encoding="utf-8") == "keep"
     assert (cli_output / "player.html").read_text(encoding="utf-8") == "keep"
+
+
+def test_delete_song_without_package_preserves_same_title_cli_output(tmp_path):
+    digest = "8" * 40
+    job = _write_terminal_job(
+        tmp_path, "j-failed", digest, "Same Name", status="error"
+    )
+    cli_output = tmp_path / "Same Name"
+    cli_output.mkdir()
+    marker = cli_output / "cli-output.txt"
+    marker.write_text("keep", encoding="utf-8")
+    log = tmp_path / job.log
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("failed", encoding="utf-8")
+    record = tmp_path / "web/jobs/j-failed.json"
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    store.delete_song(song_id(digest))
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert not log.exists()
+    assert not record.exists()
+    assert store.get_job(job.id) is None
 
 
 @pytest.mark.parametrize("status", ["queued", "running"])
