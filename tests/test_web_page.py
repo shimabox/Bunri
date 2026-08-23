@@ -212,6 +212,9 @@ def test_target_selection_is_required_and_multiple_targets_render_in_one_song(tm
         audio_path.write_bytes(b"band-audio")
         page.set_input_files("#sw-file-input", str(audio_path))
         page.wait_for_selector("#sw-confirm:not([hidden])")
+        assert page.locator('input[name="targets"]').evaluate_all(
+            "inputs => inputs.map(input => input.value)"
+        ) == ["guitar", "bass", "drums", "vocals", "piano"]
 
         page.uncheck('input[name="targets"][value="guitar"]')
         assert page.locator("#sw-upload-btn").is_disabled()
@@ -226,7 +229,7 @@ def test_target_selection_is_required_and_multiple_targets_render_in_one_song(tm
         assert page.locator("li.sw-job").count() == 1
         assert page.locator(".sw-target-row").count() == 2
         assert page.locator('.sw-target-row[data-target="vocals"] .sw-target-label').text_content() == "ボーカル"
-        assert [call["target"] for call in runner.calls] == ["vocals", "drums"]
+        assert [call["target"] for call in runner.calls] == ["drums", "vocals"]
 
 
 @_needs_browser

@@ -146,15 +146,17 @@ def test_reuploading_identical_content_dedups_once_done(client):
 
 
 def test_multiple_targets_are_normalized_and_returned_per_target(client):
-    res = _upload(client, title="Band", targets=["piano", "guitar", "vocals"])
+    res = _upload(client, title="Band", targets=["piano", "guitar", "vocals", "bass"])
     assert res.status_code == 202
     body = res.json()
-    assert [job["target"] for job in body["jobs"]] == ["guitar", "vocals", "piano"]
+    assert [job["target"] for job in body["jobs"]] == ["guitar", "bass", "vocals", "piano"]
     assert body["job_id"] == body["jobs"][0]["id"]
     assert body["dedup"] is False
     assert all(job["dedup"] is False for job in body["jobs"])
-    _wait_until(lambda: len(client.fake_runner.calls) == 3)
-    assert [call["target"] for call in client.fake_runner.calls] == ["guitar", "vocals", "piano"]
+    _wait_until(lambda: len(client.fake_runner.calls) == 4)
+    assert [call["target"] for call in client.fake_runner.calls] == [
+        "guitar", "bass", "vocals", "piano",
+    ]
 
 
 @pytest.mark.parametrize("targets", [[""], ["guitar", "guitar"], ["violin"]])

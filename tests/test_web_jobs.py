@@ -88,10 +88,10 @@ def test_create_jobs_shares_latest_digest_title_and_registry_order(tmp_path):
     _wait_until(lambda: store.get_job(original.id).status == "done")
 
     results = store.create_jobs(upload, "same", "Ignored rename", ["piano", "vocals", "bass"])
-    assert [job.target for job, _ in results] == ["vocals", "bass", "piano"]
+    assert [job.target for job, _ in results] == ["bass", "vocals", "piano"]
     assert {job.title for job, _ in results} == {"Original"}
     _wait_until(lambda: len(runner.calls) == 4)
-    assert [call["target"] for call in runner.calls] == ["guitar", "vocals", "bass", "piano"]
+    assert [call["target"] for call in runner.calls] == ["guitar", "bass", "vocals", "piano"]
 
 
 def test_create_jobs_dedups_per_target_and_retries_error(tmp_path):

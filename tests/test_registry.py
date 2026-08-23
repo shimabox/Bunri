@@ -17,6 +17,10 @@ def test_guitar_is_registered_under_its_own_key():
     assert REGISTRY["guitar"].target == "guitar"
 
 
+def test_registry_uses_canonical_instrument_order():
+    assert list(REGISTRY) == ["guitar", "bass", "drums", "vocals", "piano"]
+
+
 def test_unknown_target_raises_value_error_listing_valid_keys():
     with pytest.raises(ValueError, match="guitar"):
         get_target("nope")
