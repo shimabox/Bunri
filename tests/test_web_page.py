@@ -161,7 +161,7 @@ def test_done_job_with_empty_downloads_does_not_render_download_rows(tmp_path):
         target = page.locator('.sw-target-block[data-target="guitar"]')
         assert target.count() == 1
         assert target.locator(".sw-downloads").count() == 0
-        assert target.locator(".sw-download-row").count() == 0
+        assert target.locator(".sw-download-group").count() == 0
         assert target.locator("a.sw-download-link").count() == 0
 
 
@@ -221,6 +221,14 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
         download_links = page.locator("a.sw-download-link")
         assert download_links.count() == 4
         assert download_links.all_text_contents() == ["mp3", "wav", "mp3", "wav"]
+        download_groups = page.locator(".sw-download-group")
+        assert download_groups.count() == 2
+        assert download_groups.locator(".sw-download-label").all_text_contents() == [
+            "ギターのみ", "ギターなし",
+        ]
+        assert download_groups.locator("svg.sw-download-icon use").evaluate_all(
+            "uses => uses.map(use => use.getAttribute('href'))"
+        ) == ["#sw-download-icon", "#sw-download-icon"]
         assert download_links.evaluate_all(
             "links => links.map(link => link.getAttribute('href'))"
         ) == [
@@ -440,11 +448,13 @@ def test_target_selection_is_required_and_multiple_targets_render_in_one_song(tm
         drums = page.locator('.sw-target-block[data-target="drums"]')
         assert vocals.locator("a.sw-download-link").count() == 4
         assert drums.locator("a.sw-download-link").count() == 4
+        assert vocals.locator(".sw-download-group").count() == 2
+        assert drums.locator(".sw-download-group").count() == 2
         assert vocals.locator(".sw-download-label").all_text_contents() == [
-            "ボーカルのみ:", "ボーカルなし:",
+            "ボーカルのみ", "ボーカルなし",
         ]
         assert drums.locator(".sw-download-label").all_text_contents() == [
-            "ドラムのみ:", "ドラムなし:",
+            "ドラムのみ", "ドラムなし",
         ]
         assert vocals.locator("a.sw-download-link").evaluate_all(
             "links => links.map(link => link.getAttribute('href'))"
