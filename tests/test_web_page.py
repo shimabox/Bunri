@@ -160,6 +160,8 @@ def test_done_job_with_empty_downloads_does_not_render_download_rows(tmp_path):
         assert job["downloads"] == []
         target = page.locator('.sw-target-block[data-target="guitar"]')
         assert target.count() == 1
+        assert target.locator(".sw-download-tray").count() == 0
+        assert target.locator(".sw-download-heading").count() == 0
         assert target.locator(".sw-downloads").count() == 0
         assert target.locator(".sw-download-group").count() == 0
         assert target.locator("a.sw-download-link").count() == 0
@@ -223,12 +225,17 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
         assert download_links.all_text_contents() == ["mp3", "wav", "mp3", "wav"]
         download_groups = page.locator(".sw-download-group")
         assert download_groups.count() == 2
+        download_tray = page.locator(".sw-download-tray")
+        assert download_tray.count() == 1
+        download_heading = download_tray.locator(".sw-download-heading")
+        assert download_heading.text_content() == "ダウンロード"
+        assert download_heading.locator("svg.sw-download-icon use").get_attribute("href") == (
+            "#sw-download-icon"
+        )
         assert download_groups.locator(".sw-download-label").all_text_contents() == [
             "ギターのみ", "ギターなし",
         ]
-        assert download_groups.locator("svg.sw-download-icon use").evaluate_all(
-            "uses => uses.map(use => use.getAttribute('href'))"
-        ) == ["#sw-download-icon", "#sw-download-icon"]
+        assert download_groups.locator("svg.sw-download-icon").count() == 0
         assert download_links.evaluate_all(
             "links => links.map(link => link.getAttribute('href'))"
         ) == [
@@ -450,6 +457,10 @@ def test_target_selection_is_required_and_multiple_targets_render_in_one_song(tm
         assert drums.locator("a.sw-download-link").count() == 4
         assert vocals.locator(".sw-download-group").count() == 2
         assert drums.locator(".sw-download-group").count() == 2
+        assert vocals.locator(".sw-download-tray").count() == 1
+        assert drums.locator(".sw-download-tray").count() == 1
+        assert vocals.locator(".sw-download-heading").text_content() == "ダウンロード"
+        assert drums.locator(".sw-download-heading").text_content() == "ダウンロード"
         assert vocals.locator(".sw-download-label").all_text_contents() == [
             "ボーカルのみ", "ボーカルなし",
         ]

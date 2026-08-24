@@ -217,13 +217,32 @@
     font-weight: 600;
   }
   a.sw-open-link:hover { text-decoration: underline; }
+  .sw-download-tray {
+    width: fit-content;
+    max-width: calc(100% - 5em);
+    box-sizing: border-box;
+    margin: 7px 0 0 5em;
+    padding: 10px 14px 12px;
+    border: 1px solid #f1e8da;
+    border-radius: 12px;
+    background: #faf6f0;
+  }
+  .sw-download-heading {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 9px;
+    color: #6f665c;
+    font-size: 0.75rem;
+    font-weight: 700;
+  }
+  .sw-download-heading .sw-download-icon { color: #2f8f83; }
   .sw-downloads {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 8px;
     min-width: 0;
-    padding: 7px 0 0 5em;
   }
   .sw-download-group {
     display: inline-flex;
@@ -236,10 +255,9 @@
   .sw-download-label {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
     padding: 5px 11px;
-    background: #f8f3ea;
-    color: #6f665c;
+    background: #ece0cc;
+    color: #635a4f;
     font-size: 0.78rem;
     font-weight: 600;
     white-space: nowrap;
@@ -262,7 +280,10 @@
   }
   a.sw-download-link:hover { background: #e9f5f2; }
   @media (max-width: 480px) {
-    .sw-downloads { padding-left: 0; }
+    .sw-download-tray {
+      max-width: 100%;
+      margin-left: 0;
+    }
   }
   details.sw-error-details {
     margin-top: 8px;
@@ -753,6 +774,21 @@
         }
         targetBlock.appendChild(row);
         if (job.status === "done" && Array.isArray(job.downloads) && job.downloads.length) {
+          var downloadTray = document.createElement("div");
+          downloadTray.className = "sw-download-tray";
+          var downloadHeading = document.createElement("div");
+          downloadHeading.className = "sw-download-heading";
+          var downloadIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          downloadIcon.classList.add("sw-download-icon");
+          downloadIcon.setAttribute("aria-hidden", "true");
+          var downloadIconUse = document.createElementNS("http://www.w3.org/2000/svg", "use");
+          downloadIconUse.setAttribute("href", "#sw-download-icon");
+          downloadIcon.appendChild(downloadIconUse);
+          downloadHeading.appendChild(downloadIcon);
+          var downloadHeadingText = document.createElement("span");
+          downloadHeadingText.textContent = "ダウンロード";
+          downloadHeading.appendChild(downloadHeadingText);
+          downloadTray.appendChild(downloadHeading);
           var downloads = document.createElement("div");
           downloads.className = "sw-downloads";
           job.downloads.forEach(function (track) {
@@ -761,16 +797,7 @@
             downloadGroup.dataset.track = track.track;
             var downloadLabel = document.createElement("span");
             downloadLabel.className = "sw-download-label";
-            var downloadIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-            downloadIcon.classList.add("sw-download-icon");
-            downloadIcon.setAttribute("aria-hidden", "true");
-            var downloadIconUse = document.createElementNS("http://www.w3.org/2000/svg", "use");
-            downloadIconUse.setAttribute("href", "#sw-download-icon");
-            downloadIcon.appendChild(downloadIconUse);
-            downloadLabel.appendChild(downloadIcon);
-            var downloadLabelText = document.createElement("span");
-            downloadLabelText.textContent = track.label;
-            downloadLabel.appendChild(downloadLabelText);
+            downloadLabel.textContent = track.label;
             downloadGroup.appendChild(downloadLabel);
             track.files.forEach(function (file) {
               var downloadLink = document.createElement("a");
@@ -785,7 +812,8 @@
             });
             downloads.appendChild(downloadGroup);
           });
-          targetBlock.appendChild(downloads);
+          downloadTray.appendChild(downloads);
+          targetBlock.appendChild(downloadTray);
         }
         content.appendChild(targetBlock);
         if (job.status === "error" && job.error) {
