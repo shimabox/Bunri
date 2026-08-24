@@ -39,6 +39,11 @@ class ApiFakeRunner:
             (pkg_dir / f"{safe}.{target}.player.html").write_text(
                 "<html><body>player</body></html>", encoding="utf-8"
             )
+            for suffix in ("", ".backing"):
+                for audio_format in ("mp3", "wav"):
+                    (pkg_dir / f"{safe}.{target}{suffix}.{audio_format}").write_bytes(
+                        b"fake-audio"
+                    )
         return self.returncode
 
 
@@ -104,6 +109,53 @@ def test_job_reaches_done_and_package_url_is_reachable(client):
     assert detail["package_url"] == (
         "/packages/%E6%96%9C%E9%99%BD/%E6%96%9C%E9%99%BD.guitar.player.html"
     )
+    assert detail["downloads"] == [
+        {
+            "track": "target",
+            "label": "ギターのみ",
+            "files": [
+                {
+                    "format": "mp3",
+                    "url": "/packages/%E6%96%9C%E9%99%BD/%E6%96%9C%E9%99%BD.guitar.mp3",
+                    "filename": "斜陽_ギターのみ.mp3",
+                },
+                {
+                    "format": "wav",
+                    "url": "/packages/%E6%96%9C%E9%99%BD/%E6%96%9C%E9%99%BD.guitar.wav",
+                    "filename": "斜陽_ギターのみ.wav",
+                },
+            ],
+        },
+        {
+            "track": "backing",
+            "label": "ギターなし",
+            "files": [
+                {
+                    "format": "mp3",
+                    "url": (
+                        "/packages/%E6%96%9C%E9%99%BD/"
+                        "%E6%96%9C%E9%99%BD.guitar.backing.mp3"
+                    ),
+                    "filename": "斜陽_ギターなし.mp3",
+                },
+                {
+                    "format": "wav",
+                    "url": (
+                        "/packages/%E6%96%9C%E9%99%BD/"
+                        "%E6%96%9C%E9%99%BD.guitar.backing.wav"
+                    ),
+                    "filename": "斜陽_ギターなし.wav",
+                },
+            ],
+        },
+    ]
+    assert client.get("/api/songs").json()[0]["targets"][0]["downloads"] == detail["downloads"]
+    assert "original.mp3" not in str(detail["downloads"])
+
+    import json
+
+    stored = json.loads((client.out_dir / "web" / "jobs" / f"{job_id}.json").read_text())
+    assert "downloads" not in stored
 
     player_res = client.get(detail["package_url"])
     assert player_res.status_code == 200
@@ -262,7 +314,9 @@ def test_delete_active_song_is_409_without_side_effects(tmp_path):
         song_id = c.get("/api/songs").json()[0]["id"]
         response = c.delete(f"/api/songs/{song_id}")
         assert response.status_code == 409
-        assert c.get(f"/api/jobs/{job_id}").status_code == 200
+        detail = c.get(f"/api/jobs/{job_id}")
+        assert detail.status_code == 200
+        assert detail.json()["downloads"] == []
         release.set()
 
 
@@ -326,6 +380,7 @@ def test_failed_job_reports_log_tail_as_error(client):
         assert detail["error"] is not None
         assert "fake bunri run" in detail["error"]
         assert detail["package_url"] is None
+        assert detail["downloads"] == []
 
 
 def test_directory_listing_is_not_exposed(client):
@@ -441,6 +496,43 @@ def test_package_url_is_percent_encoded_for_hash_and_space(tmp_path):
     with TestClient(app) as c:
         detail = c.get("/api/jobs/j-legacy-hash").json()
         assert detail["package_url"] == "/packages/Song%20%231/Song%20%231.guitar.player.html"
+
+
+def test_download_urls_use_legacy_package_name_and_current_safe_title(tmp_path):
+    _write_job_file(
+        tmp_path,
+        "j-legacy-downloads",
+        title="新 曲#100%",
+        package="旧 名#100%/旧 名#100%.zither.player.html",
+        target="zither",
+    )
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        detail = c.get("/api/jobs/j-legacy-downloads").json()
+
+    assert [
+        file["url"] for track in detail["downloads"] for file in track["files"]
+    ] == [
+        "/packages/%E6%97%A7%20%E5%90%8D%23100%25/%E6%97%A7%20%E5%90%8D%23100%25.zither.mp3",
+        "/packages/%E6%97%A7%20%E5%90%8D%23100%25/%E6%97%A7%20%E5%90%8D%23100%25.zither.wav",
+        (
+            "/packages/%E6%97%A7%20%E5%90%8D%23100%25/"
+            "%E6%97%A7%20%E5%90%8D%23100%25.zither.backing.mp3"
+        ),
+        (
+            "/packages/%E6%97%A7%20%E5%90%8D%23100%25/"
+            "%E6%97%A7%20%E5%90%8D%23100%25.zither.backing.wav"
+        ),
+    ]
+    assert [track["label"] for track in detail["downloads"]] == ["zitherのみ", "zitherなし"]
+    assert [
+        file["filename"] for track in detail["downloads"] for file in track["files"]
+    ] == [
+        "新 曲_100__zitherのみ.mp3",
+        "新 曲_100__zitherのみ.wav",
+        "新 曲_100__zitherなし.mp3",
+        "新 曲_100__zitherなし.wav",
+    ]
 
 
 @pytest.mark.parametrize(

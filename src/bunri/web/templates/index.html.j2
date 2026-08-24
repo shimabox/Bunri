@@ -187,6 +187,7 @@
   button.sw-job-toggle[aria-expanded="true"] .sw-job-chevron { transform: rotate(180deg); }
   .sw-job-content { padding: 0 16px 14px; }
   .sw-job-content[hidden] { display: none; }
+  .sw-target-block { min-width: 0; }
   .sw-target-row {
     display: flex;
     align-items: center;
@@ -216,6 +217,30 @@
     font-weight: 600;
   }
   a.sw-open-link:hover { text-decoration: underline; }
+  .sw-downloads {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    min-width: 0;
+    padding: 7px 0 0 5em;
+  }
+  .sw-download-row {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 5px 9px;
+    min-width: 0;
+    font-size: 0.8rem;
+  }
+  .sw-download-label { color: #6f665c; font-weight: 600; }
+  a.sw-download-link {
+    color: #2f8f83;
+    font-weight: 600;
+    text-underline-offset: 2px;
+  }
+  @media (max-width: 480px) {
+    .sw-downloads { padding-left: 0; }
+  }
   details.sw-error-details {
     margin-top: 8px;
     font-size: 0.8rem;
@@ -671,6 +696,9 @@
       });
 
       song.targets.forEach(function (job) {
+        var targetBlock = document.createElement("div");
+        targetBlock.className = "sw-target-block";
+        targetBlock.dataset.target = job.target;
         var row = document.createElement("div");
         row.className = "sw-target-row";
         row.dataset.target = job.target;
@@ -692,7 +720,34 @@
           link.textContent = "プレイヤーを開く";
           row.appendChild(link);
         }
-        content.appendChild(row);
+        targetBlock.appendChild(row);
+        if (job.status === "done" && Array.isArray(job.downloads) && job.downloads.length) {
+          var downloads = document.createElement("div");
+          downloads.className = "sw-downloads";
+          job.downloads.forEach(function (track) {
+            var downloadRow = document.createElement("div");
+            downloadRow.className = "sw-download-row";
+            downloadRow.dataset.track = track.track;
+            var downloadLabel = document.createElement("span");
+            downloadLabel.className = "sw-download-label";
+            downloadLabel.textContent = track.label + ":";
+            downloadRow.appendChild(downloadLabel);
+            track.files.forEach(function (file) {
+              var downloadLink = document.createElement("a");
+              downloadLink.className = "sw-download-link";
+              downloadLink.href = file.url;
+              downloadLink.download = file.filename;
+              downloadLink.setAttribute(
+                "aria-label", track.label + "を" + file.format + "でダウンロード"
+              );
+              downloadLink.textContent = file.format;
+              downloadRow.appendChild(downloadLink);
+            });
+            downloads.appendChild(downloadRow);
+          });
+          targetBlock.appendChild(downloads);
+        }
+        content.appendChild(targetBlock);
         if (job.status === "error" && job.error) {
           var details = document.createElement("details");
           details.className = "sw-error-details";
@@ -702,7 +757,7 @@
           var pre = document.createElement("pre");
           pre.textContent = job.error;
           details.appendChild(pre);
-          content.appendChild(details);
+          targetBlock.appendChild(details);
         }
       });
 

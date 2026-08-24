@@ -43,6 +43,11 @@ class PageFakeRunner:
             (pkg_dir / f"{safe}.{target}.player.html").write_text(
                 "<html><body>player ok</body></html>", encoding="utf-8"
             )
+            for suffix in ("", ".backing"):
+                for audio_format in ("mp3", "wav"):
+                    (pkg_dir / f"{safe}.{target}{suffix}.{audio_format}").write_bytes(
+                        b"fake-audio"
+                    )
         return self.returncode
 
 
@@ -124,7 +129,7 @@ def _upload_from_page(page, audio_path: Path, *, targets: tuple[str, ...] = ("gu
 
 @_needs_browser
 def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
-    runner = PageFakeRunner()
+    runner = PageFakeRunner(delay=1.0)
     app = create_app(tmp_path / "out", runner=runner)
     with _running_server(app) as base_url, _open_page(base_url) as page:
         # No jobs yet -> polling is idle.
@@ -162,6 +167,7 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
 
         badge = page.locator(".sw-target-row .sw-badge").first
         assert badge.text_content() in ("待機中", ) or "処理中" in badge.text_content()
+        assert page.locator("a.sw-download-link").count() == 0
 
         # Once the fake runner finishes, a "プレイヤーを開く" link appears
         # and polling stops (no more active jobs).
@@ -173,6 +179,47 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
             "%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2.guitar.player.html"
         )
         assert page.get_attribute("a.sw-open-link", "target") == "_blank"
+
+        download_links = page.locator("a.sw-download-link")
+        assert download_links.count() == 4
+        assert download_links.all_text_contents() == ["mp3", "wav", "mp3", "wav"]
+        assert download_links.evaluate_all(
+            "links => links.map(link => link.getAttribute('href'))"
+        ) == [
+            (
+                "/packages/%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2/"
+                "%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2.guitar.mp3"
+            ),
+            (
+                "/packages/%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2/"
+                "%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2.guitar.wav"
+            ),
+            (
+                "/packages/%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2/"
+                "%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2.guitar.backing.mp3"
+            ),
+            (
+                "/packages/%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2/"
+                "%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2.guitar.backing.wav"
+            ),
+        ]
+        assert download_links.evaluate_all(
+            "links => links.map(link => link.getAttribute('download'))"
+        ) == [
+            "テスト曲_ギターのみ.mp3",
+            "テスト曲_ギターのみ.wav",
+            "テスト曲_ギターなし.mp3",
+            "テスト曲_ギターなし.wav",
+        ]
+        assert download_links.evaluate_all(
+            "links => links.map(link => link.getAttribute('aria-label'))"
+        ) == [
+            "ギターのみをmp3でダウンロード",
+            "ギターのみをwavでダウンロード",
+            "ギターなしをmp3でダウンロード",
+            "ギターなしをwavでダウンロード",
+        ]
+        assert "original.mp3" not in page.locator("li.sw-job").inner_html()
 
         page.wait_for_function("window.__bunriWeb.isPolling() === false", timeout=5_000)
 
@@ -351,6 +398,32 @@ def test_target_selection_is_required_and_multiple_targets_render_in_one_song(tm
         assert page.locator("li.sw-job").count() == 1
         assert page.locator(".sw-target-row").count() == 2
         assert page.locator('.sw-target-row[data-target="vocals"] .sw-target-label').text_content() == "ボーカル"
+        vocals = page.locator('.sw-target-block[data-target="vocals"]')
+        drums = page.locator('.sw-target-block[data-target="drums"]')
+        assert vocals.locator("a.sw-download-link").count() == 4
+        assert drums.locator("a.sw-download-link").count() == 4
+        assert vocals.locator(".sw-download-label").all_text_contents() == [
+            "ボーカルのみ:", "ボーカルなし:",
+        ]
+        assert drums.locator(".sw-download-label").all_text_contents() == [
+            "ドラムのみ:", "ドラムなし:",
+        ]
+        assert vocals.locator("a.sw-download-link").evaluate_all(
+            "links => links.map(link => link.getAttribute('href'))"
+        ) == [
+            "/packages/band/band.vocals.mp3",
+            "/packages/band/band.vocals.wav",
+            "/packages/band/band.vocals.backing.mp3",
+            "/packages/band/band.vocals.backing.wav",
+        ]
+        assert drums.locator("a.sw-download-link").evaluate_all(
+            "links => links.map(link => link.getAttribute('href'))"
+        ) == [
+            "/packages/band/band.drums.mp3",
+            "/packages/band/band.drums.wav",
+            "/packages/band/band.drums.backing.mp3",
+            "/packages/band/band.drums.backing.wav",
+        ]
         assert [call["target"] for call in runner.calls] == ["drums", "vocals"]
 
 
