@@ -8,7 +8,7 @@
 
 ## 対象
 
-- リポジトリ: `~/shimabox/github/StemLab`
+- リポジトリ: StemLab（現 Bunri。このリポジトリのルートで作業する）
 - 作業ブランチ: plan/2026-08-22-rename-bunri(ここから作成して作業する)
 - ベースブランチ: main
 
