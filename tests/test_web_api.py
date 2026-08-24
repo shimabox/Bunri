@@ -162,6 +162,34 @@ def test_job_reaches_done_and_package_url_is_reachable(client):
     assert "player" in player_res.text
 
 
+def test_missing_download_file_only_makes_its_static_url_404(client):
+    created = _upload(client, title="Missing Track")
+    job_id = created.json()["job_id"]
+    _wait_until(lambda: _job_status(client, job_id) == "done")
+
+    package_dir = client.out_dir / "Missing Track"  # type: ignore[attr-defined]
+    missing_file = package_dir / "Missing Track.guitar.backing.wav"
+    missing_file.unlink()
+
+    jobs = client.get("/api/jobs")
+    assert jobs.status_code == 200
+    job = next(item for item in jobs.json() if item["id"] == job_id)
+    download_files = [
+        file for track in job["downloads"] for file in track["files"]
+    ]
+    assert len(download_files) == 4
+    missing_url = next(
+        file["url"]
+        for file in download_files
+        if file["filename"] == "Missing Track_ギターなし.wav"
+    )
+
+    for file in download_files:
+        response = client.get(file["url"])
+        expected_status = 404 if file["url"] == missing_url else 200
+        assert response.status_code == expected_status, file["url"]
+
+
 def test_default_title_is_filename_stem_when_not_provided(client):
     res = _upload(client, name="my-track.wav", content=b"abc")
     job_id = res.json()["job_id"]

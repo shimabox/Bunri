@@ -12,6 +12,7 @@ _chromium_available skip pattern tests/test_player_html.py uses.
 from __future__ import annotations
 
 import contextlib
+import json
 import socket
 import threading
 import time
@@ -125,6 +126,43 @@ def _upload_from_page(page, audio_path: Path, *, targets: tuple[str, ...] = ("gu
         else:
             checkbox.uncheck()
     page.click("#sw-upload-btn")
+
+
+@_needs_browser
+def test_done_job_with_empty_downloads_does_not_render_download_rows(tmp_path):
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    job_id = "j-done-without-package"
+    record = {
+        "id": job_id,
+        "digest": "done-without-package",
+        "title": "No Package",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-08-24T00:00:00+00:00",
+        "started_at": "2026-08-24T00:00:01+00:00",
+        "finished_at": "2026-08-24T00:00:02+00:00",
+        "error": None,
+        "package": None,
+        "log": None,
+        "upload": None,
+    }
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps(record), encoding="utf-8")
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs().length === 1 && "
+            "window.__bunriWeb.getJobs()[0].status === 'done'"
+        )
+        job = page.evaluate("window.__bunriWeb.getJobs()[0]")
+        assert job["downloads"] == []
+        target = page.locator('.sw-target-block[data-target="guitar"]')
+        assert target.count() == 1
+        assert target.locator(".sw-downloads").count() == 0
+        assert target.locator(".sw-download-row").count() == 0
+        assert target.locator("a.sw-download-link").count() == 0
 
 
 @_needs_browser
