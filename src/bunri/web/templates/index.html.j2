@@ -187,6 +187,7 @@
   button.sw-job-toggle[aria-expanded="true"] .sw-job-chevron { transform: rotate(180deg); }
   .sw-job-content { padding: 0 16px 14px; }
   .sw-job-content[hidden] { display: none; }
+  .sw-target-block { min-width: 0; }
   .sw-target-row {
     display: flex;
     align-items: center;
@@ -216,6 +217,74 @@
     font-weight: 600;
   }
   a.sw-open-link:hover { text-decoration: underline; }
+  .sw-download-tray {
+    width: fit-content;
+    max-width: calc(100% - 5em);
+    box-sizing: border-box;
+    margin: 7px 0 0 5em;
+    padding: 10px 14px 12px;
+    border: 1px solid #f1e8da;
+    border-radius: 12px;
+    background: #faf6f0;
+  }
+  .sw-download-heading {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 9px;
+    color: #6f665c;
+    font-size: 0.75rem;
+    font-weight: 700;
+  }
+  .sw-download-heading .sw-download-icon { color: #2f8f83; }
+  .sw-downloads {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    min-width: 0;
+  }
+  .sw-download-group {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid #e6d9c4;
+    border-radius: 999px;
+    overflow: hidden;
+    background: #ffffff;
+  }
+  .sw-download-label {
+    display: inline-flex;
+    align-items: center;
+    padding: 5px 11px;
+    background: #ece0cc;
+    color: #635a4f;
+    font-size: 0.78rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .sw-download-icon {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+  }
+  a.sw-download-link {
+    display: inline-flex;
+    align-items: center;
+    padding: 5px 11px;
+    border-left: 1px solid #efe6d8;
+    color: #2f8f83;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-decoration: none;
+    text-transform: uppercase;
+  }
+  a.sw-download-link:hover { background: #e9f5f2; }
+  @media (max-width: 480px) {
+    .sw-download-tray {
+      max-width: 100%;
+      margin-left: 0;
+    }
+  }
   details.sw-error-details {
     margin-top: 8px;
     font-size: 0.8rem;
@@ -295,6 +364,14 @@
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+  <defs>
+    <symbol id="sw-download-icon" viewBox="0 0 16 16">
+      <path d="M8 1.5v8m0 0L4.8 6.3M8 9.5l3.2-3.2M2.5 12v1.2c0 .7.6 1.3 1.3 1.3h8.4c.7 0 1.3-.6 1.3-1.3V12"
+            fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+  </defs>
+</svg>
 <header class="sw-header">
   <h1 class="sw-title">Bunri</h1>
   <p class="sw-sub">音源から楽器別の練習パッケージを作る</p>
@@ -671,6 +748,9 @@
       });
 
       song.targets.forEach(function (job) {
+        var targetBlock = document.createElement("div");
+        targetBlock.className = "sw-target-block";
+        targetBlock.dataset.target = job.target;
         var row = document.createElement("div");
         row.className = "sw-target-row";
         row.dataset.target = job.target;
@@ -692,7 +772,50 @@
           link.textContent = "プレイヤーを開く";
           row.appendChild(link);
         }
-        content.appendChild(row);
+        targetBlock.appendChild(row);
+        if (job.status === "done" && Array.isArray(job.downloads) && job.downloads.length) {
+          var downloadTray = document.createElement("div");
+          downloadTray.className = "sw-download-tray";
+          var downloadHeading = document.createElement("div");
+          downloadHeading.className = "sw-download-heading";
+          var downloadIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          downloadIcon.classList.add("sw-download-icon");
+          downloadIcon.setAttribute("aria-hidden", "true");
+          var downloadIconUse = document.createElementNS("http://www.w3.org/2000/svg", "use");
+          downloadIconUse.setAttribute("href", "#sw-download-icon");
+          downloadIcon.appendChild(downloadIconUse);
+          downloadHeading.appendChild(downloadIcon);
+          var downloadHeadingText = document.createElement("span");
+          downloadHeadingText.textContent = "ダウンロード";
+          downloadHeading.appendChild(downloadHeadingText);
+          downloadTray.appendChild(downloadHeading);
+          var downloads = document.createElement("div");
+          downloads.className = "sw-downloads";
+          job.downloads.forEach(function (track) {
+            var downloadGroup = document.createElement("div");
+            downloadGroup.className = "sw-download-group";
+            downloadGroup.dataset.track = track.track;
+            var downloadLabel = document.createElement("span");
+            downloadLabel.className = "sw-download-label";
+            downloadLabel.textContent = track.label;
+            downloadGroup.appendChild(downloadLabel);
+            track.files.forEach(function (file) {
+              var downloadLink = document.createElement("a");
+              downloadLink.className = "sw-download-link";
+              downloadLink.href = file.url;
+              downloadLink.download = file.filename;
+              downloadLink.setAttribute(
+                "aria-label", track.label + "を" + file.format + "でダウンロード"
+              );
+              downloadLink.textContent = file.format;
+              downloadGroup.appendChild(downloadLink);
+            });
+            downloads.appendChild(downloadGroup);
+          });
+          downloadTray.appendChild(downloads);
+          targetBlock.appendChild(downloadTray);
+        }
+        content.appendChild(targetBlock);
         if (job.status === "error" && job.error) {
           var details = document.createElement("details");
           details.className = "sw-error-details";
@@ -702,7 +825,7 @@
           var pre = document.createElement("pre");
           pre.textContent = job.error;
           details.appendChild(pre);
-          content.appendChild(details);
+          targetBlock.appendChild(details);
         }
       });
 

@@ -52,6 +52,36 @@ def _elapsed_seconds(job: Job) -> Optional[float]:
     return max(0.0, (end - start).total_seconds())
 
 
+def _target_label(target: str) -> str:
+    return REGISTRY[target].label_ja if target in REGISTRY else target
+
+
+def _download_files(job: Job) -> list[dict]:
+    if job.status != "done" or not job.package:
+        return []
+
+    package_name = job.package.split("/", 1)[0]
+    title = safe_filename(job.title)
+    target_label = _target_label(job.target)
+    downloads = []
+    for track, label, suffix in (
+        ("target", f"{target_label}のみ", ""),
+        ("backing", f"{target_label}なし", ".backing"),
+    ):
+        files = []
+        for audio_format in ("mp3", "wav"):
+            audio_name = f"{package_name}.{job.target}{suffix}.{audio_format}"
+            files.append(
+                {
+                    "format": audio_format,
+                    "url": f"/packages/{quote(f'{package_name}/{audio_name}')}",
+                    "filename": f"{title}_{label}.{audio_format}",
+                }
+            )
+        downloads.append({"track": track, "label": label, "files": files})
+    return downloads
+
+
 def _serialize_job(job: Job) -> dict:
     return {
         "id": job.id,
@@ -69,6 +99,7 @@ def _serialize_job(job: Job) -> dict:
         # slug (see safe_filename) and the user-controlled title can still
         # contain those characters even though the slug itself never does.
         "package_url": f"/packages/{quote(job.package)}" if job.package else None,
+        "downloads": _download_files(job),
         "error": job.error,
     }
 
@@ -78,9 +109,7 @@ def _serialize_song(song: Song) -> dict:
     for job in song.targets:
         serialized = _serialize_job(job)
         serialized.pop("title")
-        serialized["target_label"] = (
-            REGISTRY[job.target].label_ja if job.target in REGISTRY else job.target
-        )
+        serialized["target_label"] = _target_label(job.target)
         targets.append(serialized)
     return {
         "id": song.id,
