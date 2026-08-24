@@ -129,7 +129,7 @@ def _upload_from_page(page, audio_path: Path, *, targets: tuple[str, ...] = ("gu
 
 
 @_needs_browser
-def test_done_job_with_empty_downloads_does_not_render_download_rows(tmp_path):
+def test_done_job_with_empty_downloads_does_not_render_download_controls(tmp_path):
     out_dir = tmp_path / "out"
     jobs_dir = out_dir / "web" / "jobs"
     jobs_dir.mkdir(parents=True)
@@ -160,8 +160,7 @@ def test_done_job_with_empty_downloads_does_not_render_download_rows(tmp_path):
         assert job["downloads"] == []
         target = page.locator('.sw-target-block[data-target="guitar"]')
         assert target.count() == 1
-        assert target.locator(".sw-download-tray").count() == 0
-        assert target.locator(".sw-download-heading").count() == 0
+        assert target.locator("button.sw-download-toggle").count() == 0
         assert target.locator(".sw-downloads").count() == 0
         assert target.locator(".sw-download-group").count() == 0
         assert target.locator("a.sw-download-link").count() == 0
@@ -219,19 +218,31 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
             "%E3%83%86%E3%82%B9%E3%83%88%E6%9B%B2.guitar.player.html"
         )
         assert page.get_attribute("a.sw-open-link", "target") == "_blank"
+        assert page.get_attribute("a.sw-open-link", "rel") == "noopener"
+        assert page.locator("a.sw-open-link").inner_text() == "プレイヤーを開く"
 
+        download_toggle = page.locator("button.sw-download-toggle")
+        assert download_toggle.count() == 1
+        assert download_toggle.get_attribute("aria-expanded") == "false"
+        assert download_toggle.text_content() == "ダウンロード▼"
+        assert download_toggle.locator("svg.sw-download-icon use").get_attribute("href") == (
+            "#sw-download-icon"
+        )
+        downloads = page.locator(".sw-downloads")
+        assert download_toggle.get_attribute("aria-controls") == downloads.get_attribute("id")
+        assert downloads.get_attribute("hidden") == ""
+        assert downloads.is_hidden()
         download_links = page.locator("a.sw-download-link")
         assert download_links.count() == 4
+        assert download_links.evaluate_all("links => links.every(link => !link.checkVisibility())")
+
+        download_toggle.click()
+        assert download_toggle.get_attribute("aria-expanded") == "true"
+        assert downloads.get_attribute("hidden") is None
+        assert downloads.is_visible()
         assert download_links.all_text_contents() == ["mp3", "wav", "mp3", "wav"]
         download_groups = page.locator(".sw-download-group")
         assert download_groups.count() == 2
-        download_tray = page.locator(".sw-download-tray")
-        assert download_tray.count() == 1
-        download_heading = download_tray.locator(".sw-download-heading")
-        assert download_heading.text_content() == "ダウンロード"
-        assert download_heading.locator("svg.sw-download-icon use").get_attribute("href") == (
-            "#sw-download-icon"
-        )
         assert download_groups.locator(".sw-download-label").all_text_contents() == [
             "ギターのみ", "ギターなし",
         ]
@@ -273,6 +284,20 @@ def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
             "ギターなしをwavでダウンロード",
         ]
         assert "original.mp3" not in page.locator("li.sw-job").inner_html()
+
+        page.evaluate(
+            "window.__downloadToggleBeforeRefresh = "
+            "document.querySelector('button.sw-download-toggle')"
+        )
+        page.evaluate("window.__bunriWeb.refresh()")
+        page.wait_for_function(
+            "window.__downloadToggleBeforeRefresh && "
+            "!window.__downloadToggleBeforeRefresh.isConnected"
+        )
+        download_toggle = page.locator("button.sw-download-toggle")
+        downloads = page.locator(".sw-downloads")
+        assert download_toggle.get_attribute("aria-expanded") == "true"
+        assert downloads.is_visible()
 
         page.wait_for_function("window.__bunriWeb.isPolling() === false", timeout=5_000)
 
@@ -453,14 +478,21 @@ def test_target_selection_is_required_and_multiple_targets_render_in_one_song(tm
         assert page.locator('.sw-target-row[data-target="vocals"] .sw-target-label').text_content() == "ボーカル"
         vocals = page.locator('.sw-target-block[data-target="vocals"]')
         drums = page.locator('.sw-target-block[data-target="drums"]')
+        vocals_toggle = vocals.locator("button.sw-download-toggle")
+        drums_toggle = drums.locator("button.sw-download-toggle")
+        assert vocals_toggle.get_attribute("aria-expanded") == "false"
+        assert drums_toggle.get_attribute("aria-expanded") == "false"
         assert vocals.locator("a.sw-download-link").count() == 4
         assert drums.locator("a.sw-download-link").count() == 4
         assert vocals.locator(".sw-download-group").count() == 2
         assert drums.locator(".sw-download-group").count() == 2
-        assert vocals.locator(".sw-download-tray").count() == 1
-        assert drums.locator(".sw-download-tray").count() == 1
-        assert vocals.locator(".sw-download-heading").text_content() == "ダウンロード"
-        assert drums.locator(".sw-download-heading").text_content() == "ダウンロード"
+        assert vocals.locator(".sw-downloads").is_hidden()
+        assert drums.locator(".sw-downloads").is_hidden()
+        vocals_toggle.click()
+        assert vocals_toggle.get_attribute("aria-expanded") == "true"
+        assert drums_toggle.get_attribute("aria-expanded") == "false"
+        assert vocals.locator(".sw-downloads").is_visible()
+        assert drums.locator(".sw-downloads").is_hidden()
         assert vocals.locator(".sw-download-label").all_text_contents() == [
             "ボーカルのみ", "ボーカルなし",
         ]
