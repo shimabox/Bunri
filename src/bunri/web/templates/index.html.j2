@@ -211,27 +211,36 @@
   .sw-badge-error { background: #fbe9e6; color: #c0392b; }
   .sw-summary-badge { padding: 2px 8px; font-size: 0.72rem; }
   a.sw-open-link {
-    font-size: 0.85rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.82rem;
+    font-weight: 700;
     color: #2f8f83;
     text-decoration: none;
-    font-weight: 600;
+    background: #ffffff;
+    border: 1.5px solid #2f8f83;
+    border-radius: 999px;
+    padding: 4px 14px;
   }
-  a.sw-open-link:hover { text-decoration: underline; }
+  a.sw-open-link:hover { background: #e9f5f2; text-decoration: none; }
+  .sw-play-icon {
+    width: 0.8em;
+    height: 0.8em;
+    flex: none;
+  }
   .sw-download-tray {
     width: fit-content;
     max-width: calc(100% - 5em);
     box-sizing: border-box;
     margin: 7px 0 0 5em;
-    padding: 10px 14px 12px;
-    border: 1px solid #f1e8da;
-    border-radius: 12px;
-    background: #faf6f0;
+    padding: 6px 0 2px;
   }
   .sw-download-heading {
     display: flex;
     align-items: center;
     gap: 6px;
-    margin-bottom: 9px;
+    margin-bottom: 7px;
     color: #6f665c;
     font-size: 0.75rem;
     font-weight: 700;
@@ -369,6 +378,9 @@
     <symbol id="sw-download-icon" viewBox="0 0 16 16">
       <path d="M8 1.5v8m0 0L4.8 6.3M8 9.5l3.2-3.2M2.5 12v1.2c0 .7.6 1.3 1.3 1.3h8.4c.7 0 1.3-.6 1.3-1.3V12"
             fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="sw-play-icon" viewBox="0 0 16 16">
+      <path d="M4 2.5v11l9-5.5z" fill="currentColor"/>
     </symbol>
   </defs>
 </svg>
@@ -769,7 +781,14 @@
           link.target = "_blank";
           link.rel = "noopener";
           link.className = "sw-open-link";
-          link.textContent = "プレイヤーを開く";
+          var playIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          playIcon.classList.add("sw-play-icon");
+          playIcon.setAttribute("aria-hidden", "true");
+          var playIconUse = document.createElementNS("http://www.w3.org/2000/svg", "use");
+          playIconUse.setAttribute("href", "#sw-play-icon");
+          playIcon.appendChild(playIconUse);
+          link.appendChild(playIcon);
+          link.appendChild(document.createTextNode("プレイヤーを開く"));
           row.appendChild(link);
         }
         targetBlock.appendChild(row);
