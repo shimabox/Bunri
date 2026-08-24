@@ -702,11 +702,16 @@
 
   function renderSongs(songs) {
     var focusedSongId = null;
+    var focusedDownloadJobId = null;
     var activeElement = document.activeElement;
     if (activeElement && activeElement.matches("button.sw-job-toggle")) {
       var focusedCard = activeElement.closest("li.sw-job");
       if (focusedCard && jobListEl.contains(focusedCard)) {
         focusedSongId = focusedCard.dataset.songId;
+      }
+    } else if (activeElement && activeElement.matches("button.sw-download-toggle")) {
+      if (jobListEl.contains(activeElement)) {
+        focusedDownloadJobId = activeElement.dataset.jobId;
       }
     }
 
@@ -805,6 +810,7 @@
           var downloadToggle = document.createElement("button");
           downloadToggle.type = "button";
           downloadToggle.className = "sw-download-toggle";
+          downloadToggle.dataset.jobId = job.id;
           downloadToggle.setAttribute("aria-expanded", String(downloadsExpanded));
           downloadToggle.setAttribute("aria-controls", downloadsId);
           var downloadIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -890,7 +896,15 @@
       jobListEl.appendChild(li);
     });
 
-    if (focusedSongId !== null) {
+    if (focusedDownloadJobId !== null) {
+      var replacementDownloadToggle = Array.prototype.find.call(
+        jobListEl.querySelectorAll("button.sw-download-toggle"),
+        function (button) { return button.dataset.jobId === focusedDownloadJobId; }
+      );
+      if (replacementDownloadToggle) {
+        replacementDownloadToggle.focus({ preventScroll: true });
+      }
+    } else if (focusedSongId !== null) {
       var replacementCard = Array.prototype.find.call(
         jobListEl.querySelectorAll("li.sw-job"),
         function (card) { return card.dataset.songId === focusedSongId; }

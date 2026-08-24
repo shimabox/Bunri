@@ -410,6 +410,68 @@ def test_song_toggle_focus_survives_polling_redraw(tmp_path):
 
 
 @_needs_browser
+def test_download_toggle_focus_survives_partial_completion_polling_redraw(tmp_path):
+    class TargetDelayRunner(PageFakeRunner):
+        def __call__(
+            self,
+            upload_path: Path,
+            out_dir: Path,
+            title: str,
+            target: str,
+            log_path: Path,
+        ) -> int:
+            self.delay = 0.1 if target == "guitar" else 5.0
+            return super().__call__(upload_path, out_dir, title, target, log_path)
+
+    app = create_app(tmp_path / "out", runner=TargetDelayRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        _upload_from_page(
+            page,
+            tmp_path / "partial-focus-song.mp3",
+            targets=("guitar", "vocals"),
+        )
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs().some(function (j) { "
+            "  return j.target === 'guitar' && j.status === 'done'; "
+            "}) && window.__bunriWeb.getJobs().some(function (j) { "
+            "  return j.target === 'vocals' && j.status === 'running'; "
+            "})",
+            timeout=5_000,
+        )
+
+        download_toggle = page.locator(
+            '.sw-target-block[data-target="guitar"] button.sw-download-toggle'
+        )
+        download_toggle.click()
+        download_toggle.focus()
+        job_id = download_toggle.get_attribute("data-job-id")
+        assert job_id
+        assert download_toggle.get_attribute("aria-expanded") == "true"
+        assert download_toggle.evaluate("button => document.activeElement === button")
+
+        page.evaluate(
+            "window.__focusedDownloadToggleBeforePoll = "
+            "document.querySelector("
+            "  '.sw-target-block[data-target=\"guitar\"] button.sw-download-toggle'"
+            ")"
+        )
+        page.wait_for_function(
+            "window.__focusedDownloadToggleBeforePoll && "
+            "!window.__focusedDownloadToggleBeforePoll.isConnected",
+            timeout=4_000,
+        )
+        assert page.evaluate(
+            "jobId => {"
+            "  const active = document.activeElement;"
+            "  return active && active.matches('button.sw-download-toggle') && "
+            "    active.dataset.jobId === jobId && "
+            "    active.getAttribute('aria-expanded') === 'true';"
+            "}",
+            job_id,
+        )
+
+
+@_needs_browser
 def test_dragover_highlights_dropzone(tmp_path):
     app = create_app(tmp_path / "out", runner=PageFakeRunner())
     with _running_server(app) as base_url, _open_page(base_url) as page:
