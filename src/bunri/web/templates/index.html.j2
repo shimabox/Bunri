@@ -211,39 +211,58 @@
   .sw-badge-error { background: #fbe9e6; color: #c0392b; }
   .sw-summary-badge { padding: 2px 8px; font-size: 0.72rem; }
   a.sw-open-link {
-    font-size: 0.85rem;
-    color: #2f8f83;
-    text-decoration: none;
-    font-weight: 600;
-  }
-  a.sw-open-link:hover { text-decoration: underline; }
-  .sw-download-tray {
-    width: fit-content;
-    max-width: calc(100% - 5em);
-    box-sizing: border-box;
-    margin: 7px 0 0 5em;
-    padding: 10px 14px 12px;
-    border: 1px solid #f1e8da;
-    border-radius: 12px;
-    background: #faf6f0;
-  }
-  .sw-download-heading {
-    display: flex;
+    display: inline-flex;
     align-items: center;
     gap: 6px;
-    margin-bottom: 9px;
-    color: #6f665c;
-    font-size: 0.75rem;
+    font-size: 0.82rem;
     font-weight: 700;
+    color: #2f8f83;
+    text-decoration: none;
+    background: #ffffff;
+    border: 1.5px solid #2f8f83;
+    border-radius: 999px;
+    padding: 4px 14px;
   }
-  .sw-download-heading .sw-download-icon { color: #2f8f83; }
+  a.sw-open-link:hover { background: #e9f5f2; text-decoration: none; }
+  .sw-play-icon {
+    width: 0.8em;
+    height: 0.8em;
+    flex: none;
+  }
+  button.sw-download-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 13px;
+    border: 1px solid #e6d9c4;
+    border-radius: 999px;
+    background: #ffffff;
+    color: #3a322c;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.sw-download-toggle:hover {
+    border-color: #e2674e;
+    background: #fff7ee;
+  }
+  button.sw-download-toggle[aria-expanded="true"] { background: #fff7ee; }
+  .sw-download-caret {
+    display: inline-block;
+    transition: transform 0.15s;
+  }
+  button.sw-download-toggle[aria-expanded="true"] .sw-download-caret {
+    transform: rotate(180deg);
+  }
   .sw-downloads {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 8px;
     min-width: 0;
+    padding: 8px 0 2px 5em;
   }
+  .sw-downloads[hidden] { display: none; }
   .sw-download-group {
     display: inline-flex;
     align-items: stretch;
@@ -280,10 +299,7 @@
   }
   a.sw-download-link:hover { background: #e9f5f2; }
   @media (max-width: 480px) {
-    .sw-download-tray {
-      max-width: 100%;
-      margin-left: 0;
-    }
+    .sw-downloads { padding-left: 0; }
   }
   details.sw-error-details {
     margin-top: 8px;
@@ -369,6 +385,9 @@
     <symbol id="sw-download-icon" viewBox="0 0 16 16">
       <path d="M8 1.5v8m0 0L4.8 6.3M8 9.5l3.2-3.2M2.5 12v1.2c0 .7.6 1.3 1.3 1.3h8.4c.7 0 1.3-.6 1.3-1.3V12"
             fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="sw-play-icon" viewBox="0 0 16 16">
+      <path d="M4 2.5v11l9-5.5z" fill="currentColor"/>
     </symbol>
   </defs>
 </svg>
@@ -474,6 +493,7 @@
   var pollTimer = null;
   var songsCache = [];
   var songExpandedStates = Object.create(null);
+  var downloadExpandedStates = Object.create(null);
   var deleteDialogSong = null;
   var deleteSubmitting = false;
 
@@ -682,11 +702,16 @@
 
   function renderSongs(songs) {
     var focusedSongId = null;
+    var focusedDownloadJobId = null;
     var activeElement = document.activeElement;
     if (activeElement && activeElement.matches("button.sw-job-toggle")) {
       var focusedCard = activeElement.closest("li.sw-job");
       if (focusedCard && jobListEl.contains(focusedCard)) {
         focusedSongId = focusedCard.dataset.songId;
+      }
+    } else if (activeElement && activeElement.matches("button.sw-download-toggle")) {
+      if (jobListEl.contains(activeElement)) {
+        focusedDownloadJobId = activeElement.dataset.jobId;
       }
     }
 
@@ -769,28 +794,44 @@
           link.target = "_blank";
           link.rel = "noopener";
           link.className = "sw-open-link";
-          link.textContent = "プレイヤーを開く";
+          var playIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          playIcon.classList.add("sw-play-icon");
+          playIcon.setAttribute("aria-hidden", "true");
+          var playIconUse = document.createElementNS("http://www.w3.org/2000/svg", "use");
+          playIconUse.setAttribute("href", "#sw-play-icon");
+          playIcon.appendChild(playIconUse);
+          link.appendChild(playIcon);
+          link.appendChild(document.createTextNode("プレイヤーを開く"));
           row.appendChild(link);
         }
-        targetBlock.appendChild(row);
         if (job.status === "done" && Array.isArray(job.downloads) && job.downloads.length) {
-          var downloadTray = document.createElement("div");
-          downloadTray.className = "sw-download-tray";
-          var downloadHeading = document.createElement("div");
-          downloadHeading.className = "sw-download-heading";
+          var downloadsExpanded = downloadExpandedStates[job.id] === true;
+          var downloadsId = "sw-downloads-" + job.id;
+          var downloadToggle = document.createElement("button");
+          downloadToggle.type = "button";
+          downloadToggle.className = "sw-download-toggle";
+          downloadToggle.dataset.jobId = job.id;
+          downloadToggle.setAttribute("aria-expanded", String(downloadsExpanded));
+          downloadToggle.setAttribute("aria-controls", downloadsId);
           var downloadIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
           downloadIcon.classList.add("sw-download-icon");
           downloadIcon.setAttribute("aria-hidden", "true");
           var downloadIconUse = document.createElementNS("http://www.w3.org/2000/svg", "use");
           downloadIconUse.setAttribute("href", "#sw-download-icon");
           downloadIcon.appendChild(downloadIconUse);
-          downloadHeading.appendChild(downloadIcon);
-          var downloadHeadingText = document.createElement("span");
-          downloadHeadingText.textContent = "ダウンロード";
-          downloadHeading.appendChild(downloadHeadingText);
-          downloadTray.appendChild(downloadHeading);
+          downloadToggle.appendChild(downloadIcon);
+          downloadToggle.appendChild(document.createTextNode("ダウンロード"));
+          var downloadCaret = document.createElement("span");
+          downloadCaret.className = "sw-download-caret";
+          downloadCaret.setAttribute("aria-hidden", "true");
+          downloadCaret.textContent = "▼";
+          downloadToggle.appendChild(downloadCaret);
+          row.appendChild(downloadToggle);
+          targetBlock.appendChild(row);
           var downloads = document.createElement("div");
           downloads.className = "sw-downloads";
+          downloads.id = downloadsId;
+          downloads.hidden = !downloadsExpanded;
           job.downloads.forEach(function (track) {
             var downloadGroup = document.createElement("div");
             downloadGroup.className = "sw-download-group";
@@ -812,8 +853,15 @@
             });
             downloads.appendChild(downloadGroup);
           });
-          downloadTray.appendChild(downloads);
-          targetBlock.appendChild(downloadTray);
+          downloadToggle.addEventListener("click", function () {
+            var nextExpanded = downloadToggle.getAttribute("aria-expanded") !== "true";
+            downloadExpandedStates[job.id] = nextExpanded;
+            downloadToggle.setAttribute("aria-expanded", String(nextExpanded));
+            downloads.hidden = !nextExpanded;
+          });
+          targetBlock.appendChild(downloads);
+        } else {
+          targetBlock.appendChild(row);
         }
         content.appendChild(targetBlock);
         if (job.status === "error" && job.error) {
@@ -848,7 +896,15 @@
       jobListEl.appendChild(li);
     });
 
-    if (focusedSongId !== null) {
+    if (focusedDownloadJobId !== null) {
+      var replacementDownloadToggle = Array.prototype.find.call(
+        jobListEl.querySelectorAll("button.sw-download-toggle"),
+        function (button) { return button.dataset.jobId === focusedDownloadJobId; }
+      );
+      if (replacementDownloadToggle) {
+        replacementDownloadToggle.focus({ preventScroll: true });
+      }
+    } else if (focusedSongId !== null) {
       var replacementCard = Array.prototype.find.call(
         jobListEl.querySelectorAll("li.sw-job"),
         function (card) { return card.dataset.songId === focusedSongId; }
