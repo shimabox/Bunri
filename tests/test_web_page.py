@@ -52,24 +52,32 @@ class PageFakeRunner:
         return self.returncode
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _bound_socket() -> socket.socket:
+    """Bind an ephemeral loopback port and hand the socket to uvicorn.
+
+    Picking a free port number and letting uvicorn bind it later leaves a
+    window where another test worker (pytest-xdist) can grab the same port.
+    Binding here and passing the socket in closes that window entirely.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    return sock
 
 
 @contextlib.contextmanager
 def _running_server(app):
     import uvicorn
 
-    port = _free_port()
+    sock = _bound_socket()
+    port = sock.getsockname()[1]
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, daemon=True)
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
 
     deadline = time.time() + 10
-    while not server.started and time.time() < deadline:
+    while not server.started and thread.is_alive() and time.time() < deadline:
         time.sleep(0.02)
     assert server.started, "uvicorn server failed to start in time"
 

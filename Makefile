@@ -17,6 +17,6 @@ ifndef FILE
 endif
 	uv run bunri "$(FILE)"
 
-# 開発用: 全テスト実行
+# 開発用: 全テスト実行(pytest-xdist で並列実行)
 test:
-	uv run pytest -q
+	uv run pytest -q -n auto
