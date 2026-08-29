@@ -69,4 +69,6 @@ dev = [
     "hypothesis",
     "playwright>=1.61.0",
     "pytest",
+    # Runs the suite across multiple workers (-n auto) to cut CI wall time.
+    "pytest-xdist>=3.8.0",
 ]
