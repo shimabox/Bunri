@@ -32,14 +32,14 @@ def test_upstream_stable_golden(name):
     assert stable_json(value) == (FIXTURES / "stable" / f"{name}.stable.json").read_bytes()
 
 
-@pytest.mark.parametrize("name", ["number-forms", "unicode-keys-nested", "non-finite"])
+@pytest.mark.parametrize("name", ["number-forms", "unicode-keys-nested", "lone-surrogates", "non-finite"])
 def test_stable_json_boundary_golden(name):
     golden = (FIXTURES / "stable" / f"{name}.stable.json").read_bytes()
     assert stable_json(parse_json(golden)) == golden
     assert golden.endswith(b"\n") and not golden.endswith(b"\n\n") and not golden.startswith(b"\xef\xbb\xbf")
 
 
-@pytest.mark.parametrize("name", ["number-forms", "unicode-keys-nested"])
+@pytest.mark.parametrize("name", ["number-forms", "unicode-keys-nested", "lone-surrogates"])
 def test_stable_json_boundary_inputs_reproduce_golden(name):
     value = parse_json((FIXTURES / "stable" / f"{name}.input.json").read_bytes())
     assert stable_json(value) == (FIXTURES / "stable" / f"{name}.stable.json").read_bytes()
@@ -89,3 +89,9 @@ def test_manifest_requires_original_key_but_accepts_null():
 def test_remote_numbers_are_parsed_as_ecmascript_binary64():
     value = parse_json(b'{"unknown":9007199254740993}')
     assert stable_json(value) == b'{"unknown":9007199254740992}\n'
+
+
+@pytest.mark.parametrize("constant", [b"NaN", b"Infinity", b"-Infinity"])
+def test_remote_non_json_constants_are_rejected(constant):
+    with pytest.raises(ProtocolError, match="invalid JSON document"):
+        parse_json(b'{"unknown":' + constant + b"}")

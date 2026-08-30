@@ -37,10 +37,14 @@ def parse_json(data: bytes) -> Any:
             data.decode("utf-8"),
             parse_int=float,
             parse_float=float,
-            parse_constant=lambda x: float(x),
+            parse_constant=_reject_non_json_constant,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProtocolError("invalid JSON document") from exc
+
+
+def _reject_non_json_constant(_value: str) -> Any:
+    raise ProtocolError("invalid JSON document")
 
 
 def _array_index(key: str) -> int | None:
@@ -103,7 +107,20 @@ def _serialize(value: Any) -> str:
     if isinstance(value, (int, float)):
         return _number(value)
     if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        normalized: list[str] = []
+        index = 0
+        while index < len(value):
+            code_point = ord(value[index])
+            if 0xD800 <= code_point <= 0xDBFF and index + 1 < len(value):
+                low = ord(value[index + 1])
+                if 0xDC00 <= low <= 0xDFFF:
+                    normalized.append(chr(0x10000 + (code_point - 0xD800) * 0x400 + low - 0xDC00))
+                    index += 2
+                    continue
+            normalized.append(value[index])
+            index += 1
+        text = json.dumps("".join(normalized), ensure_ascii=False, separators=(",", ":"))
+        return re.sub(r"[\ud800-\udfff]", lambda match: f"\\u{ord(match.group()):04x}", text)
     if isinstance(value, list):
         return "[" + ",".join(_serialize(x) for x in value) + "]"
     if isinstance(value, dict) and all(isinstance(k, str) for k in value):

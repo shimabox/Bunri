@@ -36,8 +36,14 @@ The exact input for each stable golden is:
   `number-forms.input.json` bytes. The source text intentionally retains `1.0` and `-0`.
 - `unicode-keys-nested.stable.json`: `JSON.parse()` the adjacent
   `unicode-keys-nested.input.json` bytes. This is also the array-index key ordering input.
+- `lone-surrogates.stable.json`: `JSON.parse()` the adjacent
+  `lone-surrogates.input.json` bytes. The input contains lone high and low surrogates in
+  both a string value and object keys, plus ordinary non-ASCII text and a valid pair.
 - `non-finite.stable.json`: use this JavaScript value, which JSON cannot represent:
   `{ nan: NaN, negative: -Infinity, positive: Infinity }`.
+
+`JSON.parse()` rejects textual `NaN` and `Infinity`. The non-finite golden records only
+the serializer rule for JavaScript values that already exist in memory.
 
 For every case, pass that parsed or literal JavaScript value to `stableJson()` and write
 the returned string directly to the corresponding `*.stable.json` file on stdout. Do not

@@ -75,6 +75,15 @@ def test_sidecar_violation_and_missing_mp3_are_reported_together(tmp_path):
     assert any("Song.guitar.backing.mp3" in issue for issue in exc.value.issues)
 
 
+def test_invalid_utf8_sidecar_is_reported_as_invalid_metadata(tmp_path):
+    out, directory = _package(tmp_path)
+    sidecar = directory / ".bunri-package.json"
+    sidecar.write_bytes(b'{"title":"\xff"}')
+    with pytest.raises(LocalPreflightError) as exc:
+        preflight(out, "Song")
+    assert exc.value.issues == [f"invalid package metadata: {sidecar}"]
+
+
 def test_legacy_package_and_directory_symlink_are_refused(tmp_path):
     out = tmp_path / "out"; package = out / "Old"; package.mkdir(parents=True)
     with pytest.raises(LocalPreflightError) as exc: preflight(out, "Old")

@@ -117,7 +117,7 @@ def preflight(out_dir: Path, safe_name: str, *, include_original: bool = True) -
         raise LocalPreflightError([f"package metadata is not a regular file: {sidecar}"])
     try:
         raw = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise LocalPreflightError([f"invalid package metadata: {sidecar}"]) from exc
     issues = _sidecar_issues(raw, safe_name)
     metadata: PackageMetadata | None = None
