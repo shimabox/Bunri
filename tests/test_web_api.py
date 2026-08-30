@@ -162,6 +162,13 @@ def test_job_reaches_done_and_package_url_is_reachable(client):
     assert "player" in player_res.text
 
 
+def test_package_sidecar_is_never_served(client):
+    package = client.out_dir / "Song"
+    package.mkdir()
+    (package / ".bunri-package.json").write_text('{"schema_version":1}')
+    assert client.get("/packages/Song/.bunri-package.json").status_code == 404
+
+
 def test_missing_download_file_only_makes_its_static_url_404(client):
     created = _upload(client, title="Missing Track")
     job_id = created.json()["job_id"]

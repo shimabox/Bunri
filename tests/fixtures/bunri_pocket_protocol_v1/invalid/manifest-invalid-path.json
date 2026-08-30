@@ -1,0 +1,9 @@
+{
+  "schema_version": "1.0",
+  "song_id": "0123456789ab",
+  "title": "Invalid Path",
+  "source": { "algorithm": "sha1", "digest": "0123456789abcdef0123456789abcdef01234567", "cache_key": "0123456789ab" },
+  "original": { "path": "../original.mp3", "content_type": "audio/mpeg", "bytes": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  "instruments": [],
+  "updated_at": "2026-08-29T00:00:00.000Z"
+}

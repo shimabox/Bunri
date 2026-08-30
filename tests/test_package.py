@@ -122,6 +122,12 @@ def test_build_package_skips_mp3_when_disabled(tmp_path, song_input):
     assert "song.guitar.backing.wav" in html
     assert "song.original.mp3" not in html
 
+    import json
+    sidecar = json.loads((package_dir / ".bunri-package.json").read_text())
+    assert sidecar["schema_version"] == 1
+    assert sidecar["targets"] == [{"target": "guitar", "formats": ["wav"]}]
+    assert len(sidecar["source"]["digest"]) == 40
+
 
 @_NEED_FFMPEG
 def test_build_package_second_run_uses_cache(tmp_path, song_input):
@@ -227,6 +233,12 @@ def test_build_package_targets_coexist_in_cache(tmp_path, song_input):
     assert (vocals_dir / "song.guitar.backing.wav").exists()
     assert (vocals_dir / "song.vocals.backing.wav").exists()
     assert (vocals_dir / "song.guitar.player.html").exists()
+    import json
+    sidecar = json.loads((vocals_dir / ".bunri-package.json").read_text())
+    assert sidecar["targets"] == [
+        {"target": "guitar", "formats": ["mp3", "wav"]},
+        {"target": "vocals", "formats": ["mp3", "wav"]},
+    ]
 
     build_package(song_input, out_dir, title="song")  # guitar again
     assert len(_PackageFakeSeparator.instances) == 2, (
@@ -560,3 +572,21 @@ def test_build_package_reseparates_after_a_run_that_died_between_the_two_stems(
         "the next run must re-separate rather than package a mismatched pair"
     )
     assert (cache_dir / "guitar.backing.wav").stat().st_size > 0
+
+
+@_NEED_FFMPEG
+def test_failed_regeneration_leaves_current_target_invalidated(tmp_path, song_input, monkeypatch):
+    import json
+    import bunri.package as package_module
+
+    out_dir = tmp_path / "out"
+    package_dir = build_package(song_input, out_dir, title="song")
+    monkeypatch.setattr(
+        package_module,
+        "_normalize_step",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated normalize failure")),
+    )
+    with pytest.raises(RuntimeError, match="simulated normalize failure"):
+        build_package(song_input, out_dir, title="song")
+    sidecar = json.loads((package_dir / ".bunri-package.json").read_text())
+    assert sidecar["targets"] == []

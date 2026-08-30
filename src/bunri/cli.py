@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import Optional
 
 import typer
@@ -14,6 +15,16 @@ from bunri.registry import REGISTRY
 
 app = typer.Typer(add_completion=False, rich_markup_mode="rich")
 console = Console()
+
+
+def dispatch() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "pocket":
+        from bunri.pocket.cli import app as pocket_app
+
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        pocket_app(prog_name="bunri pocket")
+    else:
+        app(prog_name="bunri")
 
 
 def _validate_target(name: str) -> str:
@@ -82,4 +93,4 @@ def main(
 
 
 if __name__ == "__main__":
-    app()
+    dispatch()

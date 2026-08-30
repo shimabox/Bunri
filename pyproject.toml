@@ -28,7 +28,7 @@ web = [
 ]
 
 [project.scripts]
-bunri = "bunri.cli:app"
+bunri = "bunri.cli:dispatch"
 bunri-web = "bunri.web.cli:app"
 
 [build-system]

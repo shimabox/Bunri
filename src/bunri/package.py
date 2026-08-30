@@ -16,6 +16,7 @@ from rich.console import Console
 
 from bunri import audio, cache
 from bunri.player import render_player
+from bunri.package_metadata import begin_target, complete_target, read_package_metadata
 from bunri.registry import get_target
 from bunri.safepath import replace_into, verified_mkdir
 from bunri.separate import separate
@@ -127,7 +128,7 @@ def build_package(
     song_title = title if title is not None else input_path.stem
     safe = _safe_filename(song_title)
 
-    digest = cache.file_digest(input_path)
+    digest = cache.input_digest(input_path)
     # The output root itself is the user's own `-o`, so creating it (symlink
     # and all, if that is what they pointed at) is doing as asked. Everything
     # below it is a different matter.
@@ -142,7 +143,31 @@ def build_package(
     # files that library creates inside the directory are not ours to route
     # through replace_into, so the guarantee they rest on is that the
     # directory they land in is genuinely inside out_dir.
-    cache_dir = verified_mkdir(out_dir, ".cache", digest)
+    cache_dir = verified_mkdir(out_dir, ".cache", digest.cache_key)
+
+    package_dir = out_dir / safe
+    if package_dir.is_symlink():
+        raise ValueError(f"refusing to write a package through a symlink: {package_dir}")
+    if not package_dir.resolve().is_relative_to(out_dir.resolve()):
+        raise ValueError(f"refusing to write package outside out_dir: {package_dir}")
+    package_dir.mkdir(parents=True, exist_ok=True)
+    sidecar = package_dir / ".bunri-package.json"
+    if sidecar.exists() or sidecar.is_symlink():
+        existing = read_package_metadata(sidecar, safe)
+        if (
+            existing.source.digest != digest.full_sha1
+            or existing.source.cache_key != digest.cache_key
+        ):
+            raise ValueError("package directory belongs to a different input digest")
+    cache.ensure_input_identity(cache_dir, digest)
+    pending = begin_target(
+        sidecar,
+        title=song_title,
+        safe_name=safe,
+        digest=digest.full_sha1,
+        cache_key=digest.cache_key,
+        target=spec.target,
+    )
 
     input_wav = cache_dir / "input.wav"
     normalize_ran = _normalize_step(input_path, input_wav, cache_dir, no_cache=no_cache)
@@ -208,7 +233,6 @@ def build_package(
         )
         console.print(f"[green]✓[/green] separate ({elapsed:.0f}s)")
 
-    package_dir = out_dir / safe
     # Defense in depth on top of _safe_filename's own sanitizing: even if a
     # future change to that function (or a caller bypassing it) let a
     # path-separator-bearing title through, this refuses to write outside
@@ -221,12 +245,6 @@ def build_package(
     # os.replace alike -- runs through the link and lands in somebody else's
     # package. lstat, so the test does not follow what it is testing; and
     # before mkdir, which would otherwise report success for the target.
-    if package_dir.is_symlink():
-        raise ValueError(f"refusing to write a package through a symlink: {package_dir}")
-    if not package_dir.resolve().is_relative_to(out_dir.resolve()):
-        raise ValueError(f"refusing to write package outside out_dir: {package_dir}")
-    package_dir.mkdir(parents=True, exist_ok=True)
-
     # Backing and player are target-scoped like the stem itself: guitar's
     # backing (has vocals) and vocals' backing (karaoke) are different mixes,
     # so building a second target for the same song must add files to the
@@ -257,5 +275,12 @@ def build_package(
     )
     replace_into(player_dest, lambda tmp: tmp.write_text(player_html, encoding="utf-8"))
     console.print(f"→ [cyan]{player_dest}[/cyan]")
+
+    complete_target(
+        sidecar,
+        expected=pending,
+        target=spec.target,
+        formats=("mp3", "wav") if mp3 else ("wav",),
+    )
 
     return package_dir

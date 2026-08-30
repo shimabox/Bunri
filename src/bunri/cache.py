@@ -9,18 +9,67 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from bunri.safepath import is_real_file_in, replace_into
 
 
-def file_digest(path: Path) -> str:
+@dataclass(frozen=True)
+class InputDigest:
+    full_sha1: str
+    cache_key: str
+
+
+def input_digest(path: Path) -> InputDigest:
     h = hashlib.sha1()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
-    return h.hexdigest()[:12]
+    full = h.hexdigest()
+    return InputDigest(full, full[:12])
+
+
+def file_digest(path: Path) -> str:
+    return input_digest(path).cache_key
+
+
+def ensure_input_identity(cache_dir: Path, digest: InputDigest) -> None:
+    """Attach and verify the full digest behind a shortened cache directory."""
+    expected_dir = cache_dir.resolve()
+    path = cache_dir / ".bunri-input.json"
+    if path.is_symlink():
+        raise ValueError(f"cache identity is a symlink: {path}")
+    if path.exists():
+        if not is_real_file_in(path, expected_dir):
+            raise ValueError(f"cache identity is not a regular file: {path}")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid cache identity: {path}") from exc
+        expected = {
+            "schema_version": 1,
+            "algorithm": "sha1",
+            "digest": digest.full_sha1,
+            "cache_key": digest.cache_key,
+        }
+        if value != expected:
+            raise ValueError(
+                f"cache key collision: {digest.cache_key} belongs to a different input"
+            )
+        return
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "algorithm": "sha1",
+            "digest": digest.full_sha1,
+            "cache_key": digest.cache_key,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ) + "\n"
+    replace_into(path, lambda tmp: tmp.write_text(payload, encoding="utf-8"))
 
 
 def params_digest(params: dict[str, Any]) -> str:
