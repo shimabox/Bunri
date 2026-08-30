@@ -164,22 +164,34 @@ def test_build_package_uses_input_stem_as_default_title(tmp_path):
 
 
 @_NEED_FFMPEG
-@pytest.mark.parametrize("empty_title", ["", " \t\n"])
-def test_build_package_uses_input_stem_for_empty_title(tmp_path, empty_title):
+@pytest.mark.parametrize(
+    ("title", "expected_title", "expected_safe_name"),
+    [
+        (None, "my-track", "my-track"),
+        (" \t\n", "my-track", "my-track"),
+        ("Custom Title", "Custom Title", "Custom Title"),
+    ],
+)
+def test_build_package_uses_resolved_title_in_metadata_and_player(
+    tmp_path, title, expected_title, expected_safe_name
+):
     import json
 
     out_dir = tmp_path / "out"
     src = tmp_path / "my-track.wav"
     _write_silence(src)
 
-    package_dir = build_package(src, out_dir, title=empty_title, mp3=False)
+    package_dir = build_package(src, out_dir, title=title, mp3=False)
 
-    assert package_dir == out_dir / "my-track"
+    assert package_dir == out_dir / expected_safe_name
     sidecar = json.loads((package_dir / ".bunri-package.json").read_text())
-    assert sidecar["title"] == "my-track"
+    assert sidecar["title"] == expected_title
     assert sidecar["targets"] == [{"target": "guitar", "formats": ["wav"]}]
-    html = (package_dir / "my-track.guitar.player.html").read_text(encoding="utf-8")
-    assert "my-track" in html
+    html = (package_dir / f"{expected_safe_name}.guitar.player.html").read_text(
+        encoding="utf-8"
+    )
+    assert f"<title>{expected_title} - 練習プレイヤー</title>" in html
+    assert f'<h1 class="tm-title">{expected_title}</h1>' in html
 
 
 @_NEED_FFMPEG

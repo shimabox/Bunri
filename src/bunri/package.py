@@ -36,6 +36,12 @@ _SEPARATE_VERSION = 1
 _UNSAFE_FILENAME_CHARS = re.compile(r'[/\\:*?"<>|#%]')
 
 
+def resolve_title(title: str | None, input_path: Path) -> str:
+    """Return the display title used throughout a generated package."""
+    requested = title if title is not None and title.strip() else input_path.stem
+    return requested if requested.strip() else "untitled"
+
+
 def _safe_filename(title: str) -> str:
     # Leading dots are stripped after substitution (not just once) so a title
     # of ".." (or "...", "....") can never resolve to a package directory
@@ -125,8 +131,7 @@ def build_package(
     Returns the generated song folder (out_dir/<safe_title>).
     """
     spec = get_target(target)
-    requested_title = title if title is not None and title.strip() else input_path.stem
-    song_title = requested_title if requested_title.strip() else "untitled"
+    song_title = resolve_title(title, input_path)
     safe = _safe_filename(song_title)
 
     digest = cache.input_digest(input_path)

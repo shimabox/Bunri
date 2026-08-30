@@ -161,6 +161,25 @@ def test_model_and_target_reach_build_package(audio, tmp_path, monkeypatch):
     assert captured["target"] == "guitar"
 
 
+def test_whitespace_title_uses_input_stem_in_banner_and_build(
+    audio, tmp_path, monkeypatch
+):
+    import bunri.cli as cli_module
+
+    captured = {}
+
+    def fake_build_package(input_path, out_dir, **kwargs):
+        captured.update(kwargs)
+        return tmp_path / "song"
+
+    monkeypatch.setattr(cli_module, "build_package", fake_build_package)
+    result = _run(audio, "--title", "   ")
+
+    assert result.exit_code == 0, result.output
+    assert f"Bunri v{cli_module.__version__} — song" in _plain(result.output)
+    assert captured["title"] == "song"
+
+
 def test_missing_input_file_is_rejected(tmp_path):
     result = _run(tmp_path / "does-not-exist.mp3")
     assert result.exit_code != 0
