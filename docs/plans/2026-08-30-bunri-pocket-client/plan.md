@@ -411,6 +411,7 @@ upload token を持つ所有者が `https://bunri-pocket.orukubami.sh` に対し
 
 | 項目 | 内容 | 実装時の扱い |
 |---|---|---|
+| identity の無い旧キャッシュ | `.bunri-input.json` が無い既存 `out/.cache/<cache_key>/` は入力を照合できず、別入力の12桁衝突時に既存 stage を再利用し得る(理論上の 48bit 衝突) | 採用して現在の full digest を identity として記録する(現状維持)。旧キャッシュの無効化・再分離は行わない。identity が記録された以降の衝突は検出して停止する |
 | 標準ライブラリ streaming | Python 3.13 の `urllib` で file-object PUT と redirect 拒否を wire-level で確認する必要がある | `urllib`、次に `http.client` 直接利用まで判断してよい。外部 dependency が必要なら追加せず報告して停止する |
 | JS Number byte 互換 | remote の未知 field も ECMAScript Number の parse/serialize 規則へ合わせる必要があり、Python の既定表現では不十分 | 上流生成 golden を正とする。golden 不一致を近似で通さず、原因と選択肢を報告して停止する |
 | POSIX 権限非対応 filesystem | chmod 後も0700/0600を保証できない環境がある | mode 再検査後に平文 token の保護不能を明示して継続する。黙って成功扱いしない |

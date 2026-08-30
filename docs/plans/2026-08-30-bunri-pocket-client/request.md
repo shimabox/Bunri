@@ -119,7 +119,7 @@ cache_key: full_sha1[:12]
 - 既存 `file_digest(path)` は互換 wrapper として12桁を返す。
 - cache directory は従来どおり `<OUT>/.cache/<cache_key>/` とし、directory 名を40桁へ変更しない。
 - cache directory には完全 digest identity を原子的に記録・検査する。新規 private metadata の名前は `<OUT>/.cache/<cache_key>/.bunri-input.json` とし、整数 `schema_version: 1`、`algorithm: "sha1"`、`digest`、`cache_key` を持たせる。
-- private metadata がない既存 cache は現在 input の identity を安全に追加して既存 stage cache を利用可能にする。metadata があり完全 digest が異なる場合は normalize/separate artifact を読まず、書き換えず停止する。
+- private metadata がない既存 cache は現在 input の identity を安全に追加して既存 stage cache を利用可能にする。既存 cache には入力との照合手段がないため、これは既存 stage cache を採用して identity を記録する判断とする。metadata があり完全 digest が異なる場合は normalize/separate artifact を読まず、書き換えず停止する。
 - cache directory または metadata の symlink を追従しない。write は既存 `replace_into()` 相当で行う。
 
 ### 4. package sidecar v1
