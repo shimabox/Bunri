@@ -1,0 +1,85 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://bunri-pocket.invalid/schemas/manifest-v1.schema.json",
+  "type": "object",
+  "required": ["schema_version", "song_id", "title", "source", "original", "instruments", "updated_at"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+$" },
+    "song_id": { "type": "string", "pattern": "^[0-9a-f]{12}$" },
+    "title": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "required": ["algorithm", "digest", "cache_key"],
+      "additionalProperties": true,
+      "properties": {
+        "algorithm": { "const": "sha1" },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "cache_key": { "type": "string", "pattern": "^[0-9a-f]{12}$" }
+      }
+    },
+    "original": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/originalAsset" }
+      ]
+    },
+    "instruments": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/instrument" }
+    },
+    "updated_at": { "type": "string", "format": "date-time", "pattern": "Z$" }
+  },
+  "definitions": {
+    "asset": {
+      "type": "object",
+      "required": ["path", "content_type", "bytes", "sha256"],
+      "additionalProperties": true,
+      "properties": {
+        "path": { "type": "string", "pattern": "^(?!.*(?:/|\\\\|\\.\\.))[^/\\\\]+\\.mp3$" },
+        "content_type": { "const": "audio/mpeg" },
+        "bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "originalAsset": {
+      "allOf": [
+        { "$ref": "#/definitions/asset" },
+        { "type": "object", "properties": { "path": { "const": "original.mp3" } } }
+      ]
+    },
+    "stem": {
+      "allOf": [
+        { "$ref": "#/definitions/asset" },
+        {
+          "type": "object",
+          "required": ["role"],
+          "properties": { "role": { "enum": ["target", "backing"] } }
+        }
+      ]
+    },
+    "instrument": {
+      "type": "object",
+      "required": ["target", "label", "stems"],
+      "additionalProperties": true,
+      "properties": {
+        "target": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,31}$",
+          "not": { "const": "original" }
+        },
+        "label": { "type": "string", "minLength": 1 },
+        "stems": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/definitions/stem" },
+          "allOf": [
+            { "contains": { "type": "object", "properties": { "role": { "const": "target" } }, "required": ["role"] } },
+            { "contains": { "type": "object", "properties": { "role": { "const": "backing" } }, "required": ["role"] } }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.1",
+  "song_id": "0123456789ab",
+  "title": "Forward Compatible",
+  "source": {
+    "algorithm": "sha1",
+    "digest": "0123456789abcdef0123456789abcdef01234567",
+    "cache_key": "0123456789ab",
+    "future_source": true
+  },
+  "original": null,
+  "instruments": [
+    {
+      "target": "guitar",
+      "label": "Guitar",
+      "future_instrument": { "enabled": true },
+      "stems": [
+        {
+          "role": "target",
+          "path": "guitar.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b",
+          "future_asset": "kept"
+        },
+        {
+          "role": "backing",
+          "path": "guitar.backing.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+        }
+      ]
+    }
+  ],
+  "updated_at": "2026-08-29T00:00:00.000Z",
+  "future_top_level": [1, 2, 3]
+}

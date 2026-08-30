@@ -1,0 +1,7 @@
+{
+  "schema_version": "1.0",
+  "updated_at": "2026-08-29T00:00:00.000Z",
+  "songs": [
+    { "song_id": "0123456789ab", "title": "Wrong Path", "manifest": "tracks/fedcba987654/manifest.json", "has_original": false, "instruments": [], "updated_at": "2026-08-29T00:00:00.000Z" }
+  ]
+}

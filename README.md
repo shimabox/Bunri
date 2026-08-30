@@ -1,12 +1,12 @@
 # Bunri
 
-Bunri (分離, "separation") extracts a single instrument stem (guitar by default; bass, drums, vocals, piano also supported) from a song and builds a practice package: the instrument alone, the backing track without it, the original, and an offline HTML player with A-B loop and pitch-preserving slow-down. Audio processing runs locally on your machine; your audio is never uploaded. Documentation is in Japanese.
+Bunri (分離, "separation") extracts a single instrument stem (guitar by default; bass, drums, vocals, piano also supported) from a song and builds a practice package: the instrument alone, the backing track without it, the original, and an offline HTML player with A-B loop and pitch-preserving slow-down. Separation runs locally and never uploads the input audio. Only an explicit `bunri pocket` command sends finished MP3 files to a Bunri Pocket storage owned by the user. Documentation is in Japanese.
 
 | アップロード | 曲一覧 | 練習プレイヤー |
 |---|---|---|
 | ![アップロード](docs/images/upload.png) | ![曲一覧](docs/images/web-ui.png) | ![練習プレイヤー](docs/images/player.png) |
 
-音源から特定の楽器パート(まずはギター)の stem を抽出し、練習用パッケージ(その楽器だけ / その楽器を抜いた伴奏 / 原曲 + オフラインで再生できる HTML プレイヤー)を生成するツールです。処理はすべてお使いのマシン内で完結し、音源が外部に送信されることはありません。
+音源から特定の楽器パート(まずはギター)の stem を抽出し、練習用パッケージ(その楽器だけ / その楽器を抜いた伴奏 / 原曲 + オフラインで再生できる HTML プレイヤー)を生成するツールです。分離処理はお使いのマシン内で完結し、入力音源が外部に送信されることはありません。明示的に `bunri pocket` を実行した場合だけ、分離後の MP3 を利用者自身が所有する Pocket storage へ送信します。Web UI も localhost 内だけで動作します。
 
 ## クイックスタート
 
@@ -158,6 +158,20 @@ bunri song.mp3 -o path/to/out               # 出力先ディレクトリ
 同じ曲でも `--target` ごとに分離キャッシュは独立しているため、対象を切り替えても過去の分離結果はそのまま再利用されます。
 
 `--model` を省略した場合、対象楽器ごとに登録されたデフォルトモデルが失敗したときだけ自動でフォールバックモデルに切り替わります(ギターの場合 `htdemucs_6s.yaml`)。`--model` で明示的に指定した場合はフォールバックせず、失敗はそのままエラーとして報告されます。
+
+## Bunri Pocket へ同期する
+
+利用者自身の Bunri Pocket に接続し、生成済みパッケージの MP3 を明示的に同期できます。
+
+```bash
+bunri pocket connect https://your-pocket.example -o out
+bunri pocket sync '曲名' -o out
+bunri pocket sync '曲名' -o out --no-original
+```
+
+`sync` の曲名は表示名の検索語ではなく、`out/` 直下の directory 名です。`--no-original` は今回 original MP3 を新しく送らない指定であり、Pocket にある original を削除しません。upload token は `out/.pocket/config.json` に平文で保存され、接続先ごとに `-o` で分かれます。接続情報を消すには対象の `out/.pocket` を削除してください。
+
+既存の分離 input に bare file 名 `pocket` を使う場合は、Pocket command と区別するため `bunri ./pocket` と指定してください。
 
 ## Docker で使う
 

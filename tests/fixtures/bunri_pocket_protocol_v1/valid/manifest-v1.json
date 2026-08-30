@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "song_id": "0123456789ab",
+  "title": "Test Song",
+  "source": {
+    "algorithm": "sha1",
+    "digest": "0123456789abcdef0123456789abcdef01234567",
+    "cache_key": "0123456789ab"
+  },
+  "original": {
+    "path": "original.mp3",
+    "content_type": "audio/mpeg",
+    "bytes": 24,
+    "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+  },
+  "instruments": [
+    {
+      "target": "guitar",
+      "label": "Guitar",
+      "stems": [
+        {
+          "role": "target",
+          "path": "guitar.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+        },
+        {
+          "role": "backing",
+          "path": "guitar.backing.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+        }
+      ]
+    }
+  ],
+  "updated_at": "2026-08-29T00:00:00.000Z"
+}

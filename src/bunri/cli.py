@@ -3,17 +3,28 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import Optional
 
 import typer
 from rich.console import Console
 
 from bunri import __version__
-from bunri.package import build_package
+from bunri.package import build_package, resolve_title
 from bunri.registry import REGISTRY
 
 app = typer.Typer(add_completion=False, rich_markup_mode="rich")
 console = Console()
+
+
+def dispatch() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "pocket":
+        from bunri.pocket.cli import app as pocket_app
+
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        pocket_app(prog_name="bunri pocket")
+    else:
+        app()
 
 
 def _validate_target(name: str) -> str:
@@ -61,14 +72,15 @@ def main(
     target = _validate_target(target)
     device = _validate_device(device)
 
-    console.print(f"[bold]Bunri[/bold] v{__version__} — {title or input_file.stem}")
+    song_title = resolve_title(title, input_file)
+    console.print(f"[bold]Bunri[/bold] v{__version__} — {song_title}")
     try:
         package_dir = build_package(
             input_file.resolve(),
             output.resolve(),
             target=target,
             model=model,
-            title=title,
+            title=song_title,
             device=device,
             mp3=mp3,
             no_cache=no_cache,
@@ -82,4 +94,4 @@ def main(
 
 
 if __name__ == "__main__":
-    app()
+    dispatch()

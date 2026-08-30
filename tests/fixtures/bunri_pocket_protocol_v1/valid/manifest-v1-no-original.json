@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "song_id": "fedcba987654",
+  "title": "No Original",
+  "source": {
+    "algorithm": "sha1",
+    "digest": "fedcba9876543210fedcba9876543210fedcba98",
+    "cache_key": "fedcba987654"
+  },
+  "original": null,
+  "instruments": [],
+  "updated_at": "2026-08-29T00:00:00.000Z"
+}

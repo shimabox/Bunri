@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://bunri-pocket.invalid/schemas/library-v1.schema.json",
+  "type": "object",
+  "required": ["schema_version", "updated_at", "songs"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+$" },
+    "updated_at": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "songs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["song_id", "title", "manifest", "has_original", "instruments", "updated_at"],
+        "additionalProperties": true,
+        "properties": {
+          "song_id": { "type": "string", "pattern": "^[0-9a-f]{12}$" },
+          "title": { "type": "string", "minLength": 1 },
+          "manifest": { "type": "string", "pattern": "^tracks/[0-9a-f]{12}/manifest\\.json$" },
+          "has_original": { "type": "boolean" },
+          "updated_at": { "type": "string", "format": "date-time", "pattern": "Z$" },
+          "instruments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["target", "label"],
+              "additionalProperties": true,
+              "properties": {
+                "target": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]{0,31}$",
+                  "not": { "const": "original" }
+                },
+                "label": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
