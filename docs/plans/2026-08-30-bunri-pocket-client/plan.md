@@ -237,7 +237,7 @@ library に対象 song があるのに manifest が404の場合は、参照が�
 1. media
    - original（`--no-original` でない場合）、target 名順の target → backing の順
    - HEAD の `X-Bunri-Content-SHA256` と `Content-Length` が両方一致すれば冪等成功として skip する
-   - 404、metadata 欠落、不一致なら PUT し、応答の SHA-256 と size が期待値と一致することを検査する
+   - 404、metadata 欠落、不一致なら PUT する。送信時は `Content-Length` と `X-Bunri-Content-SHA256` を明示し、成功応答は `X-Bunri-Content-SHA256` が期待値と一致することを検査する。応答の `Content-Length` は空 body のため0となり、検証には使わない
 2. manifest
    - media 完了後に最新を GET して再検証・再マージする
    - 新規は `If-None-Match: *`、既存は strong ETag の `If-Match` を付ける
@@ -387,7 +387,7 @@ README の英語冒頭と日本語本文の両方に、次を矛盾なく書く�
 - [ ] token が stdout、stderr、例外、`repr`、HTTP 診断に現れない。
 - [ ] redirect を1回も追従せず、metadata 30秒/media 300秒の timeout が注入可能である。
 - [ ] media PUT が file 全体を memory に載せず、明示 `Content-Length` で送られる。
-- [ ] media は SHA-256/size 一致で skip し、PUT 応答 metadata 不一致で停止する。
+- [ ] media は HEAD の SHA-256/size 一致で skip し、PUT は `Content-Length` と `X-Bunri-Content-SHA256` を明示して送信し、応答の `X-Bunri-Content-SHA256` 不一致で停止する。空 body を示す応答の `Content-Length: 0` は検証に使わない。
 - [ ] manifest/library は実質的変更なしで `updated_at` を変えず PUT もしない。
 - [ ] library の412は再取得・再マージし、manifest の412は同一 digest のときだけ再マージする。いずれも初回 + 最大3回で、上限超過は停止する。
 - [ ] manifest の412後に異なる digest を見つけた場合は即時停止し、media 上書き可能性を表示する。

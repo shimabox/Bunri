@@ -551,7 +551,7 @@ Python 3.13 標準ライブラリのみを使う。
 - JSON GET は strong ETag が必要。既存文書に ETag がない、weak、malformed なら更新せず停止する。404は absent として扱う。
 - JSON PUT は stable byte を memory で作り、送信前に1,048,576 byte以下を確認する。`Content-Type: application/json` と正確な `Content-Length` を付ける。
 - media PUT は open file object を request body に渡し、`Content-Length`、`Content-Type: audio/mpeg`、`X-Bunri-Content-SHA256` を明示する。全 file を `read()` して bytes 化しない。chunked transfer を使わない。
-- media HEAD/PUT success の `Content-Length` と `X-Bunri-Content-SHA256` を検証する。
+- media HEAD success は `Content-Length` と `X-Bunri-Content-SHA256` を検証する。media PUT success は応答の `X-Bunri-Content-SHA256` を検証し、空 body のため0となる応答の `Content-Length` は検証に使わない。
 - Authorization token を stdout、stderr、exception、`repr`、captured diagnostic に出さない。
 
 利用者向け error mapping:
@@ -590,7 +590,7 @@ GET /api/v1/upload/library
 2. `HEAD /api/v1/upload/media/<song-id>/<asset>` を実行する。
 3. 200で `X-Bunri-Content-SHA256` と `Content-Length` が両方 local descriptor と一致すれば skip。
 4. 404、metadata 欠落、不一致なら PUT。ETag だけで skip しない。
-5. PUT は200/201を成功とし、応答の SHA-256 と size が期待値と一致しなければ停止する。
+5. PUT は `Content-Length` と `X-Bunri-Content-SHA256` を明示して送信し、200/201を成功とする。応答の `X-Bunri-Content-SHA256` が期待値と一致しなければ停止する。空 body のため0となる応答の `Content-Length` は検証に使わない。
 
 #### manifest
 
@@ -739,7 +739,7 @@ version bump、上記 version assertion、lock 更新、tag は独立したリ�
 - response body 上限。
 - media body は file object を block 読みし、非 chunked、正確な Content-Length。
 - HEAD hash+size 一致で skip。片方欠落/不一致で PUT。
-- media PUT response metadata 一致を必須にする。
+- media PUT は `Content-Length` と hash header を明示し、response の hash 一致を必須にする。空 body の response `Content-Length: 0` は検証に使わない。
 - remote preflight digest 不一致で media PUT 0件。
 - 初回 sync の key/order/header/body、manifest/library 作成。
 - 同じ sync の再実行は全 skip/no-opで ETag/timestamp 不変。
@@ -797,7 +797,7 @@ uv run playwright install --with-deps chromium
 - [ ] manifest/library が protocol `1.x` と全 unknown field を維持し、label は Bunri generator で `label_ja` になる。
 - [ ] config が capabilities 成功後だけ原子的に保存され、POSIX で0700/0600、token は全 diagnostic から redaction される。
 - [ ] redirect 非追従、metadata/media timeout、response 上限、streaming Content-Length が wire test で確認される。
-- [ ] media は hash+size で skip、manifest/library は stable no-op で PUTを省略する。
+- [ ] media は HEAD の hash+size で skip し、PUT は size と hash を明示して送信し、応答 hash の一致を検証する。空 body の応答 size は検証に使わない。manifest/library は stable no-op で PUTを省略する。
 - [ ] remote digest 衝突は preflight で media 前に停止し、manifest 412後の異 digest は上書き可能性を報告して停止する。
 - [ ] library と same-digest manifest の412は初回 + 最大3回の再取得・再マージで収束し、上限超過は停止する。
 - [ ] `--no-original` が既存 original を削除しない。
