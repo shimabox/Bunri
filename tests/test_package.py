@@ -164,6 +164,25 @@ def test_build_package_uses_input_stem_as_default_title(tmp_path):
 
 
 @_NEED_FFMPEG
+@pytest.mark.parametrize("empty_title", ["", " \t\n"])
+def test_build_package_uses_input_stem_for_empty_title(tmp_path, empty_title):
+    import json
+
+    out_dir = tmp_path / "out"
+    src = tmp_path / "my-track.wav"
+    _write_silence(src)
+
+    package_dir = build_package(src, out_dir, title=empty_title, mp3=False)
+
+    assert package_dir == out_dir / "my-track"
+    sidecar = json.loads((package_dir / ".bunri-package.json").read_text())
+    assert sidecar["title"] == "my-track"
+    assert sidecar["targets"] == [{"target": "guitar", "formats": ["wav"]}]
+    html = (package_dir / "my-track.guitar.player.html").read_text(encoding="utf-8")
+    assert "my-track" in html
+
+
+@_NEED_FFMPEG
 def test_build_package_sanitizes_unsafe_title_characters(tmp_path, song_input):
     out_dir = tmp_path / "out"
 

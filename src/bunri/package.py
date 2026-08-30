@@ -125,7 +125,8 @@ def build_package(
     Returns the generated song folder (out_dir/<safe_title>).
     """
     spec = get_target(target)
-    song_title = title if title is not None else input_path.stem
+    requested_title = title if title is not None and title.strip() else input_path.stem
+    song_title = requested_title if requested_title.strip() else "untitled"
     safe = _safe_filename(song_title)
 
     digest = cache.input_digest(input_path)
