@@ -62,3 +62,15 @@ def test_response_limit(server, monkeypatch):
     monkeypatch.setattr(Handler, "do_GET", large)
     with pytest.raises(PocketHTTPError) as exc: PocketHTTPClient(server, "secret")._request("GET", "x", limit=10)
     assert exc.value.status == 413
+
+
+def test_unsupported_schema_error_keeps_supported_major(server, monkeypatch):
+    def unsupported(self):
+        self._record()
+        body = json.dumps({"error": {"code": "UNSUPPORTED_SCHEMA_MAJOR", "supported_schema_major": 2}}).encode()
+        self.send_response(409); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    monkeypatch.setattr(Handler, "do_GET", unsupported)
+    with pytest.raises(PocketHTTPError) as exc:
+        PocketHTTPClient(server, "secret").get_json("manifest/aaaaaaaaaaaa")
+    assert (exc.value.status, exc.value.code, exc.value.supported_major) == (409, "UNSUPPORTED_SCHEMA_MAJOR", 2)
+    assert "secret" not in str(exc.value)
