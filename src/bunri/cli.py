@@ -24,7 +24,7 @@ def dispatch() -> None:
         sys.argv = [sys.argv[0], *sys.argv[2:]]
         pocket_app(prog_name="bunri pocket")
     else:
-        app(prog_name="bunri")
+        app()
 
 
 def _validate_target(name: str) -> str:

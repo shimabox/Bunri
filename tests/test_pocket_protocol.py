@@ -39,6 +39,17 @@ def test_stable_json_boundary_golden(name):
     assert golden.endswith(b"\n") and not golden.endswith(b"\n\n") and not golden.startswith(b"\xef\xbb\xbf")
 
 
+@pytest.mark.parametrize("name", ["number-forms", "unicode-keys-nested"])
+def test_stable_json_boundary_inputs_reproduce_golden(name):
+    value = parse_json((FIXTURES / "stable" / f"{name}.input.json").read_bytes())
+    assert stable_json(value) == (FIXTURES / "stable" / f"{name}.stable.json").read_bytes()
+
+
+def test_non_finite_literal_reproduces_golden():
+    value = {"nan": float("nan"), "negative": float("-inf"), "positive": float("inf")}
+    assert stable_json(value) == (FIXTURES / "stable/non-finite.stable.json").read_bytes()
+
+
 def test_generator_golden_and_noop_preserve_unknown_fields():
     metadata = PackageMetadata("Sample Song", "Sample Song", SourceIdentity("sha1", "0123456789abcdef0123456789abcdef01234567", "0123456789ab"), (TargetMetadata("guitar", ("mp3", "wav")),))
     sha = "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
@@ -64,6 +75,15 @@ def test_protocol_accepts_v1_minor_but_distinguishes_version_errors():
     value["schema_version"] = "one"
     with pytest.raises(ProtocolError) as exc: validate_manifest(value)
     assert exc.value.code == "INVALID_DOCUMENT"
+
+
+def test_manifest_requires_original_key_but_accepts_null():
+    value = parse_json((FIXTURES / "valid/manifest-v1-no-original.json").read_bytes())
+    assert value["original"] is None
+    validate_manifest(value)
+    del value["original"]
+    with pytest.raises(ProtocolError, match="original is required"):
+        validate_manifest(value)
 
 
 def test_remote_numbers_are_parsed_as_ecmascript_binary64():

@@ -112,11 +112,14 @@ class PocketHTTPClient:
         except (TypeError, ValueError): size = None
         return headers.get("X-Bunri-Content-SHA256"), size
 
-    def put_media(self, song_id: str, name: str, path: Path, size: int, checksum: str) -> tuple[str | None, int | None]:
+    def put_media(self, song_id: str, name: str, path: Path, size: int, checksum: str) -> str | None:
+        """Upload media and return the server-verified SHA-256 checksum.
+
+        The empty PUT response body has a transport-level Content-Length of zero,
+        so the response length is deliberately not treated as stored media size.
+        """
         remote = f"media/{song_id}/{name}"
         with path.open("rb") as stream:
             status, headers, _ = self._request("PUT", remote, data=stream, headers={"Content-Type": "audio/mpeg", "Content-Length": str(size), "X-Bunri-Content-SHA256": checksum}, timeout=self.media_timeout, limit=0)
         if status not in (200, 201): raise PocketHTTPError(status, "UNEXPECTED_STATUS", self._url(remote))
-        try: response_size = int(headers.get("Content-Length"))
-        except (TypeError, ValueError): response_size = None
-        return headers.get("X-Bunri-Content-SHA256"), response_size
+        return headers.get("X-Bunri-Content-SHA256")

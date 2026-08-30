@@ -176,7 +176,10 @@ def validate_manifest(value: Any, route_song_id: str | None = None) -> dict[str,
         if not isinstance(digest, str) or not SHA1.fullmatch(digest): issues.append("source.digest is invalid")
         if not isinstance(key, str) or not SONG_ID.fullmatch(key): issues.append("source.cache_key is invalid")
         if isinstance(song, str) and isinstance(digest, str) and isinstance(key, str) and (key != song or digest[:12] != song): issues.append("source identity fields disagree")
-    if value.get("original") is not None: _asset(value.get("original"), "original.mp3", "original", issues)
+    if "original" not in value:
+        issues.append("original is required")
+    elif value["original"] is not None:
+        _asset(value["original"], "original.mp3", "original", issues)
     instruments = value.get("instruments")
     if not isinstance(instruments, list): issues.append("instruments must be an array")
     else:

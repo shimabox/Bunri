@@ -56,6 +56,25 @@ def test_unknown_target_is_reported_with_its_missing_assets(tmp_path):
     assert len(exc.value.issues) == 3
 
 
+def test_sidecar_violation_and_missing_mp3_are_reported_together(tmp_path):
+    import json
+
+    out, directory = _package(tmp_path)
+    sidecar = directory / ".bunri-package.json"
+    value = json.loads(sidecar.read_text())
+    value["safe_name"] = "Different"
+    value["source"]["cache_key"] = "b" * 12
+    value["targets"][0]["formats"] = ["wav", "wav"]
+    sidecar.write_text(json.dumps(value))
+    with pytest.raises(LocalPreflightError) as exc:
+        preflight(out, "Song", include_original=False)
+    assert any("safe_name" in issue for issue in exc.value.issues)
+    assert any("source identity" in issue for issue in exc.value.issues)
+    assert any("invalid formats" in issue for issue in exc.value.issues)
+    assert any("Song.guitar.mp3" in issue for issue in exc.value.issues)
+    assert any("Song.guitar.backing.mp3" in issue for issue in exc.value.issues)
+
+
 def test_legacy_package_and_directory_symlink_are_refused(tmp_path):
     out = tmp_path / "out"; package = out / "Old"; package.mkdir(parents=True)
     with pytest.raises(LocalPreflightError) as exc: preflight(out, "Old")

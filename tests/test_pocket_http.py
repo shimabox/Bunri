@@ -20,7 +20,7 @@ class Handler(BaseHTTPRequestHandler):
         self._record(); self.send_response(200); self.send_header("Content-Length", "7"); self.send_header("X-Bunri-Content-SHA256", "a" * 64); self.end_headers()
     def do_PUT(self):
         length = int(self.headers["Content-Length"]); body = self.rfile.read(length); self._record(body)
-        self.send_response(201); self.send_header("Content-Length", str(length)); self.send_header("X-Bunri-Content-SHA256", self.headers["X-Bunri-Content-SHA256"]); self.end_headers()
+        self.send_response(201); self.send_header("Content-Length", "0"); self.send_header("ETag", '"stored"'); self.send_header("X-Bunri-Content-SHA256", self.headers["X-Bunri-Content-SHA256"]); self.end_headers()
 
 
 @pytest.fixture
@@ -31,11 +31,11 @@ def server():
     finally: httpd.shutdown(); thread.join(); httpd.server_close()
 
 
-def test_media_put_streams_with_length_and_no_chunking(server, tmp_path):
+def test_media_put_accepts_empty_response_and_verifies_checksum(server, tmp_path):
     payload = b"abcdefg" * 4096
     path = tmp_path / "media.mp3"; path.write_bytes(payload)
     client = PocketHTTPClient(server, "secret", metadata_timeout=1, media_timeout=2)
-    assert client.put_media("a" * 12, "guitar.mp3", path, len(payload), "a" * 64) == ("a" * 64, len(payload))
+    assert client.put_media("a" * 12, "guitar.mp3", path, len(payload), "a" * 64) == "a" * 64
     method, _, headers, body = Handler.requests[-1]
     assert method == "PUT" and body == payload and headers["Content-Length"] == str(len(payload))
     assert "Transfer-Encoding" not in headers and headers["Authorization"] == "Bearer secret"

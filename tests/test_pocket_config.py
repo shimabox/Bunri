@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import stat
 
 import pytest
@@ -41,3 +42,21 @@ def test_rejects_short_token_and_capability_mismatch():
 def test_read_rejects_symlink(tmp_path):
     (tmp_path / ".pocket").symlink_to(tmp_path / "elsewhere")
     with pytest.raises(ValueError): read_config(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"schema_version": True},
+        {"schema_version": "1"},
+        {"base_url": ["https://example.invalid"]},
+        {"token": [TOKEN]},
+    ],
+)
+def test_read_reports_typed_config_fields_as_corrupt(tmp_path, changes):
+    directory = tmp_path / ".pocket"; directory.mkdir()
+    value = {"schema_version": 1, "base_url": "https://example.invalid", "token": TOKEN, **changes}
+    (directory / "config.json").write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="設定ファイルが壊れています") as exc:
+        read_config(tmp_path)
+    assert TOKEN not in str(exc.value)

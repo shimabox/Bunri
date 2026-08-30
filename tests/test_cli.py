@@ -20,19 +20,20 @@ def test_dispatch_reserves_only_exact_pocket(monkeypatch, argument):
     monkeypatch.setattr(cli, "app", lambda **kwargs: calls.append(("main", sys.argv[:], kwargs)))
     monkeypatch.setattr(sys, "argv", ["bunri", argument])
     cli.dispatch()
-    assert calls == [("main", ["bunri", argument], {"prog_name": "bunri"})]
+    assert calls == [("main", ["bunri", argument], {})]
 
 
-def test_module_and_console_help_are_identical():
+@pytest.mark.parametrize("arguments", [["--help"], ["/definitely/missing.mp3"]])
+def test_module_invocation_preserves_original_usage(arguments):
     import os
     import subprocess
     import sys
-    from pathlib import Path
 
     environment = {**os.environ, "NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "200"}
-    module = subprocess.run([sys.executable, "-m", "bunri.cli", "--help"], text=True, capture_output=True, env=environment)
-    console = subprocess.run([str(Path(sys.executable).with_name("bunri")), "--help"], text=True, capture_output=True, env=environment)
-    assert (module.returncode, _plain(module.stdout + module.stderr)) == (console.returncode, _plain(console.stdout + console.stderr))
+    module = subprocess.run([sys.executable, "-m", "bunri.cli", *arguments], text=True, capture_output=True, env=environment)
+    output = _plain(module.stdout + module.stderr)
+    assert module.returncode == (0 if arguments == ["--help"] else 2)
+    assert "Usage: python -m bunri.cli [OPTIONS] INPUT_FILE" in output
 
 
 def test_console_entrypoint_points_to_dispatch():

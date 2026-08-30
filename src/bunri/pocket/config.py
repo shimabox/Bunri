@@ -114,5 +114,16 @@ def read_config(out_dir: Path) -> PocketConfig | None:
     if not is_real_file_in(path, directory.resolve()): raise ValueError(f"Pocket 設定 file が安全ではありません: {path}")
     try: value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc: raise ValueError("Pocket 設定を読み取れません") from exc
-    if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 1: raise ValueError("Pocket 設定 version が不正です")
-    return PocketConfig(validate_base_url(value.get("base_url", "")), validate_token(value.get("token", "")))
+    invalid = (
+        not isinstance(value, dict)
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or not isinstance(value.get("base_url"), str)
+        or not isinstance(value.get("token"), str)
+    )
+    if invalid:
+        raise ValueError("設定ファイルが壊れています。`bunri pocket connect` をやり直してください")
+    try:
+        return PocketConfig(validate_base_url(value["base_url"]), validate_token(value["token"]))
+    except ValueError as exc:
+        raise ValueError("設定ファイルが壊れています。`bunri pocket connect` をやり直してください") from exc

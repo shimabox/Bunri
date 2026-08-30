@@ -48,7 +48,7 @@ def synchronize(package: LocalPackage, client: PocketHTTPClient, *, include_orig
         info = client.head_media(song_id, asset.descriptor.remote_name)
         if info == (asset.descriptor.sha256, asset.descriptor.bytes): skipped += 1; continue
         returned = client.put_media(song_id, asset.descriptor.remote_name, asset.path, asset.descriptor.bytes, asset.descriptor.sha256)
-        if returned != (asset.descriptor.sha256, asset.descriptor.bytes): raise SyncError(f"media upload metadata mismatch: {asset.descriptor.remote_name}")
+        if returned != asset.descriptor.sha256: raise SyncError(f"media upload checksum mismatch: {asset.descriptor.remote_name}")
         uploaded += 1
     manifest_updated = manifest_skipped = 0
     for attempt in range(4):
@@ -61,8 +61,12 @@ def synchronize(package: LocalPackage, client: PocketHTTPClient, *, include_orig
         if not changed: manifest_skipped = 1; break
         try: client.put_json(f"manifest/{song_id}", stable_json(manifest), current.etag if current else "*")
         except PocketHTTPError as exc:
-            if exc.status == 412 and attempt < 3: continue
-            if exc.status == 412: raise SyncError("manifest の競合が解消しません。再実行してください。") from exc
+            if exc.status == 412:
+                latest = _manifest(client, song_id)
+                if latest is not None and latest.value["source"]["digest"] != package.metadata.source.digest:
+                    raise SyncError(f"RACE_DIGEST_COLLISION:{latest.value['source']['digest']}") from exc
+                if attempt < 3: continue
+                raise SyncError("manifest の競合が解消しません。再実行してください。") from exc
             raise
         manifest_updated = 1; break
     else: raise SyncError("manifest の競合が解消しません。再実行してください。")
