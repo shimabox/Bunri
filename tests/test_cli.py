@@ -47,10 +47,11 @@ def test_console_entrypoint_points_to_dispatch():
 def test_pocket_connect_has_no_token_argv_option():
     from bunri.pocket.cli import app as pocket_app
 
-    result = CliRunner().invoke(pocket_app, ["connect", "--help"])
+    result = CliRunner().invoke(pocket_app, ["connect", "--help"], env=_STABLE_TERMINAL)
     assert result.exit_code == 0
-    assert "--token-stdin" in result.stdout
-    assert "--token " not in result.stdout
+    help_text = _plain(result.output)
+    assert "--token-stdin" in help_text
+    assert "--token " not in help_text
 
 
 def test_pocket_connect_reads_token_from_stdin_without_displaying_it(tmp_path, monkeypatch):
