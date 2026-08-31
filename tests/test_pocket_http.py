@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from bunri import __version__ as bunri_version
 from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
 
 
@@ -39,6 +40,14 @@ def test_media_put_accepts_empty_response_and_verifies_checksum(server, tmp_path
     method, _, headers, body = Handler.requests[-1]
     assert method == "PUT" and body == payload and headers["Content-Length"] == str(len(payload))
     assert "Transfer-Encoding" not in headers and headers["Authorization"] == "Bearer secret"
+
+
+def test_requests_identify_the_client_by_name(server):
+    client = PocketHTTPClient(server, "secret", metadata_timeout=1)
+    client.capabilities()
+    _, _, headers, _ = Handler.requests[-1]
+    assert headers["User-Agent"] == f"bunri/{bunri_version}"
+    assert not headers["User-Agent"].startswith("Python-urllib")
 
 
 def test_head_metadata_and_timeouts(server):

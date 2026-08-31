@@ -10,7 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from bunri import __version__
 from bunri.pocket.protocol import parse_json
+
+# Cloudflare's Browser Integrity Check rejects urllib's default
+# "Python-urllib/x.y" signature with an HTML 403 before the Worker runs, so
+# every request identifies this client by name instead.
+USER_AGENT = f"bunri/{__version__}"
 
 METADATA_TIMEOUT_SECONDS = 30
 MEDIA_TIMEOUT_SECONDS = 300
@@ -57,7 +63,7 @@ class PocketHTTPClient:
 
     def _url(self, path: str) -> str: return self.base_url + "/api/v1/upload/" + path.lstrip("/")
     def _request(self, method: str, path: str, *, data: Any = None, headers: dict[str, str] | None = None, timeout: float | None = None, limit: int = JSON_LIMIT_BYTES) -> tuple[int, Any, bytes]:
-        url = self._url(path); request_headers = {"Authorization": f"Bearer {self._token}", **(headers or {})}
+        url = self._url(path); request_headers = {"Authorization": f"Bearer {self._token}", "User-Agent": USER_AGENT, **(headers or {})}
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         try: response = self._opener.open(request, timeout=timeout or self.metadata_timeout)
         except urllib.error.HTTPError as exc:
