@@ -136,6 +136,30 @@ def _upload_from_page(page, audio_path: Path, *, targets: tuple[str, ...] = ("gu
     page.click("#sw-upload-btn")
 
 
+def _write_pocket_all_record(
+    out_dir: Path,
+    *,
+    job_id: str,
+    status: str,
+    error: str | None,
+    progress: dict[str, Any],
+) -> None:
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    finished_at = None if status in ("queued", "running") else "2026-09-05T00:00:02+00:00"
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps({
+        "id": job_id,
+        "kind": "pocket_all",
+        "status": status,
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00" if status != "queued" else None,
+        "finished_at": finished_at,
+        "error": error,
+        "progress": progress,
+        "result": None,
+    }), encoding="utf-8")
+
+
 @_needs_browser
 def test_done_job_with_empty_downloads_does_not_render_download_controls(tmp_path):
     out_dir = tmp_path / "out"
@@ -302,6 +326,107 @@ def test_pocket_all_failure_summary_renders_without_song_cards(tmp_path, monkeyp
             f"{safe_message}（完了 1件 / 失敗 1件 / 未実行 1件）（再生成が必要 1件）"
         )
         assert summary.get_attribute("class").endswith("is-error")
+
+
+@_needs_browser
+def test_reloaded_page_resumes_running_batch_and_renders_its_result(tmp_path, monkeypatch):
+    import base64
+
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    job_id = "j-pocket-reload"
+    _write_pocket_all_record(
+        out_dir,
+        job_id=job_id,
+        status="running",
+        error=None,
+        progress={
+            "total": 2,
+            "completed": 0,
+            "current": "First Song",
+            "legacy": [],
+            "done": [],
+            "failed": [],
+            "pending": ["First Song", "Second Song"],
+        },
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def finish_sync_all(*_args, progress=None, **_kwargs):
+        started.set()
+        release.wait(timeout=10)
+        batch = BatchResult(
+            total=2,
+            items=[BatchItem("First Song", "done"), BatchItem("Second Song", "done")],
+        )
+        if progress is not None:
+            progress(batch, None)
+        return batch
+
+    monkeypatch.setattr(jobs_module, "sync_all", finish_sync_all)
+    app = create_app(out_dir, runner=PageFakeRunner())
+    assert started.wait(timeout=5)
+    try:
+        with _running_server(app) as base_url, _open_page(base_url) as page:
+            page.reload()
+            page.wait_for_function(
+                "window.__bunriWeb && window.__bunriWeb.isPolling() === true",
+                timeout=10_000,
+            )
+            release.set()
+            page.wait_for_function(
+                "document.getElementById('sw-pocket-summary').textContent === "
+                "'全曲アップロード完了: 2件'",
+                timeout=10_000,
+            )
+            assert page.locator("#sw-pocket-summary").is_visible()
+            page.wait_for_function("window.__bunriWeb.isPolling() === false", timeout=10_000)
+    finally:
+        release.set()
+
+
+@_needs_browser
+def test_reloaded_preflight_failure_summary_omits_empty_counts(tmp_path):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    safe_message = "ローカルパッケージを安全に同期できません。"
+    _write_pocket_all_record(
+        out_dir,
+        job_id="j-pocket-preflight",
+        status="error",
+        error=safe_message,
+        progress={
+            "total": 0,
+            "completed": 0,
+            "current": None,
+            "legacy": [],
+            "done": [],
+            "failed": [],
+            "pending": [],
+        },
+    )
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-summary').textContent === "
+            "'全曲アップロード失敗: ローカルパッケージを安全に同期できません。'",
+            timeout=10_000,
+        )
+        summary = page.locator("#sw-pocket-summary")
+        assert summary.is_visible()
+        assert "0件" not in summary.text_content()
 
 
 @_needs_browser

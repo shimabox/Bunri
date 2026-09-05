@@ -728,17 +728,21 @@
   function renderPocketSummary(job) {
     if (job.kind !== "pocket_all" || (job.status !== "done" && job.status !== "error")) return;
     var completed = pocketJobCount(job, "completed");
+    var failed = pocketJobCount(job, "failed");
+    var pending = pocketJobCount(job, "pending");
     var legacy = pocketJobCount(job, "legacy");
+    var total = pocketJobCount(job, "total");
+    var hasCounts = total > 0 || completed > 0 || failed > 0 || pending > 0 || legacy > 0;
     var legacyText = legacy ? "（再生成が必要 " + legacy + "件）" : "";
     if (job.status === "done") {
       pocketSummary.textContent = "全曲アップロード完了: " + completed + "件" + legacyText;
       pocketSummary.classList.remove("is-error");
     } else {
-      var failed = pocketJobCount(job, "failed");
-      var pending = pocketJobCount(job, "pending");
       var error = job.error || "Pocket の同期に失敗しました。";
       pocketSummary.textContent = "全曲アップロード失敗: " + error
-        + "（完了 " + completed + "件 / 失敗 " + failed + "件 / 未実行 " + pending + "件）"
+        + (hasCounts
+          ? "（完了 " + completed + "件 / 失敗 " + failed + "件 / 未実行 " + pending + "件）"
+          : "")
         + legacyText;
       pocketSummary.classList.add("is-error");
     }
@@ -903,7 +907,8 @@
         pocketButton.type = "button";
         pocketButton.className = "sw-btn";
         pocketButton.textContent = "⬆ アップロード";
-        pocketButton.disabled = pocketChecking || hasActivePocketJobs(songs) || !pocketStatus || !pocketStatus.can_sync;
+        pocketButton.disabled = pocketChecking || activePocketJobId !== null
+          || hasActivePocketJobs(songs) || !pocketStatus || !pocketStatus.can_sync;
         if (pocketStatus && pocketStatus.song_id) {
           pocketButton.addEventListener("click", function () {
             pocketButton.disabled = true;
@@ -1043,7 +1048,8 @@
       deleteButton.type = "button";
       deleteButton.className = "sw-btn sw-delete-song-btn";
       deleteButton.textContent = "この曲を削除";
-      deleteButton.disabled = songHasActiveJobs(song) || hasActivePocketJobs(songs);
+      deleteButton.disabled = activePocketJobId !== null
+        || songHasActiveJobs(song) || hasActivePocketJobs(songs);
       if (deleteButton.disabled) {
         deleteButton.title = "待機中または処理中のジョブがある曲は削除できません";
       }
@@ -1143,11 +1149,21 @@
         pocketStatuses = Object.create(null);
         if (status.job && (status.job.status === "queued" || status.job.status === "running")) {
           activePocketJobId = status.job.id;
+        } else if (status.job && (status.job.status === "done" || status.job.status === "error")) {
+          activePocketJobId = null;
+          renderPocketSummary(status.job);
         }
         (status.songs || []).forEach(function (item) {
           if (item.web_song_id) pocketStatuses[item.web_song_id] = item;
         });
         pocketCount.textContent = "出力先の全パッケージ " + (status.package_count || 0) + "件中、同期対象 " + (status.target_count || 0) + "件";
+        if (
+          activePocketJobId !== null && status.job
+          && status.job.kind === "pocket_all" && status.job.progress
+        ) {
+          pocketCount.textContent = "全曲アップロード: " + status.job.progress.completed + "/" + status.job.progress.total
+            + (status.job.progress.current ? "（" + status.job.progress.current + "）" : "");
+        }
       })
       .catch(function () {
         pocketConnected = false;
@@ -1157,6 +1173,7 @@
       .finally(function () {
         pocketChecking = false;
         renderSongs(songsCache);
+        schedulePoll(songsCache);
       });
   }
 
@@ -1164,7 +1181,9 @@
     pocketAll.disabled = true;
     postPocket(API_POCKET_SYNC)
       .catch(function (err) { window.alert(err.message || "全曲アップロードを開始できません"); })
-      .finally(function () { pocketAll.disabled = hasActivePocketJobs(songsCache); });
+      .finally(function () {
+        pocketAll.disabled = activePocketJobId !== null || hasActivePocketJobs(songsCache);
+      });
   });
   pocketRefresh.addEventListener("click", function () {
     clearPocketSummary();

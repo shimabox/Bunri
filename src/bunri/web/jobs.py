@@ -39,12 +39,13 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from bunri.package_metadata import read_package_metadata
 from bunri.registry import REGISTRY
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.service import safe_error, sync_all, sync_one
@@ -1463,13 +1464,80 @@ class JobStore:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def _package_names_for_digest(self, digest: str, jobs: list[Job]) -> set[str]:
+        """Resolve a web song to package names through its persisted sidecar.
+
+        Batch progress is keyed by package name, while the web song list is
+        keyed by source digest.  Reading only the small sidecar keeps this
+        lookup suitable for the lightweight song poll and avoids treating
+        display download URLs as synchronization identity.
+        """
+        names: set[str] = set()
+        out_dir = self.out_dir.resolve()
+        for job in jobs:
+            if job.kind != "separate" or job.digest != digest or job.package is None:
+                continue
+            package_name = Path(job.package).parts[0]
+            package_dir = self.out_dir / package_name
+            try:
+                if (
+                    package_dir.is_symlink()
+                    or not package_dir.is_dir()
+                    or package_dir.resolve().parent != out_dir
+                ):
+                    continue
+                metadata = read_package_metadata(
+                    package_dir / ".bunri-package.json",
+                    package_name,
+                    allow_unknown_targets=True,
+                )
+            except (OSError, ValueError):
+                continue
+            if metadata.source.digest == digest:
+                names.add(package_name)
+        return names
+
+    @staticmethod
+    def _batch_song_status(job: Job, package_names: set[str]) -> tuple[bool, Job | None]:
+        progress = job.progress if isinstance(job.progress, dict) else {}
+
+        def progress_names(name: str) -> set[str]:
+            value = progress.get(name)
+            if not isinstance(value, list):
+                return set()
+            return {item for item in value if isinstance(item, str)}
+
+        if package_names & progress_names("failed"):
+            return True, replace(job, status="error")
+        if package_names & progress_names("done"):
+            return True, replace(job, status="done", error=None)
+        if package_names & progress_names("pending"):
+            # A batch failure says nothing about a package that was never
+            # attempted.  Let its independently inspected remote state show.
+            return True, None
+        return False, None
+
     def latest_pocket_job(self, digest: str) -> Optional[Job]:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        package_names = self._package_names_for_digest(digest, jobs)
+        candidates: list[tuple[Job, Job | None]] = []
+        for job in jobs:
+            if job.kind == "pocket_single" and job.pocket_digest == digest:
+                candidates.append((job, job))
+            elif job.kind == "pocket_all" and package_names:
+                related, song_view = self._batch_song_status(job, package_names)
+                if related:
+                    candidates.append((job, song_view))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: (item[0].created_at, item[0].id))[1]
+
+    def latest_finished_pocket_all_job(self) -> Optional[Job]:
         with self._lock:
             candidates = [
                 job for job in self._jobs.values()
-                if job.kind == "pocket_all" or (
-                    job.kind == "pocket_single" and job.pocket_digest == digest
-                )
+                if job.kind == "pocket_all" and job.status in ("done", "error")
             ]
         return max(candidates, key=lambda job: (job.created_at, job.id), default=None)
 

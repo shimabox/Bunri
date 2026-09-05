@@ -157,6 +157,112 @@ def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, m
     assert "example.invalid" not in response.text + json.dumps(detail) + json.dumps(stored)
 
 
+def test_pocket_status_returns_latest_finished_batch_after_reload(tmp_path, monkeypatch):
+    import base64
+    import json
+
+    from bunri.pocket.config import PocketConfig, save_config
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(tmp_path, PocketConfig("https://example.invalid", token))
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    job_id = "j-pocket-finished"
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps({
+        "id": job_id,
+        "kind": "pocket_all",
+        "status": "error",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": "Pocket の同期に失敗しました。後で再実行してください。",
+        "progress": {
+            "total": 2,
+            "completed": 1,
+            "current": None,
+            "legacy": [],
+            "done": ["Done Song"],
+            "failed": ["Failed Song"],
+            "pending": [],
+        },
+        "result": {"total": 2, "completed": 1, "failed": 1, "pending": 0, "legacy": []},
+    }), encoding="utf-8")
+    monkeypatch.setattr(app_module, "inspect_packages", lambda *_args, **_kwargs: ())
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        response = c.get("/api/pocket/status")
+
+    assert response.status_code == 200
+    assert response.json()["job"]["id"] == job_id
+    assert response.json()["job"]["status"] == "error"
+
+
+def test_songs_apply_batch_results_only_to_matching_packages(tmp_path, monkeypatch):
+    import json
+
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    digests = {
+        "Done Song": "1" * 40,
+        "Failed Song": "2" * 40,
+        "Pending Song": "3" * 40,
+    }
+    for index, (safe_name, digest) in enumerate(digests.items()):
+        _write_job_file(
+            tmp_path,
+            f"j-separate-{index}",
+            digest=digest,
+            title=safe_name,
+        )
+        package = tmp_path / safe_name
+        package.mkdir()
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                safe_name,
+                safe_name,
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",)),),
+            ),
+        )
+    jobs_dir = tmp_path / "web" / "jobs"
+    (jobs_dir / "j-pocket-all.json").write_text(json.dumps({
+        "id": "j-pocket-all",
+        "kind": "pocket_all",
+        "status": "error",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": "Pocket の同期に失敗しました。後で再実行してください。",
+        "progress": {
+            "total": 3,
+            "completed": 1,
+            "current": None,
+            "legacy": [],
+            "done": ["Done Song"],
+            "failed": ["Failed Song"],
+            "pending": ["Pending Song"],
+        },
+        "result": {"total": 3, "completed": 1, "failed": 1, "pending": 1, "legacy": []},
+    }), encoding="utf-8")
+    monkeypatch.setattr(app_module, "_download_files", lambda _job: [])
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        songs = {song["title"]: song for song in c.get("/api/songs").json()}
+
+    assert songs["Done Song"]["pocket_job"]["status"] == "done"
+    assert songs["Done Song"]["pocket_job"]["error"] is None
+    assert songs["Failed Song"]["pocket_job"]["status"] == "error"
+    assert songs["Pending Song"]["pocket_job"] is None
+
+
 # ---------------------------------------------------------------------------
 def test_upload_returns_202_and_job_appears_queued_or_running(client):
     res = _upload(client, title="My Song")

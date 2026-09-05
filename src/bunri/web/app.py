@@ -440,12 +440,12 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
             }
             for item in packages
         ]
-        active_job = store.active_pocket_job()
+        status_job = store.active_pocket_job() or store.latest_finished_pocket_all_job()
         return {
             "connected": True,
             "target_count": sum(item.song_id is not None for item in packages),
             "package_count": len(packages),
-            "job": _serialize_job(active_job) if active_job is not None else None,
+            "job": _serialize_job(status_job) if status_job is not None else None,
             "songs": songs,
         }
 

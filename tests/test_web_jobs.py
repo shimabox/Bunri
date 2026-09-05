@@ -555,6 +555,67 @@ def test_completed_pocket_job_does_not_rename_untitled_separation_job(tmp_path):
     assert safe_filename(job.title) == "untitled"
 
 
+def test_batch_pocket_job_uses_each_package_result_for_song_status(tmp_path):
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    digests = {
+        "Done Song": "1" * 40,
+        "Failed Song": "2" * 40,
+        "Pending Song": "3" * 40,
+    }
+    for index, (safe_name, digest) in enumerate(digests.items()):
+        _write_terminal_job(tmp_path, f"j-separate-{index}", digest, safe_name)
+        package = tmp_path / safe_name
+        package.mkdir()
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                safe_name,
+                safe_name,
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",)),),
+            ),
+        )
+    batch = Job(
+        id="j-pocket-all",
+        digest="",
+        title="",
+        target="",
+        status="error",
+        created_at="2026-09-05T00:00:00+00:00",
+        finished_at="2026-09-05T00:00:01+00:00",
+        error="Pocket の同期に失敗しました。後で再実行してください。",
+        kind="pocket_all",
+        progress={
+            "total": 3,
+            "completed": 1,
+            "current": None,
+            "legacy": [],
+            "done": ["Done Song"],
+            "failed": ["Failed Song"],
+            "pending": ["Pending Song"],
+        },
+    )
+    _write_job_file(tmp_path, batch)
+    store = JobStore(tmp_path, runner=FakeRunner())
+    try:
+        done = store.latest_pocket_job(digests["Done Song"])
+        failed = store.latest_pocket_job(digests["Failed Song"])
+        pending = store.latest_pocket_job(digests["Pending Song"])
+
+        assert done is not None and done.status == "done" and done.error is None
+        assert failed is not None and failed.status == "error"
+        assert failed.error == batch.error
+        assert pending is None
+    finally:
+        store.shutdown()
+
+
 def test_delete_song_rejects_final_and_fixed_parent_symlinks(tmp_path):
     digest = "e" * 40
     _write_terminal_job(tmp_path, "j-delete", digest, "Song")
