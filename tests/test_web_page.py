@@ -257,6 +257,54 @@ def test_pocket_error_job_renders_failure_badge_and_safe_message(tmp_path, monke
 
 
 @_needs_browser
+def test_pocket_all_failure_summary_renders_without_song_cards(tmp_path, monkeypatch):
+    import base64
+
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    safe_message = "Pocket の同期に失敗しました。後で再実行してください。"
+
+    def fail_sync_all(*_args, progress=None, **_kwargs):
+        batch = BatchResult(
+            total=3,
+            legacy=["Legacy Song"],
+            items=[
+                BatchItem("Done Song", "done"),
+                BatchItem("Failed Song", "error", error=safe_message),
+                BatchItem("Pending Song", "pending"),
+            ],
+        )
+        if progress is not None:
+            progress(batch, None)
+        return batch
+
+    monkeypatch.setattr(jobs_module, "sync_all", fail_sync_all)
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        page.wait_for_selector("#sw-pocket-controls:not([hidden])")
+        assert page.locator("li.sw-job").count() == 0
+        page.locator("#sw-pocket-all").click()
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-summary').textContent.startsWith("
+            "'全曲アップロード失敗:')",
+            timeout=10_000,
+        )
+
+        summary = page.locator("#sw-pocket-summary")
+        assert summary.is_visible()
+        assert summary.text_content() == (
+            "全曲アップロード失敗: "
+            f"{safe_message}（完了 1件 / 失敗 1件 / 未実行 1件）（再生成が必要 1件）"
+        )
+        assert summary.get_attribute("class").endswith("is-error")
+
+
+@_needs_browser
 def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
     runner = PageFakeRunner(delay=1.0)
     app = create_app(tmp_path / "out", runner=runner)

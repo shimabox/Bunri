@@ -53,6 +53,15 @@
   .sw-pocket-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .sw-pocket-controls[hidden] { display: none; }
   .sw-pocket-note { color: #8a7f74; font-size: 0.76rem; }
+  .sw-pocket-summary {
+    flex-basis: 100%;
+    margin: 2px 0 0;
+    color: #1f6f64;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .sw-pocket-summary[hidden] { display: none; }
+  .sw-pocket-summary.is-error { color: #c0392b; }
   .sw-pocket-row { border-bottom: 1px solid #f1e8da; padding: 10px 0 12px; }
   .sw-pocket-row-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .sw-pocket-message { margin: 6px 0 0; color: #8a7f74; font-size: 0.78rem; }
@@ -457,6 +466,7 @@
         <button type="button" id="sw-pocket-all" class="sw-btn sw-btn-primary">全曲アップロード</button>
         <button type="button" id="sw-pocket-refresh" class="sw-btn">状態を再読込</button>
         <span id="sw-pocket-count" class="sw-pocket-note"></span>
+        <p id="sw-pocket-summary" class="sw-pocket-summary" role="status" aria-live="polite" hidden></p>
       </div>
     </div>
     <p id="sw-empty" class="sw-empty">まだ曲はありません。</p>
@@ -522,6 +532,7 @@
   var pocketAll = document.getElementById("sw-pocket-all");
   var pocketRefresh = document.getElementById("sw-pocket-refresh");
   var pocketCount = document.getElementById("sw-pocket-count");
+  var pocketSummary = document.getElementById("sw-pocket-summary");
 
   var pendingFile = null;
   var pollTimer = null;
@@ -695,9 +706,43 @@
       }
       return res.json();
     }).then(function (body) {
+      clearPocketSummary();
       activePocketJobId = body.job_id;
       return refreshSongs();
     });
+  }
+
+  function clearPocketSummary() {
+    pocketSummary.hidden = true;
+    pocketSummary.textContent = "";
+    pocketSummary.classList.remove("is-error");
+  }
+
+  function pocketJobCount(job, name) {
+    if (job.result && typeof job.result[name] === "number") return job.result[name];
+    if (job.progress && Array.isArray(job.progress[name])) return job.progress[name].length;
+    if (job.progress && typeof job.progress[name] === "number") return job.progress[name];
+    return 0;
+  }
+
+  function renderPocketSummary(job) {
+    if (job.kind !== "pocket_all" || (job.status !== "done" && job.status !== "error")) return;
+    var completed = pocketJobCount(job, "completed");
+    var legacy = pocketJobCount(job, "legacy");
+    var legacyText = legacy ? "（再生成が必要 " + legacy + "件）" : "";
+    if (job.status === "done") {
+      pocketSummary.textContent = "全曲アップロード完了: " + completed + "件" + legacyText;
+      pocketSummary.classList.remove("is-error");
+    } else {
+      var failed = pocketJobCount(job, "failed");
+      var pending = pocketJobCount(job, "pending");
+      var error = job.error || "Pocket の同期に失敗しました。";
+      pocketSummary.textContent = "全曲アップロード失敗: " + error
+        + "（完了 " + completed + "件 / 失敗 " + failed + "件 / 未実行 " + pending + "件）"
+        + legacyText;
+      pocketSummary.classList.add("is-error");
+    }
+    pocketSummary.hidden = false;
   }
 
   function expandedFor(song) {
@@ -1078,6 +1123,7 @@
             + (job.progress.current ? "（" + job.progress.current + "）" : "");
         }
         if (job.status === "done" || job.status === "error") {
+          renderPocketSummary(job);
           activePocketJobId = null;
           return refreshPocketStatus();
         }
@@ -1120,7 +1166,10 @@
       .catch(function (err) { window.alert(err.message || "全曲アップロードを開始できません"); })
       .finally(function () { pocketAll.disabled = hasActivePocketJobs(songsCache); });
   });
-  pocketRefresh.addEventListener("click", refreshPocketStatus);
+  pocketRefresh.addEventListener("click", function () {
+    clearPocketSummary();
+    refreshPocketStatus();
+  });
 
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "visible") {
