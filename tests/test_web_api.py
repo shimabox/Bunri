@@ -157,7 +157,9 @@ def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, m
     assert "example.invalid" not in response.text + json.dumps(detail) + json.dumps(stored)
 
 
-def test_pocket_status_returns_latest_finished_batch_after_reload(tmp_path, monkeypatch):
+def test_pocket_job_tracking_never_waits_for_the_remote_inspection(tmp_path, monkeypatch):
+    """A reload must be able to resume following a batch even when the remote
+    shelf is unreachable, so the tracking route inspects nothing remote."""
     import base64
     import json
 
@@ -187,15 +189,106 @@ def test_pocket_status_returns_latest_finished_batch_after_reload(tmp_path, monk
         },
         "result": {"total": 2, "completed": 1, "failed": 1, "pending": 0, "legacy": []},
     }), encoding="utf-8")
-    monkeypatch.setattr(app_module, "inspect_packages", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(
+        app_module,
+        "inspect_packages",
+        lambda *_args, **_kwargs: pytest.fail("job tracking must not inspect the remote shelf"),
+    )
 
     app = create_app(tmp_path, runner=ApiFakeRunner())
     with TestClient(app) as c:
-        response = c.get("/api/pocket/status")
+        response = c.get("/api/pocket/job")
 
     assert response.status_code == 200
     assert response.json()["job"]["id"] == job_id
     assert response.json()["job"]["status"] == "error"
+    assert response.json()["job"]["kind"] == "pocket_all"
+    assert token not in response.text and "example.invalid" not in response.text
+
+
+def test_queued_pocket_job_blocks_a_second_pocket_job_of_another_kind(tmp_path):
+    """A `queued` Pocket job holds no cross-process lock yet -- it takes one
+    when the worker reaches it. Letting a different kind register beside it
+    would hand that lock to whichever ran first and fail the other."""
+    import base64
+    import json
+    import threading
+
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+    from bunri.pocket.config import PocketConfig, save_config
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(tmp_path, PocketConfig("https://example.invalid", token))
+    digest = "a" * 40
+    package = tmp_path / "Song"
+    package.mkdir()
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Song",
+            "Song",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+        (package / f"Song.{suffix}").write_bytes(b"audio")
+
+    uploads_dir = tmp_path / "web" / "uploads"
+    uploads_dir.mkdir(parents=True)
+    (uploads_dir / "song.mp3").write_bytes(b"fake-audio-bytes")
+    # Recovery re-queues in created_at order, so the separation job occupies
+    # the single worker and leaves the batch waiting in the queue -- exactly
+    # the state a restart leaves behind.
+    _write_job_file(
+        tmp_path,
+        "j-separate-busy",
+        status="queued",
+        started_at=None,
+        finished_at=None,
+        package=None,
+        created_at="2026-09-05T00:00:00+00:00",
+    )
+    (tmp_path / "web" / "jobs" / "j-pocket-all.json").write_text(json.dumps({
+        "id": "j-pocket-all",
+        "kind": "pocket_all",
+        "status": "running",
+        "created_at": "2026-09-05T00:00:01+00:00",
+        "started_at": "2026-09-05T00:00:02+00:00",
+        "finished_at": None,
+        "error": None,
+        "progress": None,
+        "result": None,
+    }), encoding="utf-8")
+
+    release = threading.Event()
+    running = threading.Event()
+
+    def blocking_runner(upload_path, out_dir, title, target, log_path):
+        running.set()
+        release.wait(timeout=10)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("blocked\n", encoding="utf-8")
+        return 1
+
+    app = create_app(tmp_path, runner=blocking_runner)
+    with TestClient(app) as c:
+        try:
+            assert running.wait(timeout=5)
+            _wait_until(lambda: _job_status(c, "j-pocket-all") == "queued")
+            response = c.post("/api/pocket/sync/" + digest[:12])
+            jobs = c.get("/api/jobs").json()
+        finally:
+            release.set()
+
+    assert response.status_code == 409
+    assert token not in response.text and "example.invalid" not in response.text
+    assert sorted(job["id"] for job in jobs) == ["j-pocket-all", "j-separate-busy"]
 
 
 def test_songs_apply_batch_results_only_to_matching_packages(tmp_path, monkeypatch):

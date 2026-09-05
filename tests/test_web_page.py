@@ -392,6 +392,69 @@ def test_reloaded_page_resumes_running_batch_and_renders_its_result(tmp_path, mo
 
 
 @_needs_browser
+def test_reloaded_page_resumes_polling_before_the_remote_check_answers(tmp_path, monkeypatch):
+    """An unreachable shelf costs one timeout per song. The reloaded page must
+    pick a running batch back up without waiting for that."""
+    import base64
+
+    import bunri.web.app as app_module
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    _write_pocket_all_record(
+        out_dir,
+        job_id="j-pocket-slow-remote",
+        status="running",
+        error=None,
+        progress={
+            "total": 2,
+            "completed": 0,
+            "current": "First Song",
+            "legacy": [],
+            "done": [],
+            "failed": [],
+            "pending": ["First Song", "Second Song"],
+        },
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_sync_all(*_args, progress=None, **_kwargs):
+        started.set()
+        release.wait(timeout=30)
+        batch = BatchResult(
+            total=2,
+            items=[BatchItem("First Song", "done"), BatchItem("Second Song", "done")],
+        )
+        if progress is not None:
+            progress(batch, None)
+        return batch
+
+    def unreachable_inspect(*_args, **_kwargs):
+        release.wait(timeout=30)
+        return ()
+
+    monkeypatch.setattr(jobs_module, "sync_all", blocking_sync_all)
+    monkeypatch.setattr(app_module, "inspect_packages", unreachable_inspect)
+    app = create_app(out_dir, runner=PageFakeRunner())
+    assert started.wait(timeout=5)
+    try:
+        with _running_server(app) as base_url, _open_page(base_url) as page:
+            page.wait_for_function(
+                "window.__bunriWeb.isPolling() === true", timeout=5_000
+            )
+            assert page.evaluate(
+                "document.getElementById('sw-pocket-count').textContent"
+            ) == "全曲アップロード: 0/2（First Song）"
+    finally:
+        release.set()
+
+
+@_needs_browser
 def test_reloaded_preflight_failure_summary_omits_empty_counts(tmp_path):
     import base64
 

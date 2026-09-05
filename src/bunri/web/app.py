@@ -391,6 +391,19 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
             for song in store.list_songs()
         ]
 
+    @app.get("/api/pocket/job")
+    def pocket_job() -> dict:
+        """Which Pocket synchronization the page should be following.
+
+        Deliberately reads nothing but the local job records: the remote
+        shelf inspection behind /api/pocket/status can take one timeout per
+        song when Pocket is unreachable, and a page that had to wait for it
+        would leave a running batch untracked -- no progress, no polling --
+        for that whole time after every reload.
+        """
+        job = store.active_pocket_job() or store.latest_finished_pocket_all_job()
+        return {"job": _serialize_job(job) if job is not None else None}
+
     @app.get("/api/pocket/status")
     def pocket_status() -> dict:
         try:
@@ -440,12 +453,10 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
             }
             for item in packages
         ]
-        status_job = store.active_pocket_job() or store.latest_finished_pocket_all_job()
         return {
             "connected": True,
             "target_count": sum(item.song_id is not None for item in packages),
             "package_count": len(packages),
-            "job": _serialize_job(status_job) if status_job is not None else None,
             "songs": songs,
         }
 

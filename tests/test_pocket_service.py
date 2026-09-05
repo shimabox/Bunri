@@ -12,7 +12,14 @@ from bunri.pocket.config import PocketConfig, save_config
 from bunri.pocket.http import JSONDocument, PocketHTTPError
 from bunri.pocket.local import all_package_names
 from bunri.pocket.lock import SyncLock, SyncLockBusy
-from bunri.pocket.service import PocketServiceError, inspect_remote, inventory, sync_all
+from bunri.pocket.service import (
+    PocketServiceError,
+    inspect_packages,
+    inspect_remote,
+    inventory,
+    resolve_package,
+    sync_all,
+)
 
 
 TOKEN = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
@@ -50,6 +57,54 @@ def test_inventory_reports_all_legacy_but_rejects_duplicate_identity(tmp_path):
     make_package(tmp_path, "B", "a" * 40)
     with pytest.raises(PocketServiceError, match="複数のパッケージ名"):
         inventory(tmp_path)
+
+
+class RefusingClient:
+    """Any call means a conflicting package reached the network."""
+
+    def get_json(self, path):
+        pytest.fail("a conflicting identity must be settled before any request")
+
+    def head_media(self, song_id, name):
+        pytest.fail("a conflicting identity must be settled before any request")
+
+
+def test_duplicate_song_id_is_detected_even_when_one_copy_fails_preflight(tmp_path):
+    make_package(tmp_path, "Good", "a" * 40)
+    make_package(tmp_path, "Broken", "a" * 12 + "b" * 28)
+    (tmp_path / "Broken" / "Broken.guitar.mp3").unlink()
+
+    with pytest.raises(PocketServiceError, match="identity が競合"):
+        resolve_package(tmp_path, "a" * 12)
+
+    statuses = {item.safe_name: item for item in inspect_packages(tmp_path, RefusingClient())}
+    assert statuses["Good"].remote.conflict is True
+    assert statuses["Good"].remote.can_sync is False
+    assert statuses["Broken"].remote.conflict is True
+
+
+def test_duplicate_full_digest_is_detected_even_when_one_copy_fails_preflight(tmp_path):
+    make_package(tmp_path, "Good", "a" * 40)
+    make_package(tmp_path, "Broken", "a" * 40)
+    (tmp_path / "Broken" / "Broken.original.mp3").write_bytes(b"")
+
+    with pytest.raises(PocketServiceError, match="identity が競合"):
+        resolve_package(tmp_path, "Good")
+
+    with pytest.raises(PocketServiceError, match="複数のパッケージ名"):
+        inventory(tmp_path)
+
+    statuses = {item.safe_name: item for item in inspect_packages(tmp_path, RefusingClient())}
+    assert statuses["Good"].remote.conflict is True
+
+
+def test_a_sidecarless_directory_never_joins_the_identity_check(tmp_path):
+    make_package(tmp_path, "Good", "a" * 40)
+    (tmp_path / "Legacy").mkdir()
+
+    package = resolve_package(tmp_path, "a" * 12)
+    assert package.directory.name == "Good"
+    assert inventory(tmp_path).legacy == ("Legacy",)
 
 
 def test_sync_lock_is_non_blocking_and_reusable_after_release(tmp_path):

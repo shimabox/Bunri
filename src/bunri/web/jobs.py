@@ -1798,18 +1798,25 @@ class JobStore:
         """Persist one direct Pocket job after its cross-process lock is held."""
         kind = "pocket_single" if song_id is not None else "pocket_all"
         with self._lock:
-            duplicate = next(
+            # Only one Pocket synchronization may be pending at a time, whatever
+            # its kind. A job that is merely `queued` -- a fresh one behind a
+            # busy worker, or one a restart put back -- does not hold the
+            # cross-process sync lock yet: it takes it when the worker picks it
+            # up. Admitting a second Pocket job next to it would hand that lock
+            # to whichever runs first and leave the other to fail on a conflict
+            # it never caused. Refusing here keeps "one sync at a time" true for
+            # the whole queue, not just for the job currently running.
+            pending = next(
                 (
                     job for job in self._jobs.values()
-                    if job.kind == kind
+                    if job.kind in ("pocket_single", "pocket_all")
                     and job.status in ("queued", "running")
-                    and (kind == "pocket_all" or job.pocket_song_id == song_id)
                 ),
                 None,
             )
-            if duplicate is not None:
+            if pending is not None:
                 sync_lock.release()
-                raise SyncLockBusy("同じ Pocket 同期がすでに登録されています。")
+                raise SyncLockBusy("ほかの Pocket 同期がすでに登録されています。")
             job_id = new_job_id()
             job = Job(
                 id=job_id,

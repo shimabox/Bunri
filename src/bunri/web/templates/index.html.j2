@@ -504,6 +504,7 @@
   var API_JOBS = "/api/jobs";
   var API_SONGS = "/api/songs";
   var API_POCKET_STATUS = "/api/pocket/status";
+  var API_POCKET_JOB = "/api/pocket/job";
   var API_POCKET_SYNC = "/api/pocket/sync";
   var POLL_INTERVAL_MS = 2000;
 
@@ -545,6 +546,11 @@
   var pocketChecking = false;
   var pocketStatuses = Object.create(null);
   var activePocketJobId = null;
+  // The package tally comes from the remote status call and the batch progress
+  // from the job poll; they share one line, so each keeps its own text and the
+  // progress wins whenever a batch is in flight.
+  var pocketCountText = "";
+  var pocketProgressText = "";
 
   function stem(name) {
     var idx = name.lastIndexOf(".");
@@ -716,6 +722,21 @@
     pocketSummary.hidden = true;
     pocketSummary.textContent = "";
     pocketSummary.classList.remove("is-error");
+  }
+
+  function renderPocketCount() {
+    pocketCount.textContent = pocketProgressText || pocketCountText;
+  }
+
+  function renderPocketProgress(job) {
+    if (job && job.kind === "pocket_all" && job.progress
+      && (job.status === "queued" || job.status === "running")) {
+      pocketProgressText = "全曲アップロード: " + job.progress.completed + "/" + job.progress.total
+        + (job.progress.current ? "（" + job.progress.current + "）" : "");
+    } else {
+      pocketProgressText = "";
+    }
+    renderPocketCount();
   }
 
   function pocketJobCount(job, name) {
@@ -1124,15 +1145,33 @@
     return fetch(API_JOBS + "/" + encodeURIComponent(jobId))
       .then(function (res) { return res.json(); })
       .then(function (job) {
-        if (job.progress && job.kind === "pocket_all") {
-          pocketCount.textContent = "全曲アップロード: " + job.progress.completed + "/" + job.progress.total
-            + (job.progress.current ? "（" + job.progress.current + "）" : "");
-        }
+        renderPocketProgress(job);
         if (job.status === "done" || job.status === "error") {
           renderPocketSummary(job);
           activePocketJobId = null;
           return refreshPocketStatus();
         }
+      })
+      .catch(function () { return undefined; });
+  }
+
+  // Restores what the page should be following without touching the remote
+  // shelf: an unreachable Pocket must not delay a reload from picking a
+  // running batch back up.
+  function refreshPocketJob() {
+    return fetch(API_POCKET_JOB)
+      .then(function (res) { return res.json(); })
+      .then(function (body) {
+        var job = body.job;
+        renderPocketProgress(job);
+        if (job && (job.status === "queued" || job.status === "running")) {
+          activePocketJobId = job.id;
+        } else if (job && (job.status === "done" || job.status === "error")) {
+          activePocketJobId = null;
+          renderPocketSummary(job);
+        }
+        renderSongs(songsCache);
+        schedulePoll(songsCache);
       })
       .catch(function () { return undefined; });
   }
@@ -1147,23 +1186,11 @@
         pocketBanner.hidden = !pocketConnected;
         pocketControls.hidden = !pocketConnected;
         pocketStatuses = Object.create(null);
-        if (status.job && (status.job.status === "queued" || status.job.status === "running")) {
-          activePocketJobId = status.job.id;
-        } else if (status.job && (status.job.status === "done" || status.job.status === "error")) {
-          activePocketJobId = null;
-          renderPocketSummary(status.job);
-        }
         (status.songs || []).forEach(function (item) {
           if (item.web_song_id) pocketStatuses[item.web_song_id] = item;
         });
-        pocketCount.textContent = "出力先の全パッケージ " + (status.package_count || 0) + "件中、同期対象 " + (status.target_count || 0) + "件";
-        if (
-          activePocketJobId !== null && status.job
-          && status.job.kind === "pocket_all" && status.job.progress
-        ) {
-          pocketCount.textContent = "全曲アップロード: " + status.job.progress.completed + "/" + status.job.progress.total
-            + (status.job.progress.current ? "（" + status.job.progress.current + "）" : "");
-        }
+        pocketCountText = "出力先の全パッケージ " + (status.package_count || 0) + "件中、同期対象 " + (status.target_count || 0) + "件";
+        renderPocketCount();
       })
       .catch(function () {
         pocketConnected = false;
@@ -1193,6 +1220,7 @@
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "visible") {
       refreshSongs();
+      refreshPocketJob();
       refreshPocketStatus();
     }
   });
@@ -1207,9 +1235,12 @@
       return songsCache.reduce(function (jobs, song) { return jobs.concat(song.targets); }, []);
     },
     isPolling: function () { return pollTimer !== null; },
-    refresh: function () { return Promise.all([refreshSongs(), refreshPocketStatus()]); }
+    refresh: function () {
+      return Promise.all([refreshSongs(), refreshPocketJob(), refreshPocketStatus()]);
+    }
   };
 
+  refreshPocketJob();
   refreshSongs();
   refreshPocketStatus();
 })();

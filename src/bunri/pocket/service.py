@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
+from bunri.package_metadata import SourceIdentity
 from bunri.pocket.config import read_config
 from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
 from bunri.pocket.local import LocalPackage, LocalPreflightError, all_package_names, preflight
@@ -70,13 +71,51 @@ class BatchResult:
         return sum(item.status == "pending" for item in self.items)
 
 
-def _identity_issues(packages: Iterable[LocalPackage]) -> list[str]:
+@dataclass(frozen=True)
+class ScannedPackage:
+    """One package directory as preflight saw it, plus its sidecar identity.
+
+    Identity is kept separately from the preflight outcome on purpose: a
+    package whose audio assets are missing or unreadable still claims a
+    source digest and a song ID, so it has to take part in the duplicate
+    identity check. Otherwise a broken copy of a song would hide the
+    ambiguity and let the remaining copy be uploaded as if it were the only
+    one. Directories without a sidecar (legacy) claim no identity and stay
+    out of that check.
+    """
+
+    safe_name: str
+    package: LocalPackage | None
+    error: LocalPreflightError | None
+    identity: SourceIdentity | None
+
+
+def _scan_packages(out_dir: Path, *, include_original: bool) -> list[ScannedPackage]:
+    scanned: list[ScannedPackage] = []
+    for safe_name in all_package_names(out_dir):
+        try:
+            package = preflight(out_dir, safe_name, include_original=include_original)
+        except LocalPreflightError as exc:
+            metadata = exc.metadata
+            scanned.append(ScannedPackage(
+                safe_name,
+                None,
+                exc,
+                metadata.source if metadata is not None else None,
+            ))
+        else:
+            scanned.append(ScannedPackage(safe_name, package, None, package.metadata.source))
+    return scanned
+
+
+def _identity_issues(entries: Iterable[ScannedPackage]) -> list[str]:
     digest_names: dict[str, set[str]] = {}
     id_digests: dict[str, set[str]] = {}
-    for package in packages:
-        source = package.metadata.source
-        digest_names.setdefault(source.digest, set()).add(package.directory.name)
-        id_digests.setdefault(source.cache_key, set()).add(source.digest)
+    for entry in entries:
+        if entry.identity is None:
+            continue
+        digest_names.setdefault(entry.identity.digest, set()).add(entry.safe_name)
+        id_digests.setdefault(entry.identity.cache_key, set()).add(entry.identity.digest)
     issues = []
     for digest, names in sorted(digest_names.items()):
         if len(names) > 1:
@@ -88,18 +127,18 @@ def _identity_issues(packages: Iterable[LocalPackage]) -> list[str]:
 
 
 def inventory(out_dir: Path, *, include_original: bool = True) -> PackageInventory:
+    scanned = _scan_packages(out_dir, include_original=include_original)
     packages: list[LocalPackage] = []
     legacy: list[str] = []
     problems: list[str] = []
-    for safe_name in all_package_names(out_dir):
-        try:
-            packages.append(preflight(out_dir, safe_name, include_original=include_original))
-        except LocalPreflightError as exc:
-            if exc.kind == "legacy":
-                legacy.append(safe_name)
-            else:
-                problems.extend(f"{safe_name}: {issue}" for issue in exc.issues)
-    problems.extend(_identity_issues(packages))
+    for entry in scanned:
+        if entry.package is not None:
+            packages.append(entry.package)
+        elif entry.error is not None and entry.error.kind == "legacy":
+            legacy.append(entry.safe_name)
+        elif entry.error is not None:
+            problems.extend(f"{entry.safe_name}: {issue}" for issue in entry.error.issues)
+    problems.extend(_identity_issues(scanned))
     if problems:
         raise PocketServiceError(
             "ローカルパッケージを安全に同期できません。アップロードは開始していません。\n- "
@@ -116,11 +155,13 @@ def resolve_package(
     expected_digest: str | None = None,
     include_original: bool = True,
 ) -> LocalPackage:
-    names = all_package_names(out_dir)
-    if expected_digest is None and song_id in names:
-        try:
-            selected = preflight(out_dir, song_id, include_original=include_original)
-        except LocalPreflightError as exc:
+    scanned = _scan_packages(out_dir, include_original=include_original)
+    by_name = {entry.safe_name: entry for entry in scanned}
+    if expected_digest is None and song_id in by_name:
+        entry = by_name[song_id]
+        if entry.package is None:
+            exc = entry.error
+            assert exc is not None
             if exc.kind == "legacy":
                 raise PocketServiceError("このパッケージは再生成が必要です。", kind="legacy") from exc
             raise PocketServiceError(
@@ -128,41 +169,41 @@ def resolve_package(
                 + "\n- ".join(exc.issues),
                 kind="local",
             ) from exc
-        peers: list[LocalPackage] = []
-        for name in names:
-            try:
-                candidate = preflight(out_dir, name, include_original=include_original)
-            except LocalPreflightError:
-                continue
-            source = candidate.metadata.source
-            if (
-                source.digest == selected.metadata.source.digest
-                or source.cache_key == selected.metadata.source.cache_key
-            ):
-                peers.append(candidate)
+        selected = entry.package
+        source = selected.metadata.source
+        peers = [
+            other for other in scanned
+            if other.identity is not None
+            and (other.identity.digest == source.digest or other.identity.cache_key == source.cache_key)
+        ]
         if _identity_issues(peers):
             raise PocketServiceError("曲の identity が競合しているためアップロードできません。", kind="conflict")
         return selected
-    matches: list[LocalPackage] = []
-    legacy_match = False
-    for safe_name in names:
-        try:
-            package = preflight(out_dir, safe_name, include_original=include_original)
-        except LocalPreflightError as exc:
-            if exc.kind == "legacy" and safe_name == song_id:
-                legacy_match = True
-            continue
-        source = package.metadata.source
-        if source.cache_key == song_id or (expected_digest is not None and source.digest == expected_digest):
-            matches.append(package)
-    if legacy_match:
+    matches = [
+        entry for entry in scanned
+        if entry.identity is not None
+        and (
+            entry.identity.cache_key == song_id
+            or (expected_digest is not None and entry.identity.digest == expected_digest)
+        )
+    ]
+    named = by_name.get(song_id)
+    if named is not None and named.error is not None and named.error.kind == "legacy":
         raise PocketServiceError("このパッケージは再生成が必要です。", kind="legacy")
     if not matches:
         raise PocketServiceError("同期する曲が見つかりません。", kind="not_found")
-    problems = _identity_issues(matches)
-    if len(matches) != 1 or problems:
+    if len(matches) != 1 or _identity_issues(matches):
         raise PocketServiceError("曲の identity が競合しているためアップロードできません。", kind="conflict")
-    package = matches[0]
+    match = matches[0]
+    if match.package is None:
+        exc = match.error
+        assert exc is not None
+        raise PocketServiceError(
+            "パッケージを安全に同期できません。アップロードは開始していません。\n- "
+            + "\n- ".join(exc.issues),
+            kind="local",
+        ) from exc
+    package = match.package
     if expected_digest is not None:
         try:
             package = preflight(
@@ -217,55 +258,54 @@ def inspect_remote(package: LocalPackage, client: PocketHTTPClient) -> RemoteSta
 
 
 def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageStatus, ...]:
-    prepared: list[LocalPackage] = []
-    statuses: list[PackageStatus] = []
-    for safe_name in all_package_names(out_dir):
-        try:
-            prepared.append(preflight(out_dir, safe_name, include_original=True))
-        except LocalPreflightError as exc:
-            if exc.kind == "legacy":
-                statuses.append(PackageStatus(
-                    safe_name,
-                    safe_name,
-                    None,
-                    None,
-                    RemoteStatus(
-                        "legacy",
-                        False,
-                        "元の入力音源から再生成してください。キャッシュが残っていれば分離処理は省略されます。",
-                    ),
-                ))
-            else:
-                statuses.append(PackageStatus(
-                    safe_name,
-                    exc.metadata.title if exc.metadata is not None else safe_name,
-                    exc.metadata.source.cache_key if exc.metadata is not None else None,
-                    exc.metadata.source.digest if exc.metadata is not None else None,
-                    RemoteStatus("unknown", False, "ローカルパッケージを確認できません。"),
-                ))
-    conflict_ids: set[str] = set()
-    conflict_digests: set[str] = set()
+    scanned = _scan_packages(out_dir, include_original=True)
     digest_names: dict[str, set[str]] = {}
     id_digests: dict[str, set[str]] = {}
-    for package in prepared:
-        source = package.metadata.source
-        digest_names.setdefault(source.digest, set()).add(package.directory.name)
-        id_digests.setdefault(source.cache_key, set()).add(source.digest)
-    conflict_digests.update(digest for digest, names in digest_names.items() if len(names) > 1)
-    conflict_ids.update(song_id for song_id, digests in id_digests.items() if len(digests) > 1)
-    for package in prepared:
-        source = package.metadata.source
-        remote = (
-            RemoteStatus("different", False, "曲の identity が競合しているためアップロードできません。", True)
-            if source.digest in conflict_digests or source.cache_key in conflict_ids
-            else inspect_remote(package, client)
+    for entry in scanned:
+        if entry.identity is None:
+            continue
+        digest_names.setdefault(entry.identity.digest, set()).add(entry.safe_name)
+        id_digests.setdefault(entry.identity.cache_key, set()).add(entry.identity.digest)
+    conflict_digests = {digest for digest, names in digest_names.items() if len(names) > 1}
+    conflict_ids = {song_id for song_id, digests in id_digests.items() if len(digests) > 1}
+
+    conflicted = RemoteStatus(
+        "different", False, "曲の identity が競合しているためアップロードできません。", True
+    )
+    statuses: list[PackageStatus] = []
+    for entry in scanned:
+        source = entry.identity
+        in_conflict = source is not None and (
+            source.digest in conflict_digests or source.cache_key in conflict_ids
         )
+        if entry.package is None:
+            exc = entry.error
+            assert exc is not None
+            if exc.kind == "legacy":
+                remote = RemoteStatus(
+                    "legacy",
+                    False,
+                    "元の入力音源から再生成してください。キャッシュが残っていれば分離処理は省略されます。",
+                )
+            elif in_conflict:
+                remote = conflicted
+            else:
+                remote = RemoteStatus("unknown", False, "ローカルパッケージを確認できません。")
+            statuses.append(PackageStatus(
+                entry.safe_name,
+                exc.metadata.title if exc.metadata is not None else entry.safe_name,
+                source.cache_key if source is not None else None,
+                source.digest if source is not None else None,
+                remote,
+            ))
+            continue
+        assert source is not None
         statuses.append(PackageStatus(
-            package.directory.name,
-            package.metadata.title,
+            entry.safe_name,
+            entry.package.metadata.title,
             source.cache_key,
             source.digest,
-            remote,
+            conflicted if in_conflict else inspect_remote(entry.package, client),
         ))
     return tuple(sorted(statuses, key=lambda item: (item.safe_name.casefold(), item.safe_name)))
 
