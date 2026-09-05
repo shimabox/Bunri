@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import base64
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata, write_package_metadata
 from bunri.pocket.config import PocketConfig, save_config
-from bunri.pocket.http import PocketHTTPError
+from bunri.pocket.http import JSONDocument, PocketHTTPError
 from bunri.pocket.local import all_package_names
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.service import PocketServiceError, inspect_remote, inventory, sync_all
@@ -59,6 +61,26 @@ def test_sync_lock_is_non_blocking_and_reusable_after_release(tmp_path):
     assert (tmp_path / ".pocket" / "sync.lock").read_bytes() == b""
 
 
+def test_sync_lock_is_released_when_owning_process_exits(tmp_path):
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "from bunri.pocket.lock import SyncLock\n"
+                "SyncLock(Path(sys.argv[1])).acquire()\n"
+                "os._exit(7)\n"
+            ),
+            str(tmp_path),
+        ],
+        check=False,
+    )
+    assert child.returncode == 7
+    SyncLock(tmp_path).acquire().release()
+
+
 def test_remote_status_uses_only_get_and_head(tmp_path):
     make_package(tmp_path, "Song", "a" * 40)
     package = inventory(tmp_path).packages[0]
@@ -79,6 +101,38 @@ def test_remote_status_uses_only_get_and_head(tmp_path):
     status = inspect_remote(package, client)
     assert status.state == "not_synced"
     assert [method for method, _ in client.calls] == ["GET", "GET"]
+
+
+def test_remote_status_rejects_library_entry_without_manifest(tmp_path):
+    make_package(tmp_path, "Song", "a" * 40)
+    package = inventory(tmp_path).packages[0]
+
+    class Client:
+        def get_json(self, path):
+            if path.startswith("manifest/"):
+                return None
+            return JSONDocument(
+                {
+                    "schema_version": "1.0",
+                    "updated_at": "2026-09-05T00:00:00Z",
+                    "songs": [
+                        {
+                            "song_id": "a" * 12,
+                            "title": "Song",
+                            "manifest": f"tracks/{'a' * 12}/manifest.json",
+                            "has_original": True,
+                            "instruments": [{"target": "guitar", "label": "ギター"}],
+                            "updated_at": "2026-09-05T00:00:00Z",
+                        }
+                    ],
+                },
+                '"library"',
+            )
+
+    status = inspect_remote(package, Client())
+    assert status.state == "different"
+    assert status.can_sync is False
+    assert status.message == "棚の状態に不整合があるためアップロードできません。"
 
 
 def test_batch_validates_every_local_package_before_first_http_call(tmp_path):

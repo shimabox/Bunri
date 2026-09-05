@@ -1488,7 +1488,10 @@ class JobStore:
         doesn't queue a duplicate). Returns None if neither exists."""
         with self._lock:
             candidates = sorted(
-                (j for j in self._jobs.values() if j.digest == digest and j.target == target),
+                (
+                    j for j in self._jobs.values()
+                    if j.kind == "separate" and j.digest == digest and j.target == target
+                ),
                 key=lambda j: j.created_at,
                 reverse=True,
             )
@@ -1531,7 +1534,10 @@ class JobStore:
                 raise SongDeleteConflict("song has queued or running jobs")
 
             target_ids = {job.id for job in targets}
-            remaining = [job for job in self._jobs.values() if job.id not in target_ids]
+            remaining = [
+                job for job in self._jobs.values()
+                if job.kind == "separate" and job.id not in target_ids
+            ]
             for job in self._jobs.values():
                 problem = _validate_job_record(job.to_dict(), job.id)
                 if problem is not None:
@@ -1612,6 +1618,8 @@ class JobStore:
         owners: dict[str, set[str]] = {}
         with self._lock:
             for j in self._jobs.values():
+                if j.kind != "separate":
+                    continue
                 owners.setdefault(safe_filename(j.title), set()).add(j.digest)
 
         requested_title = requested_title[:MAX_TITLE_CHARS]
@@ -1671,7 +1679,10 @@ class JobStore:
         # out rather than left to blow up at write time.
         requested_title = _storable(requested_title)[:MAX_TITLE_CHARS]
         with self._lock:
-            existing = [job for job in self._jobs.values() if job.digest == digest]
+            existing = [
+                job for job in self._jobs.values()
+                if job.kind == "separate" and job.digest == digest
+            ]
             title = (
                 max(existing, key=lambda job: (job.created_at, job.id)).title
                 if existing

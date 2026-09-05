@@ -175,6 +175,88 @@ def test_done_job_with_empty_downloads_does_not_render_download_controls(tmp_pat
 
 
 @_needs_browser
+def test_pocket_error_job_renders_failure_badge_and_safe_message(tmp_path, monkeypatch):
+    import base64
+
+    import bunri.web.app as app_module
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+    from bunri.pocket.config import PocketConfig, save_config
+
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    digest = "a" * 40
+    package = out_dir / "Song"
+    package.mkdir()
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Song",
+            "Song",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+        (package / f"Song.{suffix}").write_bytes(b"audio")
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": digest,
+        "title": "Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": None,
+        "package": "Song/Song.guitar.player.html",
+        "log": "web/logs/j-separate.log",
+        "upload": "web/uploads/song.mp3",
+    }), encoding="utf-8")
+    safe_message = "Pocket の同期に失敗しました。後で再実行してください。"
+    (jobs_dir / "j-pocket.json").write_text(json.dumps({
+        "id": "j-pocket",
+        "kind": "pocket_single",
+        "status": "error",
+        "created_at": "2026-09-05T00:00:03+00:00",
+        "started_at": "2026-09-05T00:00:04+00:00",
+        "finished_at": "2026-09-05T00:00:05+00:00",
+        "error": safe_message,
+        "pocket_song_id": digest[:12],
+        "pocket_digest": digest,
+        "pocket_safe_name": "Song",
+        "progress": None,
+        "result": None,
+    }), encoding="utf-8")
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+
+    class OfflineShelf:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_json(self, _path):
+            return None
+
+    monkeypatch.setattr(app_module, "PocketHTTPClient", OfflineShelf)
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        page.wait_for_selector(".sw-pocket-row", state="attached")
+        page.locator("button.sw-job-toggle").click()
+        badge = page.locator(".sw-pocket-row .sw-badge")
+        page.wait_for_function(
+            "document.querySelector('.sw-pocket-row .sw-badge').textContent === '失敗'"
+        )
+        assert badge.get_attribute("class").endswith("sw-badge-error")
+        assert page.locator(".sw-pocket-message").text_content() == safe_message
+
+
+@_needs_browser
 def test_upload_via_input_flows_through_to_a_player_link(tmp_path):
     runner = PageFakeRunner(delay=1.0)
     app = create_app(tmp_path / "out", runner=runner)

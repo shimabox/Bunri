@@ -131,7 +131,17 @@ def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, m
     )
     for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
         (package / f"Song.{suffix}").write_bytes(b"audio")
-    monkeypatch.setattr(jobs_module, "sync_one", lambda *args, **kwargs: SyncResult())
+    sync_calls = []
+    monkeypatch.setattr(
+        jobs_module,
+        "sync_one",
+        lambda *args, **kwargs: sync_calls.append((args, kwargs)) or SyncResult(),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_download_files",
+        lambda _job: pytest.fail("display downloads must not be a Pocket sync input"),
+    )
 
     response = client.post("/api/pocket/sync/" + digest[:12])
     assert response.status_code == 202
@@ -140,6 +150,9 @@ def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, m
     detail = client.get(f"/api/jobs/{job_id}").json()
     stored = json.loads((client.out_dir / "web" / "jobs" / f"{job_id}.json").read_text())
     assert detail["kind"] == stored["kind"] == "pocket_single"
+    assert len(sync_calls) == 1
+    assert sync_calls[0][1]["expected_digest"] == digest
+    assert sync_calls[0][1]["include_original"] is True
     assert token not in response.text + json.dumps(detail) + json.dumps(stored)
     assert "example.invalid" not in response.text + json.dumps(detail) + json.dumps(stored)
 

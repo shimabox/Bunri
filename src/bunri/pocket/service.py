@@ -186,7 +186,13 @@ def inspect_remote(package: LocalPackage, client: PocketHTTPClient) -> RemoteSta
             and any(item.get("song_id") == song_id for item in library_doc.value.get("songs", []))
         )
         if manifest_doc is None:
-            return RemoteStatus("different" if library_has_song else "not_synced", True)
+            if library_has_song:
+                return RemoteStatus(
+                    "different",
+                    False,
+                    "棚の状態に不整合があるためアップロードできません。",
+                )
+            return RemoteStatus("not_synced", True)
         if manifest_doc.value["source"]["digest"] != package.metadata.source.digest:
             return RemoteStatus("different", False, "song ID が競合しています。", True)
         manifest, manifest_changed = merge_manifest(

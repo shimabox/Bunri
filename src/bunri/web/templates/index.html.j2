@@ -672,7 +672,9 @@
   }
 
   function pocketBadge(status, job) {
-    if (job && (job.status === "queued" || job.status === "running")) return badgeFor(job);
+    if (job && (
+      job.status === "queued" || job.status === "running" || job.status === "error"
+    )) return badgeFor(job);
     if (pocketChecking) return { text: "確認中", cls: "sw-badge-queued" };
     if (!status) return { text: "確認できません", cls: "sw-badge-error" };
     switch (status.state) {
@@ -866,10 +868,13 @@
         }
         pocketMain.appendChild(pocketButton);
         pocketRow.appendChild(pocketMain);
-        if (pocketStatus && pocketStatus.message) {
+        var pocketMessageText = song.pocket_job && song.pocket_job.status === "error"
+          ? song.pocket_job.error
+          : pocketStatus && pocketStatus.message;
+        if (pocketMessageText) {
           var pocketMessage = document.createElement("p");
           pocketMessage.className = "sw-pocket-message";
-          pocketMessage.textContent = pocketStatus.message;
+          pocketMessage.textContent = pocketMessageText;
           pocketRow.appendChild(pocketMessage);
         }
         content.appendChild(pocketRow);
