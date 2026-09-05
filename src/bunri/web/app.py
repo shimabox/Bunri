@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -22,6 +23,15 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from bunri.registry import REGISTRY
+from bunri.pocket.config import read_config
+from bunri.pocket.http import PocketHTTPClient
+from bunri.pocket.lock import SyncLock, SyncLockBusy
+from bunri.pocket.service import (
+    PocketServiceError,
+    inspect_packages,
+    resolve_package,
+    safe_error,
+)
 from bunri.web.jobs import (
     Job,
     JobStore,
@@ -83,6 +93,20 @@ def _download_files(job: Job) -> list[dict]:
 
 
 def _serialize_job(job: Job) -> dict:
+    if job.kind != "separate":
+        return {
+            "id": job.id,
+            "kind": job.kind,
+            "song_id": job.pocket_song_id,
+            "status": job.status,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "elapsed_seconds": _elapsed_seconds(job),
+            "progress": job.progress,
+            "result": job.result,
+            "error": job.error,
+        }
     return {
         "id": job.id,
         "title": job.title,
@@ -104,19 +128,21 @@ def _serialize_job(job: Job) -> dict:
     }
 
 
-def _serialize_song(song: Song) -> dict:
+def _serialize_song(song: Song, pocket_job: Job | None = None) -> dict:
     targets = []
     for job in song.targets:
         serialized = _serialize_job(job)
         serialized.pop("title")
         serialized["target_label"] = _target_label(job.target)
         targets.append(serialized)
-    return {
+    result = {
         "id": song.id,
         "title": song.title,
         "created_at": song.created_at,
         "targets": targets,
     }
+    result["pocket_job"] = _serialize_job(pocket_job) if pocket_job is not None else None
+    return result
 
 
 def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
@@ -357,7 +383,129 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
 
     @app.get("/api/songs")
     def list_songs() -> list[dict]:
-        return [_serialize_song(song) for song in store.list_songs()]
+        return [
+            _serialize_song(
+                song,
+                store.latest_pocket_job(song.targets[0].digest) if song.targets else None,
+            )
+            for song in store.list_songs()
+        ]
+
+    @app.get("/api/pocket/status")
+    def pocket_status() -> dict:
+        try:
+            config = read_config(out_dir)
+        except (OSError, ValueError):
+            return {
+                "connected": False,
+                "state": "unknown",
+                "message": "Pocket の接続設定を確認できません。",
+                "target_count": 0,
+                "songs": [],
+            }
+        if config is None:
+            return {"connected": False, "target_count": 0, "songs": []}
+        client = PocketHTTPClient(config.base_url, config.token)
+        packages = inspect_packages(out_dir, client)
+        digest_to_web_id = {
+            song.targets[0].digest: song.id
+            for song in store.list_songs()
+            if song.targets
+        }
+        safe_to_web_id = {}
+        for song in store.list_songs():
+            package_name = next(
+                (
+                    Path(job.package).parent.name
+                    for job in song.targets
+                    if job.package is not None
+                ),
+                safe_filename(song.title),
+            )
+            safe_to_web_id[package_name] = song.id
+        songs = [
+            {
+                "web_song_id": (
+                    digest_to_web_id.get(item.digest)
+                    if item.digest is not None
+                    else safe_to_web_id.get(item.safe_name)
+                ),
+                "song_id": item.song_id,
+                "title": item.title,
+                "safe_name": item.safe_name,
+                "state": item.remote.state,
+                "can_sync": item.remote.can_sync,
+                "message": item.remote.message,
+                "conflict": item.remote.conflict,
+            }
+            for item in packages
+        ]
+        active_job = store.active_pocket_job()
+        return {
+            "connected": True,
+            "target_count": sum(item.song_id is not None for item in packages),
+            "package_count": len(packages),
+            "job": _serialize_job(active_job) if active_job is not None else None,
+            "songs": songs,
+        }
+
+    def _pocket_config_or_409():
+        try:
+            config = read_config(out_dir)
+        except (OSError, ValueError):
+            raise HTTPException(status_code=409, detail="Pocket の接続設定を確認できません。")
+        if config is None:
+            raise HTTPException(status_code=409, detail="Pocket の接続設定がありません。")
+        return config
+
+    @app.post("/api/pocket/sync/{pocket_song_id}")
+    def create_pocket_sync(pocket_song_id: str) -> JSONResponse:
+        _pocket_config_or_409()
+        if re.fullmatch(r"[0-9a-f]{12}", pocket_song_id) is None:
+            raise HTTPException(status_code=400, detail="song ID が不正です。")
+        try:
+            sync_lock = SyncLock(out_dir).acquire()
+        except (OSError, SyncLockBusy) as exc:
+            raise HTTPException(status_code=409, detail=safe_error(exc))
+        try:
+            package = resolve_package(out_dir, pocket_song_id, include_original=True)
+            job = store.create_pocket_job(
+                song_id=pocket_song_id,
+                digest=package.metadata.source.digest,
+                safe_name=package.directory.name,
+                sync_lock=sync_lock,
+            )
+        except PocketServiceError as exc:
+            sync_lock.release()
+            status = 404 if exc.kind == "not_found" else 409
+            raise HTTPException(status_code=status, detail=safe_error(exc))
+        except SyncLockBusy as exc:
+            raise HTTPException(status_code=409, detail=safe_error(exc))
+        except BaseException:
+            sync_lock.release()
+            raise
+        return JSONResponse({"job_id": job.id}, status_code=202)
+
+    @app.post("/api/pocket/sync")
+    def create_pocket_sync_all() -> JSONResponse:
+        _pocket_config_or_409()
+        try:
+            sync_lock = SyncLock(out_dir).acquire()
+        except (OSError, SyncLockBusy) as exc:
+            raise HTTPException(status_code=409, detail=safe_error(exc))
+        try:
+            job = store.create_pocket_job(
+                song_id=None,
+                digest=None,
+                safe_name=None,
+                sync_lock=sync_lock,
+            )
+        except SyncLockBusy as exc:
+            raise HTTPException(status_code=409, detail=safe_error(exc))
+        except BaseException:
+            sync_lock.release()
+            raise
+        return JSONResponse({"job_id": job.id}, status_code=202)
 
     @app.delete("/api/songs/{song_id}", status_code=204)
     def delete_song(song_id: str) -> Response:

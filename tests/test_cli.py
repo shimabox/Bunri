@@ -80,6 +80,15 @@ def test_pocket_sync_without_config_does_not_create_http_client(tmp_path, monkey
     assert result.exit_code == 1
     assert "Pocket の接続設定がありません" in _plain(result.output)
 
+
+@pytest.mark.parametrize("arguments", [[], ["Song", "--all"]])
+def test_pocket_sync_requires_exactly_one_selector(arguments):
+    from bunri.pocket.cli import app as pocket_app
+
+    result = CliRunner().invoke(pocket_app, ["sync", *arguments], env=_STABLE_TERMINAL)
+    assert result.exit_code == 1
+    assert "SAFE_NAME と --all のどちらか一方" in _plain(result.output)
+
 runner = CliRunner()
 
 # Typer renders help and errors through rich, which adapts to whatever

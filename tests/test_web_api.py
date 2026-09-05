@@ -81,6 +81,69 @@ def _job_status(client, job_id: str) -> str:
     return client.get(f"/api/jobs/{job_id}").json()["status"]
 
 
+def test_pocket_status_is_hidden_when_not_connected(client):
+    response = client.get("/api/pocket/status")
+    assert response.status_code == 200
+    assert response.json() == {"connected": False, "target_count": 0, "songs": []}
+    assert "Bunri Pocket 連携中" in client.get("/").text
+
+
+def test_pocket_sync_lock_conflict_returns_409_without_creating_job(client):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.lock import SyncLock
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    held = SyncLock(client.out_dir).acquire()
+    try:
+        response = client.post("/api/pocket/sync")
+    finally:
+        held.release()
+    assert response.status_code == 409
+    assert client.get("/api/jobs").json() == []
+    assert "example.invalid" not in response.text and token not in response.text
+
+
+def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, monkeypatch):
+    import base64
+    import json
+
+    import bunri.web.jobs as jobs_module
+    from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata, write_package_metadata
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.sync import SyncResult
+
+    token = base64.urlsafe_b64encode(b"secret" * 8).decode().rstrip("=")
+    save_config(client.out_dir, PocketConfig("https://example.invalid/private", token))
+    package = client.out_dir / "Song"
+    package.mkdir()
+    digest = "a" * 40
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Song",
+            "Song",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+        (package / f"Song.{suffix}").write_bytes(b"audio")
+    monkeypatch.setattr(jobs_module, "sync_one", lambda *args, **kwargs: SyncResult())
+
+    response = client.post("/api/pocket/sync/" + digest[:12])
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    _wait_until(lambda: _job_status(client, job_id) == "done")
+    detail = client.get(f"/api/jobs/{job_id}").json()
+    stored = json.loads((client.out_dir / "web" / "jobs" / f"{job_id}.json").read_text())
+    assert detail["kind"] == stored["kind"] == "pocket_single"
+    assert token not in response.text + json.dumps(detail) + json.dumps(stored)
+    assert "example.invalid" not in response.text + json.dumps(detail) + json.dumps(stored)
+
+
 # ---------------------------------------------------------------------------
 def test_upload_returns_202_and_job_appears_queued_or_running(client):
     res = _upload(client, title="My Song")

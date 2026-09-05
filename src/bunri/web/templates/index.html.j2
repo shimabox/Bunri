@@ -26,6 +26,17 @@
     font-weight: 700;
   }
   .sw-sub { margin: 0; color: #8a7f74; font-size: 0.85rem; }
+  .sw-pocket-banner {
+    display: inline-flex;
+    margin-top: 12px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: #e3f3ef;
+    color: #1f6f64;
+    font-size: 0.8rem;
+    font-weight: 700;
+  }
+  .sw-pocket-banner[hidden] { display: none; }
   main.sw-main {
     padding: 22px 24px 40px;
     max-width: 760px;
@@ -37,6 +48,14 @@
     color: #6f665c;
     margin: 0 0 12px;
   }
+  .sw-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .sw-section-heading .sw-h2 { margin: 0; }
+  .sw-pocket-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .sw-pocket-controls[hidden] { display: none; }
+  .sw-pocket-note { color: #8a7f74; font-size: 0.76rem; }
+  .sw-pocket-row { border-bottom: 1px solid #f1e8da; padding: 10px 0 12px; }
+  .sw-pocket-row-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .sw-pocket-message { margin: 6px 0 0; color: #8a7f74; font-size: 0.78rem; }
 
   .sw-dropzone {
     border: 2px dashed #e6d9c4;
@@ -394,6 +413,7 @@
 <header class="sw-header">
   <h1 class="sw-title">Bunri</h1>
   <p class="sw-sub">音源から楽器別の練習パッケージを作る</p>
+  <div id="sw-pocket-banner" class="sw-pocket-banner" hidden>Bunri Pocket 連携中</div>
 </header>
 
 <main class="sw-main">
@@ -431,7 +451,14 @@
   </section>
 
   <section class="sw-section">
-    <h2 id="sw-songs-heading" class="sw-h2" tabindex="-1">曲一覧</h2>
+    <div class="sw-section-heading">
+      <h2 id="sw-songs-heading" class="sw-h2" tabindex="-1">曲一覧</h2>
+      <div id="sw-pocket-controls" class="sw-pocket-controls" hidden>
+        <button type="button" id="sw-pocket-all" class="sw-btn sw-btn-primary">全曲アップロード</button>
+        <button type="button" id="sw-pocket-refresh" class="sw-btn">状態を再読込</button>
+        <span id="sw-pocket-count" class="sw-pocket-note"></span>
+      </div>
+    </div>
     <p id="sw-empty" class="sw-empty">まだ曲はありません。</p>
     <ul id="sw-job-list" class="sw-job-list"></ul>
   </section>
@@ -466,6 +493,8 @@
 
   var API_JOBS = "/api/jobs";
   var API_SONGS = "/api/songs";
+  var API_POCKET_STATUS = "/api/pocket/status";
+  var API_POCKET_SYNC = "/api/pocket/sync";
   var POLL_INTERVAL_MS = 2000;
 
   var dropzone = document.getElementById("sw-dropzone");
@@ -488,6 +517,11 @@
   var deleteCancel = document.getElementById("sw-delete-cancel");
   var deleteConfirm = document.getElementById("sw-delete-confirm");
   var deleteError = document.getElementById("sw-delete-error");
+  var pocketBanner = document.getElementById("sw-pocket-banner");
+  var pocketControls = document.getElementById("sw-pocket-controls");
+  var pocketAll = document.getElementById("sw-pocket-all");
+  var pocketRefresh = document.getElementById("sw-pocket-refresh");
+  var pocketCount = document.getElementById("sw-pocket-count");
 
   var pendingFile = null;
   var pollTimer = null;
@@ -496,6 +530,10 @@
   var downloadExpandedStates = Object.create(null);
   var deleteDialogSong = null;
   var deleteSubmitting = false;
+  var pocketConnected = false;
+  var pocketChecking = false;
+  var pocketStatuses = Object.create(null);
+  var activePocketJobId = null;
 
   function stem(name) {
     var idx = name.lastIndexOf(".");
@@ -620,6 +658,43 @@
   function songHasActiveJobs(song) {
     return song.targets.some(function (job) {
       return job.status === "queued" || job.status === "running";
+    }) || Boolean(song.pocket_job && (
+      song.pocket_job.status === "queued" || song.pocket_job.status === "running"
+    ));
+  }
+
+  function hasActivePocketJobs(songs) {
+    return songs.some(function (song) {
+      return song.pocket_job && (
+        song.pocket_job.status === "queued" || song.pocket_job.status === "running"
+      );
+    });
+  }
+
+  function pocketBadge(status, job) {
+    if (job && (job.status === "queued" || job.status === "running")) return badgeFor(job);
+    if (pocketChecking) return { text: "確認中", cls: "sw-badge-queued" };
+    if (!status) return { text: "確認できません", cls: "sw-badge-error" };
+    switch (status.state) {
+      case "synced": return { text: "棚にある", cls: "sw-badge-done" };
+      case "not_synced": return { text: "未同期", cls: "sw-badge-queued" };
+      case "different": return { text: "差分あり", cls: "sw-badge-running" };
+      case "legacy": return { text: "再生成が必要", cls: "sw-badge-error" };
+      default: return { text: "確認できません", cls: "sw-badge-error" };
+    }
+  }
+
+  function postPocket(url) {
+    return fetch(url, { method: "POST" }).then(function (res) {
+      if (!res.ok) {
+        return res.json().catch(function () { return {}; }).then(function (body) {
+          throw new Error(body.detail || ("アップロードを開始できません (" + res.status + ")"));
+        });
+      }
+      return res.json();
+    }).then(function (body) {
+      activePocketJobId = body.job_id;
+      return refreshSongs();
     });
   }
 
@@ -716,6 +791,7 @@
     }
 
     songsCache = songs;
+    pocketAll.disabled = pocketChecking || hasActivePocketJobs(songs) || activePocketJobId !== null;
     jobListEl.innerHTML = "";
     emptyMsg.hidden = songs.length !== 0;
 
@@ -764,6 +840,40 @@
       content.className = "sw-job-content";
       content.id = contentId;
       content.hidden = !expanded;
+
+      if (pocketConnected) {
+        var pocketStatus = pocketStatuses[song.id];
+        var pocketRow = document.createElement("div");
+        pocketRow.className = "sw-pocket-row";
+        var pocketMain = document.createElement("div");
+        pocketMain.className = "sw-pocket-row-main";
+        var pocketState = pocketBadge(pocketStatus, song.pocket_job);
+        var pocketBadgeEl = document.createElement("span");
+        pocketBadgeEl.className = "sw-badge " + pocketState.cls;
+        pocketBadgeEl.textContent = pocketState.text;
+        pocketMain.appendChild(pocketBadgeEl);
+        var pocketButton = document.createElement("button");
+        pocketButton.type = "button";
+        pocketButton.className = "sw-btn";
+        pocketButton.textContent = "⬆ アップロード";
+        pocketButton.disabled = pocketChecking || hasActivePocketJobs(songs) || !pocketStatus || !pocketStatus.can_sync;
+        if (pocketStatus && pocketStatus.song_id) {
+          pocketButton.addEventListener("click", function () {
+            pocketButton.disabled = true;
+            postPocket(API_POCKET_SYNC + "/" + encodeURIComponent(pocketStatus.song_id))
+              .catch(function (err) { window.alert(err.message || "アップロードを開始できません"); });
+          });
+        }
+        pocketMain.appendChild(pocketButton);
+        pocketRow.appendChild(pocketMain);
+        if (pocketStatus && pocketStatus.message) {
+          var pocketMessage = document.createElement("p");
+          pocketMessage.className = "sw-pocket-message";
+          pocketMessage.textContent = pocketStatus.message;
+          pocketRow.appendChild(pocketMessage);
+        }
+        content.appendChild(pocketRow);
+      }
 
       head.addEventListener("click", function () {
         var nextExpanded = head.getAttribute("aria-expanded") !== "true";
@@ -883,7 +993,7 @@
       deleteButton.type = "button";
       deleteButton.className = "sw-btn sw-delete-song-btn";
       deleteButton.textContent = "この曲を削除";
-      deleteButton.disabled = songHasActiveJobs(song);
+      deleteButton.disabled = songHasActiveJobs(song) || hasActivePocketJobs(songs);
       if (deleteButton.disabled) {
         deleteButton.title = "待機中または処理中のジョブがある曲は削除できません";
       }
@@ -926,17 +1036,20 @@
       clearTimeout(pollTimer);
       pollTimer = null;
     }
-    if (hasActiveJobs(jobs)) {
+    if (hasActiveJobs(jobs) || activePocketJobId !== null) {
       pollTimer = setTimeout(function () { refreshSongs(); }, POLL_INTERVAL_MS);
     }
   }
 
   function refreshSongs() {
+    var hadActivePocket = hasActivePocketJobs(songsCache);
     return fetch(API_SONGS)
       .then(function (res) { return res.json(); })
       .then(function (songs) {
         renderSongs(songs);
         schedulePoll(songs);
+        if (activePocketJobId !== null) refreshActivePocketJob();
+        if (hadActivePocket && !hasActivePocketJobs(songs)) refreshPocketStatus();
         return songs;
       })
       .catch(function () {
@@ -949,8 +1062,66 @@
       });
   }
 
+  function refreshActivePocketJob() {
+    var jobId = activePocketJobId;
+    if (jobId === null) return Promise.resolve();
+    return fetch(API_JOBS + "/" + encodeURIComponent(jobId))
+      .then(function (res) { return res.json(); })
+      .then(function (job) {
+        if (job.progress && job.kind === "pocket_all") {
+          pocketCount.textContent = "全曲アップロード: " + job.progress.completed + "/" + job.progress.total
+            + (job.progress.current ? "（" + job.progress.current + "）" : "");
+        }
+        if (job.status === "done" || job.status === "error") {
+          activePocketJobId = null;
+          return refreshPocketStatus();
+        }
+      })
+      .catch(function () { return undefined; });
+  }
+
+  function refreshPocketStatus() {
+    pocketChecking = true;
+    if (songsCache.length) renderSongs(songsCache);
+    return fetch(API_POCKET_STATUS)
+      .then(function (res) { return res.json(); })
+      .then(function (status) {
+        pocketConnected = status.connected === true;
+        pocketBanner.hidden = !pocketConnected;
+        pocketControls.hidden = !pocketConnected;
+        pocketStatuses = Object.create(null);
+        if (status.job && (status.job.status === "queued" || status.job.status === "running")) {
+          activePocketJobId = status.job.id;
+        }
+        (status.songs || []).forEach(function (item) {
+          if (item.web_song_id) pocketStatuses[item.web_song_id] = item;
+        });
+        pocketCount.textContent = "出力先の全パッケージ " + (status.package_count || 0) + "件中、同期対象 " + (status.target_count || 0) + "件";
+      })
+      .catch(function () {
+        pocketConnected = false;
+        pocketBanner.hidden = true;
+        pocketControls.hidden = true;
+      })
+      .finally(function () {
+        pocketChecking = false;
+        renderSongs(songsCache);
+      });
+  }
+
+  pocketAll.addEventListener("click", function () {
+    pocketAll.disabled = true;
+    postPocket(API_POCKET_SYNC)
+      .catch(function (err) { window.alert(err.message || "全曲アップロードを開始できません"); })
+      .finally(function () { pocketAll.disabled = hasActivePocketJobs(songsCache); });
+  });
+  pocketRefresh.addEventListener("click", refreshPocketStatus);
+
   document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "visible") refreshSongs();
+    if (document.visibilityState === "visible") {
+      refreshSongs();
+      refreshPocketStatus();
+    }
   });
 
   // Test/automation hook, same idea as the player's window.__player: exposes
@@ -963,10 +1134,11 @@
       return songsCache.reduce(function (jobs, song) { return jobs.concat(song.targets); }, []);
     },
     isPolling: function () { return pollTimer !== null; },
-    refresh: refreshSongs
+    refresh: function () { return Promise.all([refreshSongs(), refreshPocketStatus()]); }
   };
 
   refreshSongs();
+  refreshPocketStatus();
 })();
 </script>
 </body>

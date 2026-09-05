@@ -46,6 +46,26 @@ def package_candidates(out_dir: Path) -> list[str]:
     return sorted(x.name for x in children if not x.name.startswith(".") and x.name.casefold() != "web" and not x.is_symlink() and x.is_dir())[:20]
 
 
+def all_package_names(out_dir: Path) -> list[str]:
+    """Return every real package directory in a deterministic order."""
+    try:
+        children = list(out_dir.iterdir())
+    except OSError:
+        return []
+    blocked = {"web", ".cache", ".pocket"}
+    return sorted(
+        (
+            child.name
+            for child in children
+            if not child.name.startswith(".")
+            and child.name.casefold() not in blocked
+            and not child.is_symlink()
+            and child.is_dir()
+        ),
+        key=lambda name: (name.casefold(), name),
+    )
+
+
 def _hash(path: Path) -> tuple[int, str]:
     size = 0; digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -103,7 +123,13 @@ def _sidecar_issues(value: object, safe_name: str) -> list[str]:
     return issues
 
 
-def preflight(out_dir: Path, safe_name: str, *, include_original: bool = True) -> LocalPackage:
+def preflight(
+    out_dir: Path,
+    safe_name: str,
+    *,
+    include_original: bool = True,
+    expected_digest: str | None = None,
+) -> LocalPackage:
     validate_safe_name(safe_name)
     package_dir = out_dir / safe_name
     if package_dir.is_symlink() or not package_dir.is_dir() or package_dir.resolve().parent != out_dir.resolve():
@@ -156,4 +182,10 @@ def preflight(out_dir: Path, safe_name: str, *, include_original: bool = True) -
         no_mp3 = any("formats に mp3" in issue for issue in issues)
         raise LocalPreflightError(issues, kind="no_mp3" if no_mp3 else "general", metadata=metadata)
     assert metadata is not None
+    if expected_digest is not None and metadata.source.digest != expected_digest:
+        raise LocalPreflightError(
+            ["package metadata source digest no longer matches the selected song"],
+            kind="identity",
+            metadata=metadata,
+        )
     return LocalPackage(package_dir, metadata, tuple(assets))

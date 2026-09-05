@@ -46,6 +46,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from bunri.registry import REGISTRY
+from bunri.pocket.lock import SyncLock, SyncLockBusy
+from bunri.pocket.service import safe_error, sync_all, sync_one
 
 from bunri.safepath import (
     DeleteTarget,
@@ -601,14 +603,29 @@ class Job:
     # find the file it must feed the subprocess; relative to out_dir like the
     # other paths above.
     upload: Optional[str] = None
+    kind: str = "separate"  # separate | pocket_single | pocket_all
+    pocket_song_id: Optional[str] = None
+    pocket_digest: Optional[str] = None
+    pocket_safe_name: Optional[str] = None
+    progress: Optional[dict[str, Any]] = None
+    result: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        if self.kind != "separate":
+            for name in ("digest", "title", "target", "package", "log", "upload"):
+                data.pop(name, None)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "Job":
         known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        values = {k: v for k, v in data.items() if k in known}
+        values.setdefault("kind", "separate")
+        values.setdefault("digest", "")
+        values.setdefault("title", "")
+        values.setdefault("target", "")
+        return cls(**values)
 
 
 @dataclass(frozen=True)
@@ -626,11 +643,15 @@ def song_id(digest: str) -> str:
 
 
 _VALID_STATUSES = {"queued", "running", "done", "error"}
+_VALID_KINDS = {"separate", "pocket_single", "pocket_all"}
 # Must exist and be a string; every other field is Optional[str] (may be
 # absent or None).
 _REQUIRED_STR_FIELDS = ("id", "digest", "title", "target", "status", "created_at")
 _OPTIONAL_DATETIME_FIELDS = ("started_at", "finished_at")
-_OPTIONAL_STR_FIELDS = ("error", "package", "log", "upload")
+_OPTIONAL_STR_FIELDS = (
+    "error", "package", "log", "upload", "kind", "pocket_song_id",
+    "pocket_digest", "pocket_safe_name",
+)
 # Every field of Job that can hold text, for checks that apply to all of them.
 _ALL_STR_FIELDS = _REQUIRED_STR_FIELDS + _OPTIONAL_DATETIME_FIELDS + _OPTIONAL_STR_FIELDS
 
@@ -776,6 +797,46 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
     """
     if not isinstance(data, dict):
         return "not a JSON object"
+    kind = data.get("kind", "separate")
+    if kind not in _VALID_KINDS:
+        return f"unknown job kind: {kind!r}"
+    if kind != "separate":
+        for name in ("id", "status", "created_at"):
+            if not isinstance(data.get(name), str):
+                return f"missing or non-string required field: {name!r}"
+        if data["id"] != expected_id:
+            return f"id {data['id']!r} does not match filename (expected {expected_id!r})"
+        if data["status"] not in _VALID_STATUSES:
+            return f"unknown status: {data['status']!r}"
+        if kind == "pocket_single":
+            if not isinstance(data.get("pocket_song_id"), str) or not re.fullmatch(r"[0-9a-f]{12}", data["pocket_song_id"]):
+                return "pocket_single has an invalid song id"
+            if not isinstance(data.get("pocket_digest"), str) or _SHA1_DIGEST.fullmatch(data["pocket_digest"]) is None:
+                return "pocket_single has an invalid source digest"
+            if not isinstance(data.get("pocket_safe_name"), str) or not data["pocket_safe_name"]:
+                return "pocket_single has an invalid package name"
+        for name in _OPTIONAL_DATETIME_FIELDS:
+            value = data.get(name)
+            if value is not None and (not isinstance(value, str) or _datetime_problem(value, name) is not None):
+                return f"invalid datetime field: {name!r}"
+        if _datetime_problem(data["created_at"], "created_at") is not None:
+            return "invalid created_at"
+        if data.get("error") is not None and not isinstance(data["error"], str):
+            return "non-string field: 'error'"
+        if data.get("progress") is not None and not isinstance(data["progress"], dict):
+            return "non-object field: 'progress'"
+        if data.get("result") is not None and not isinstance(data["result"], dict):
+            return "non-object field: 'result'"
+        for name in ("id", "status", "created_at", "error", "pocket_song_id", "pocket_digest", "pocket_safe_name"):
+            value = data.get(name)
+            if isinstance(value, str):
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    return f"field {name!r} is not valid UTF-8"
+                if "\x00" in value:
+                    return f"field {name!r} contains a NUL byte"
+        return None
     for name in _REQUIRED_STR_FIELDS:
         if not isinstance(data.get(name), str):
             return f"missing or non-string required field: {name!r}"
@@ -974,6 +1035,12 @@ def _fully_grown(job: Job) -> Job:
     """
     grown = Job.from_dict(job.to_dict())
 
+    if grown.kind != "separate":
+        grown.started_at = grown.started_at or _LONGEST_TIMESTAMP
+        grown.finished_at = grown.finished_at or _LONGEST_TIMESTAMP
+        grown.status = max(_VALID_STATUSES, key=len)
+        return grown
+
     def reserve(current: Optional[str], replacement: str) -> str:
         # Compared in *bytes*, not characters: the limit this feeds is a byte
         # count, and a multi-byte current value can be the longer of the two
@@ -1033,6 +1100,7 @@ class JobStore:
         # never a real job id, which always starts with "j-".
         self._queue: "queue.Queue[str | None]" = queue.Queue()
         self._stopping = threading.Event()
+        self._pocket_locks: dict[str, SyncLock] = {}
 
         self._load_and_recover()
 
@@ -1254,7 +1322,7 @@ class JobStore:
     def _recover_pending_job(self, job: Job) -> None:
         """Re-queue one job left unfinished by the previous server, having
         first made sure its old subprocess is gone. See _load_and_recover."""
-        if job.status == "running" and job.log:
+        if job.kind == "separate" and job.status == "running" and job.log:
             outcome = terminate_pid_from_sidecar(
                 self.out_dir / _log_relpath(job.id), expected_logs_dir=self._real_logs_dir()
             )
@@ -1362,6 +1430,8 @@ class JobStore:
         with self._lock:
             groups: dict[str, list[Job]] = {}
             for job in self._jobs.values():
+                if job.kind != "separate":
+                    continue
                 groups.setdefault(job.digest, []).append(job)
 
         registry_order = {target: index for index, target in enumerate(REGISTRY)}
@@ -1393,6 +1463,24 @@ class JobStore:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def latest_pocket_job(self, digest: str) -> Optional[Job]:
+        with self._lock:
+            candidates = [
+                job for job in self._jobs.values()
+                if job.kind == "pocket_all" or (
+                    job.kind == "pocket_single" and job.pocket_digest == digest
+                )
+            ]
+        return max(candidates, key=lambda job: (job.created_at, job.id), default=None)
+
+    def active_pocket_job(self) -> Optional[Job]:
+        with self._lock:
+            candidates = [
+                job for job in self._jobs.values()
+                if job.kind != "separate" and job.status in ("queued", "running")
+            ]
+        return min(candidates, key=lambda job: (job.created_at, job.id), default=None)
+
     def find_reusable(self, digest: str, target: str) -> Optional[Job]:
         """Dedup lookup: a finished job for this digest+target wins outright
         (no re-run needed); otherwise an already queued/running one wins (so
@@ -1420,9 +1508,22 @@ class JobStore:
         last so a failed partial deletion remains visible and retryable.
         """
         with self._lock:
+            active_pocket = [
+                job for job in self._jobs.values()
+                if job.kind != "separate" and job.status in ("queued", "running")
+            ]
+            if any(
+                job.kind == "pocket_all"
+                or (
+                    job.pocket_digest is not None
+                    and song_id(job.pocket_digest) == requested_song_id
+                )
+                for job in active_pocket
+            ):
+                raise SongDeleteConflict("Pocket sync is queued or running")
             targets = [
                 job for job in self._jobs.values()
-                if song_id(job.digest) == requested_song_id
+                if job.kind == "separate" and song_id(job.digest) == requested_song_id
             ]
             if not targets:
                 raise SongNotFoundError(requested_song_id)
@@ -1607,6 +1708,49 @@ class JobStore:
                 self._queue.put(job_id)
             return results
 
+    def create_pocket_job(
+        self,
+        *,
+        song_id: str | None,
+        digest: str | None,
+        safe_name: str | None,
+        sync_lock: SyncLock,
+    ) -> Job:
+        """Persist one direct Pocket job after its cross-process lock is held."""
+        kind = "pocket_single" if song_id is not None else "pocket_all"
+        with self._lock:
+            duplicate = next(
+                (
+                    job for job in self._jobs.values()
+                    if job.kind == kind
+                    and job.status in ("queued", "running")
+                    and (kind == "pocket_all" or job.pocket_song_id == song_id)
+                ),
+                None,
+            )
+            if duplicate is not None:
+                sync_lock.release()
+                raise SyncLockBusy("同じ Pocket 同期がすでに登録されています。")
+            job_id = new_job_id()
+            job = Job(
+                id=job_id,
+                digest="",
+                title="",
+                target="",
+                status="queued",
+                created_at=_now_iso(),
+                kind=kind,
+                pocket_song_id=song_id,
+                pocket_digest=digest,
+                pocket_safe_name=safe_name,
+                progress={"total": 0, "completed": 0, "current": None, "legacy": [], "done": [], "failed": [], "pending": []},
+            )
+            self._jobs[job_id] = job
+            self._pocket_locks[job_id] = sync_lock
+            self._write_job(job)
+            self._queue.put(job_id)
+            return job
+
     # -- worker -------------------------------------------------------------
     def _worker_loop(self) -> None:
         while True:
@@ -1741,6 +1885,10 @@ class JobStore:
             job.started_at = _now_iso()
             self._write_job(job)
 
+        if job.kind != "separate":
+            self._run_pocket_job(job)
+            return
+
         # Both of these are refusals, not conveniences: the runner truncates
         # the log it opens and reads whatever upload it is handed, so a job
         # that cannot be given a safe pair of paths must not run at all.
@@ -1798,6 +1946,78 @@ class JobStore:
                 job.status = "error"
                 job.error = _tail(log_path, 8, expected_logs_dir=self._real_logs_dir())
             self._write_job(job)
+
+    def _run_pocket_job(self, job: Job) -> None:
+        sync_lock = self._pocket_locks.get(job.id)
+        try:
+            if sync_lock is None:
+                sync_lock = SyncLock(self.out_dir).acquire()
+                self._pocket_locks[job.id] = sync_lock
+            if job.kind == "pocket_single":
+                assert job.pocket_song_id is not None and job.pocket_digest is not None
+                result = sync_one(
+                    self.out_dir,
+                    job.pocket_song_id,
+                    expected_digest=job.pocket_digest,
+                    include_original=True,
+                    lock=sync_lock,
+                )
+                job.result = asdict(result)
+                failed = False
+            else:
+                def update_progress(batch, current: str | None) -> None:
+                    with self._lock:
+                        job.progress = {
+                            "total": batch.total,
+                            "completed": batch.completed,
+                            "current": current,
+                            "legacy": list(batch.legacy),
+                            "done": [item.safe_name for item in batch.items if item.status == "done"],
+                            "failed": [item.safe_name for item in batch.items if item.status == "error"],
+                            "pending": [item.safe_name for item in batch.items if item.status == "pending"],
+                        }
+                        self._write_job(job)
+
+                batch = sync_all(
+                    self.out_dir,
+                    include_original=True,
+                    lock=sync_lock,
+                    progress=update_progress,
+                )
+                update_progress(batch, None)
+                job.result = {
+                    "total": batch.total,
+                    "completed": batch.completed,
+                    "failed": batch.failed,
+                    "pending": batch.pending,
+                    "legacy": list(batch.legacy),
+                }
+                failed = batch.failed > 0
+                if failed:
+                    job.error = next(
+                        (item.error for item in batch.items if item.status == "error"),
+                        "Pocket の同期に失敗しました。",
+                    )
+            with self._lock:
+                job.status = "error" if failed else "done"
+                job.finished_at = _now_iso()
+                if not failed:
+                    job.error = None
+                self._write_job(job)
+        except Exception as exc:
+            with self._lock:
+                if self._stopping.is_set():
+                    job.status = "queued"
+                    job.started_at = None
+                else:
+                    job.status = "error"
+                    job.error = safe_error(exc)
+                    job.finished_at = _now_iso()
+                self._write_job(job)
+        finally:
+            held = self._pocket_locks.pop(job.id, None)
+            if held is not None:
+                held.release()
 
 
 def _storable(text: str) -> str:
