@@ -88,6 +88,10 @@ def sync(
         assert safe_name is not None
         result = sync_one(out, safe_name, include_original=original, lock=lock)
     except PocketServiceError as exc:
+        if all_packages and exc.legacy:
+            for name in exc.legacy:
+                console.print(f"[yellow]再生成が必要:[/yellow] {name}")
+            console.print("旧パッケージは元の入力音源から再生成してください。キャッシュが残っていれば分離処理は省略されます。")
         if exc.kind == "legacy":
             _fail("Pocket 同期情報のない旧パッケージです。元の入力音源から再生成してください。キャッシュが残っていれば分離処理は省略されます。")
         _fail(str(exc))

@@ -48,7 +48,7 @@ from typing import Any, Callable, Optional
 from bunri.package_metadata import read_package_metadata
 from bunri.registry import REGISTRY
 from bunri.pocket.lock import SyncLock, SyncLockBusy
-from bunri.pocket.service import safe_error, sync_all, sync_one
+from bunri.pocket.service import PocketServiceError, safe_error, sync_all, sync_one
 
 from bunri.safepath import (
     DeleteTarget,
@@ -1345,10 +1345,29 @@ class JobStore:
                     file=sys.stderr,
                 )
                 return
-        job.status = "queued"
-        job.started_at = None
-        self._write_job(job)
-        self._queue.put(job.id)
+        recovered_lock: SyncLock | None = None
+        if job.kind in ("pocket_single", "pocket_all"):
+            try:
+                recovered_lock = SyncLock(self.out_dir).acquire()
+            except SyncLockBusy:
+                # An external sync was already active when the server started.
+                # Keep this job queued and let the worker retry once, without
+                # blocking startup or spinning on the lock.
+                pass
+            else:
+                # Match newly registered Pocket jobs: once admitted to the
+                # queue, keep CLI/Web exclusion in force until this job ends.
+                self._pocket_locks[job.id] = recovered_lock
+        try:
+            job.status = "queued"
+            job.started_at = None
+            self._write_job(job)
+            self._queue.put(job.id)
+        except Exception:
+            if recovered_lock is not None:
+                self._pocket_locks.pop(job.id, None)
+                recovered_lock.release()
+            raise
 
     def shutdown(self, *, join_timeout: float = 15.0, poll_interval: float = 0.2) -> None:
         """Graceful-shutdown hook (wired to the app's lifespan): stop the
@@ -1799,13 +1818,10 @@ class JobStore:
         kind = "pocket_single" if song_id is not None else "pocket_all"
         with self._lock:
             # Only one Pocket synchronization may be pending at a time, whatever
-            # its kind. A job that is merely `queued` -- a fresh one behind a
-            # busy worker, or one a restart put back -- does not hold the
-            # cross-process sync lock yet: it takes it when the worker picks it
-            # up. Admitting a second Pocket job next to it would hand that lock
-            # to whichever runs first and leave the other to fail on a conflict
-            # it never caused. Refusing here keeps "one sync at a time" true for
-            # the whole queue, not just for the job currently running.
+            # its kind. Fresh jobs and normally recovered jobs hold the
+            # cross-process lock while queued. A recovered job may exceptionally
+            # be queued without it when an external sync already held the lock at
+            # startup, so this in-memory check remains necessary as well.
             pending = next(
                 (
                     job for job in self._jobs.values()
@@ -2092,6 +2108,14 @@ class JobStore:
                 self._write_job(job)
         except Exception as exc:
             with self._lock:
+                if (
+                    job.kind == "pocket_all"
+                    and isinstance(exc, PocketServiceError)
+                    and exc.kind == "local"
+                ):
+                    legacy = list(exc.legacy)
+                    job.progress = {**(job.progress or {}), "legacy": legacy}
+                    job.result = {**(job.result or {}), "legacy": legacy}
                 if self._stopping.is_set():
                     job.status = "queued"
                     job.started_at = None

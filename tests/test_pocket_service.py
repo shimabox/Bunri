@@ -56,8 +56,10 @@ def test_inventory_reports_all_legacy_but_rejects_duplicate_identity(tmp_path):
     assert found.legacy == ("Old1", "Old2")
 
     make_package(tmp_path, "B", "a" * 40)
-    with pytest.raises(PocketServiceError, match="複数のパッケージ名"):
+    with pytest.raises(PocketServiceError, match="複数のパッケージ名") as caught:
         inventory(tmp_path)
+    assert caught.value.kind == "local"
+    assert caught.value.legacy == ("Old1", "Old2")
 
 
 class RefusingClient:

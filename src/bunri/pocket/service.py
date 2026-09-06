@@ -16,9 +16,16 @@ from bunri.pocket.sync import SyncError, SyncResult, _library, _manifest, synchr
 
 
 class PocketServiceError(RuntimeError):
-    def __init__(self, message: str, *, kind: str = "invalid") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "invalid",
+        legacy: Iterable[str] = (),
+    ) -> None:
         super().__init__(message)
         self.kind = kind
+        self.legacy = tuple(legacy)
 
 
 @dataclass(frozen=True)
@@ -143,6 +150,7 @@ def inventory(out_dir: Path, *, include_original: bool = True) -> PackageInvento
             "ローカルパッケージを安全に同期できません。アップロードは開始していません。\n- "
             + "\n- ".join(problems),
             kind="local",
+            legacy=legacy,
         )
     return PackageInventory(tuple(packages), tuple(legacy))
 
