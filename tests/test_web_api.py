@@ -200,6 +200,7 @@ def test_pocket_job_tracking_never_waits_for_the_remote_inspection(tmp_path, mon
         response = c.get("/api/pocket/job")
 
     assert response.status_code == 200
+    assert response.json()["connected"] is True
     assert response.json()["job"]["id"] == job_id
     assert response.json()["job"]["status"] == "error"
     assert response.json()["job"]["kind"] == "pocket_all"

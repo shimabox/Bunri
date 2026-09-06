@@ -17,7 +17,7 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -106,13 +106,15 @@ _needs_browser = pytest.mark.skipif(not _HAVE_BROWSER, reason="playwright chromi
 
 
 @contextlib.contextmanager
-def _open_page(base_url: str):
+def _open_page(base_url: str, *, before_goto: Callable[[Any], None] | None = None):
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         try:
             page = browser.new_page()
+            if before_goto is not None:
+                before_goto(page)
             page.goto(base_url + "/")
             page.wait_for_function(
                 "window.__bunriWeb && typeof window.__bunriWeb.getJobs === 'function'",
@@ -278,6 +280,47 @@ def test_pocket_error_job_renders_failure_badge_and_safe_message(tmp_path, monke
         )
         assert badge.get_attribute("class").endswith("sw-badge-error")
         assert page.locator(".sw-pocket-message").text_content() == safe_message
+
+
+@_needs_browser
+def test_pocket_connection_and_checking_render_before_status_responds(tmp_path):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": "a" * 40,
+        "title": "Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": None,
+        "package": "Song/Song.guitar.player.html",
+        "log": "web/logs/j-separate.log",
+        "upload": "web/uploads/song.mp3",
+    }), encoding="utf-8")
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+
+    def hold_status(page):
+        page.route("**/api/pocket/status", lambda _route: None)
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=hold_status
+    ) as page:
+        page.wait_for_selector("#sw-pocket-banner:not([hidden])")
+        page.wait_for_selector(".sw-pocket-row", state="attached")
+        page.locator("button.sw-job-toggle").click()
+        badge = page.locator(".sw-pocket-row .sw-badge")
+        assert badge.is_visible()
+        assert badge.text_content() == "確認中"
 
 
 @_needs_browser

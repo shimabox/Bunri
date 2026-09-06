@@ -395,14 +395,21 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
     def pocket_job() -> dict:
         """Which Pocket synchronization the page should be following.
 
-        Deliberately reads nothing but the local job records: the remote
-        shelf inspection behind /api/pocket/status can take one timeout per
-        song when Pocket is unreachable, and a page that had to wait for it
-        would leave a running batch untracked -- no progress, no polling --
-        for that whole time after every reload.
+        Deliberately reads only local connection state and job records: the
+        remote shelf inspection behind /api/pocket/status can take one
+        timeout per song when Pocket is unreachable, and a page that had to
+        wait for it would leave a running batch untracked -- no progress, no
+        polling -- for that whole time after every reload.
         """
+        try:
+            connected = read_config(out_dir) is not None
+        except (OSError, ValueError):
+            connected = False
         job = store.active_pocket_job() or store.latest_finished_pocket_all_job()
-        return {"job": _serialize_job(job) if job is not None else None}
+        return {
+            "connected": connected,
+            "job": _serialize_job(job) if job is not None else None,
+        }
 
     @app.get("/api/pocket/status")
     def pocket_status() -> dict:

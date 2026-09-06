@@ -728,6 +728,12 @@
     pocketCount.textContent = pocketProgressText || pocketCountText;
   }
 
+  function setPocketConnected(connected) {
+    pocketConnected = connected === true;
+    pocketBanner.hidden = !pocketConnected;
+    pocketControls.hidden = !pocketConnected;
+  }
+
   function renderPocketProgress(job) {
     if (job && job.kind === "pocket_all" && job.progress
       && (job.status === "queued" || job.status === "running")) {
@@ -1162,6 +1168,7 @@
     return fetch(API_POCKET_JOB)
       .then(function (res) { return res.json(); })
       .then(function (body) {
+        setPocketConnected(body.connected);
         var job = body.job;
         renderPocketProgress(job);
         if (job && (job.status === "queued" || job.status === "running")) {
@@ -1182,9 +1189,7 @@
     return fetch(API_POCKET_STATUS)
       .then(function (res) { return res.json(); })
       .then(function (status) {
-        pocketConnected = status.connected === true;
-        pocketBanner.hidden = !pocketConnected;
-        pocketControls.hidden = !pocketConnected;
+        setPocketConnected(status.connected);
         pocketStatuses = Object.create(null);
         (status.songs || []).forEach(function (item) {
           if (item.web_song_id) pocketStatuses[item.web_song_id] = item;
@@ -1193,9 +1198,7 @@
         renderPocketCount();
       })
       .catch(function () {
-        pocketConnected = false;
-        pocketBanner.hidden = true;
-        pocketControls.hidden = true;
+        setPocketConnected(false);
       })
       .finally(function () {
         pocketChecking = false;

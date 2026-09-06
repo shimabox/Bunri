@@ -96,12 +96,11 @@ def _scan_packages(out_dir: Path, *, include_original: bool) -> list[ScannedPack
         try:
             package = preflight(out_dir, safe_name, include_original=include_original)
         except LocalPreflightError as exc:
-            metadata = exc.metadata
             scanned.append(ScannedPackage(
                 safe_name,
                 None,
                 exc,
-                metadata.source if metadata is not None else None,
+                exc.identity,
             ))
         else:
             scanned.append(ScannedPackage(safe_name, package, None, package.metadata.source))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -96,6 +97,21 @@ def test_duplicate_full_digest_is_detected_even_when_one_copy_fails_preflight(tm
 
     statuses = {item.safe_name: item for item in inspect_packages(tmp_path, RefusingClient())}
     assert statuses["Good"].remote.conflict is True
+
+
+def test_duplicate_full_digest_is_detected_when_package_is_copied_under_another_name(tmp_path):
+    make_package(tmp_path, "Good", "a" * 40)
+    shutil.copytree(tmp_path / "Good", tmp_path / "Renamed")
+
+    with pytest.raises(PocketServiceError, match="identity が競合"):
+        resolve_package(tmp_path, "Good")
+
+    with pytest.raises(PocketServiceError, match="複数のパッケージ名"):
+        inventory(tmp_path)
+
+    statuses = {item.safe_name: item for item in inspect_packages(tmp_path, RefusingClient())}
+    assert statuses["Good"].remote.conflict is True
+    assert statuses["Renamed"].remote.conflict is True
 
 
 def test_a_sidecarless_directory_never_joins_the_identity_check(tmp_path):
