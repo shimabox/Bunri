@@ -43,12 +43,18 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from bunri.package_metadata import read_package_metadata
 from bunri.registry import REGISTRY
 from bunri.pocket.lock import SyncLock, SyncLockBusy
-from bunri.pocket.service import PocketServiceError, safe_error, sync_all, sync_one
+from bunri.pocket.service import (
+    BatchResult,
+    PocketServiceError,
+    safe_error,
+    sync_all,
+    sync_one,
+)
 
 from bunri.safepath import (
     DeleteTarget,
@@ -101,10 +107,61 @@ _TRUNCATION_NOTE = "... (truncated)\n"
 # the filesystem's business, unchanged by this cap.)
 MAX_TITLE_CHARS = 200
 
+# A batch can contain an arbitrary number of packages, but its durable job
+# record cannot. Counts remain exact; these caps apply only to the sample of
+# names retained for per-song status and diagnostics in the Web UI.
+MAX_POCKET_JOB_NAMES_PER_STATE = 100
+MAX_POCKET_JOB_NAME_CHARS = 255
+
 # Same rule as bunri.package._safe_filename -- see module docstring for why
 # this is duplicated rather than imported.
 _UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|#%]')
 _SHA1_DIGEST = re.compile(r"[0-9a-f]{40}")
+
+
+def _limited_pocket_names(names: Iterable[str]) -> list[str]:
+    limited: list[str] = []
+    for name in names:
+        if len(limited) >= MAX_POCKET_JOB_NAMES_PER_STATE:
+            break
+        limited.append(_storable(name)[:MAX_POCKET_JOB_NAME_CHARS])
+    return limited
+
+
+def _pocket_batch_progress(batch: BatchResult, current: str | None) -> dict[str, Any]:
+    return {
+        "total": batch.total,
+        "completed": batch.completed,
+        "failed_count": batch.failed,
+        "pending_count": batch.pending,
+        "legacy_count": len(batch.legacy),
+        "current": (
+            _storable(current)[:MAX_POCKET_JOB_NAME_CHARS]
+            if current is not None
+            else None
+        ),
+        "legacy": _limited_pocket_names(batch.legacy),
+        "done": _limited_pocket_names(
+            item.safe_name for item in batch.items if item.status == "done"
+        ),
+        "failed": _limited_pocket_names(
+            item.safe_name for item in batch.items if item.status == "error"
+        ),
+        "pending": _limited_pocket_names(
+            item.safe_name for item in batch.items if item.status == "pending"
+        ),
+    }
+
+
+def _pocket_batch_result(batch: BatchResult) -> dict[str, Any]:
+    return {
+        "total": batch.total,
+        "completed": batch.completed,
+        "failed": batch.failed,
+        "pending": batch.pending,
+        "legacy_count": len(batch.legacy),
+        "legacy": _limited_pocket_names(batch.legacy),
+    }
 
 
 class SongNotFoundError(LookupError):
@@ -1845,7 +1902,18 @@ class JobStore:
                 pocket_song_id=song_id,
                 pocket_digest=digest,
                 pocket_safe_name=safe_name,
-                progress={"total": 0, "completed": 0, "current": None, "legacy": [], "done": [], "failed": [], "pending": []},
+                progress={
+                    "total": 0,
+                    "completed": 0,
+                    "failed_count": 0,
+                    "pending_count": 0,
+                    "legacy_count": 0,
+                    "current": None,
+                    "legacy": [],
+                    "done": [],
+                    "failed": [],
+                    "pending": [],
+                },
             )
             self._jobs[job_id] = job
             self._pocket_locks[job_id] = sync_lock
@@ -2060,6 +2128,7 @@ class JobStore:
                 result = sync_one(
                     self.out_dir,
                     job.pocket_song_id,
+                    resolution="song_id",
                     expected_digest=job.pocket_digest,
                     include_original=True,
                     lock=sync_lock,
@@ -2069,15 +2138,7 @@ class JobStore:
             else:
                 def update_progress(batch, current: str | None) -> None:
                     with self._lock:
-                        job.progress = {
-                            "total": batch.total,
-                            "completed": batch.completed,
-                            "current": current,
-                            "legacy": list(batch.legacy),
-                            "done": [item.safe_name for item in batch.items if item.status == "done"],
-                            "failed": [item.safe_name for item in batch.items if item.status == "error"],
-                            "pending": [item.safe_name for item in batch.items if item.status == "pending"],
-                        }
+                        job.progress = _pocket_batch_progress(batch, current)
                         self._write_job(job)
 
                 batch = sync_all(
@@ -2087,13 +2148,7 @@ class JobStore:
                     progress=update_progress,
                 )
                 update_progress(batch, None)
-                job.result = {
-                    "total": batch.total,
-                    "completed": batch.completed,
-                    "failed": batch.failed,
-                    "pending": batch.pending,
-                    "legacy": list(batch.legacy),
-                }
+                job.result = _pocket_batch_result(batch)
                 failed = batch.failed > 0
                 if failed:
                     job.error = next(
@@ -2113,9 +2168,21 @@ class JobStore:
                     and isinstance(exc, PocketServiceError)
                     and exc.kind == "local"
                 ):
-                    legacy = list(exc.legacy)
-                    job.progress = {**(job.progress or {}), "legacy": legacy}
-                    job.result = {**(job.result or {}), "legacy": legacy}
+                    legacy = _limited_pocket_names(exc.legacy)
+                    legacy_count = len(exc.legacy)
+                    job.progress = {
+                        **(job.progress or {}),
+                        "legacy_count": legacy_count,
+                        "legacy": legacy,
+                    }
+                    job.result = {
+                        "total": 0,
+                        "completed": 0,
+                        "failed": 0,
+                        "pending": 0,
+                        "legacy_count": legacy_count,
+                        "legacy": legacy,
+                    }
                 if self._stopping.is_set():
                     job.status = "queued"
                     job.started_at = None

@@ -151,10 +151,58 @@ def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, m
     stored = json.loads((client.out_dir / "web" / "jobs" / f"{job_id}.json").read_text())
     assert detail["kind"] == stored["kind"] == "pocket_single"
     assert len(sync_calls) == 1
+    assert sync_calls[0][1]["resolution"] == "song_id"
     assert sync_calls[0][1]["expected_digest"] == digest
     assert sync_calls[0][1]["include_original"] is True
     assert token not in response.text + json.dumps(detail) + json.dumps(stored)
     assert "example.invalid" not in response.text + json.dumps(detail) + json.dumps(stored)
+
+
+def test_pocket_single_sync_resolves_song_id_before_same_named_directory(
+    client, monkeypatch
+):
+    import base64
+
+    import bunri.web.jobs as jobs_module
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.sync import SyncResult
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+
+    def make_package(name: str, digest: str) -> None:
+        package = client.out_dir / name
+        package.mkdir()
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                name,
+                name,
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",)),),
+            ),
+        )
+        for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+            (package / f"{name}.{suffix}").write_bytes(b"audio")
+
+    make_package("aaaaaaaaaaaa", "b" * 40)
+    make_package("Actual Song", "a" * 40)
+    monkeypatch.setattr(jobs_module, "sync_one", lambda *args, **kwargs: SyncResult())
+
+    response = client.post("/api/pocket/sync/" + "a" * 12)
+
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    _wait_until(lambda: _job_status(client, job_id) == "done")
+    saved = client.get(f"/api/jobs/{job_id}").json()
+    assert saved["song_id"] == "a" * 12
+    assert client.app.state.job_store.get_job(job_id).pocket_safe_name == "Actual Song"
 
 
 def test_pocket_job_tracking_never_waits_for_the_remote_inspection(tmp_path, monkeypatch):

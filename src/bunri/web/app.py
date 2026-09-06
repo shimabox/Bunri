@@ -486,7 +486,12 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         except (OSError, SyncLockBusy) as exc:
             raise HTTPException(status_code=409, detail=safe_error(exc))
         try:
-            package = resolve_package(out_dir, pocket_song_id, include_original=True)
+            package = resolve_package(
+                out_dir,
+                pocket_song_id,
+                resolution="song_id",
+                include_original=True,
+            )
             job = store.create_pocket_job(
                 song_id=pocket_song_id,
                 digest=package.metadata.source.digest,

@@ -78,7 +78,7 @@ def test_duplicate_song_id_is_detected_even_when_one_copy_fails_preflight(tmp_pa
     (tmp_path / "Broken" / "Broken.guitar.mp3").unlink()
 
     with pytest.raises(PocketServiceError, match="identity が競合"):
-        resolve_package(tmp_path, "a" * 12)
+        resolve_package(tmp_path, "a" * 12, resolution="song_id")
 
     statuses = {item.safe_name: item for item in inspect_packages(tmp_path, RefusingClient())}
     assert statuses["Good"].remote.conflict is True
@@ -92,7 +92,7 @@ def test_duplicate_full_digest_is_detected_even_when_one_copy_fails_preflight(tm
     (tmp_path / "Broken" / "Broken.original.mp3").write_bytes(b"")
 
     with pytest.raises(PocketServiceError, match="identity が競合"):
-        resolve_package(tmp_path, "Good")
+        resolve_package(tmp_path, "Good", resolution="safe_name")
 
     with pytest.raises(PocketServiceError, match="複数のパッケージ名"):
         inventory(tmp_path)
@@ -106,7 +106,7 @@ def test_duplicate_full_digest_is_detected_when_package_is_copied_under_another_
     shutil.copytree(tmp_path / "Good", tmp_path / "Renamed")
 
     with pytest.raises(PocketServiceError, match="identity が競合"):
-        resolve_package(tmp_path, "Good")
+        resolve_package(tmp_path, "Good", resolution="safe_name")
 
     with pytest.raises(PocketServiceError, match="複数のパッケージ名"):
         inventory(tmp_path)
@@ -120,9 +120,29 @@ def test_a_sidecarless_directory_never_joins_the_identity_check(tmp_path):
     make_package(tmp_path, "Good", "a" * 40)
     (tmp_path / "Legacy").mkdir()
 
-    package = resolve_package(tmp_path, "a" * 12)
+    package = resolve_package(tmp_path, "a" * 12, resolution="song_id")
     assert package.directory.name == "Good"
     assert inventory(tmp_path).legacy == ("Legacy",)
+
+
+def test_safe_name_and_song_id_resolution_do_not_share_a_namespace(tmp_path):
+    make_package(tmp_path, "aaaaaaaaaaaa", "b" * 40)
+    make_package(tmp_path, "Actual Song", "a" * 40)
+
+    by_name = resolve_package(tmp_path, "a" * 12, resolution="safe_name")
+    by_song_id = resolve_package(tmp_path, "a" * 12, resolution="song_id")
+
+    assert by_name.directory.name == "aaaaaaaaaaaa"
+    assert by_song_id.directory.name == "Actual Song"
+
+
+def test_safe_name_resolution_never_falls_back_to_a_song_id(tmp_path):
+    make_package(tmp_path, "Actual Song", "a" * 40)
+
+    with pytest.raises(PocketServiceError) as caught:
+        resolve_package(tmp_path, "a" * 12, resolution="safe_name")
+
+    assert caught.value.kind == "not_found"
 
 
 def test_sync_lock_is_non_blocking_and_reusable_after_release(tmp_path):

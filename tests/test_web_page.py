@@ -487,7 +487,7 @@ def test_pocket_all_failure_summary_renders_without_song_cards(tmp_path, monkeyp
     def fail_sync_all(*_args, progress=None, **_kwargs):
         batch = BatchResult(
             total=3,
-            legacy=["Legacy Song"],
+            legacy=[f"Legacy Song {index}" for index in range(101)],
             items=[
                 BatchItem("Done Song", "done"),
                 BatchItem("Failed Song", "error", error=safe_message),
@@ -514,7 +514,7 @@ def test_pocket_all_failure_summary_renders_without_song_cards(tmp_path, monkeyp
         assert summary.is_visible()
         assert summary.text_content() == (
             "全曲アップロード失敗: "
-            f"{safe_message}（完了 1件 / 失敗 1件 / 未実行 1件）（再生成が必要 1件）"
+            f"{safe_message}（完了 1件 / 失敗 1件 / 未実行 1件）（再生成が必要 101件）"
         )
         assert summary.get_attribute("class").endswith("is-error")
 

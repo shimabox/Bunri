@@ -86,7 +86,13 @@ def sync(
                 raise typer.Exit(1)
             return
         assert safe_name is not None
-        result = sync_one(out, safe_name, include_original=original, lock=lock)
+        result = sync_one(
+            out,
+            safe_name,
+            resolution="safe_name",
+            include_original=original,
+            lock=lock,
+        )
     except PocketServiceError as exc:
         if all_packages and exc.legacy:
             for name in exc.legacy:

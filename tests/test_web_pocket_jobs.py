@@ -43,6 +43,7 @@ def test_pocket_job_uses_direct_service_and_omits_separation_fields(tmp_path, mo
         assert saved["kind"] == "pocket_single"
         assert not ({"target", "upload", "package", "log"} & saved.keys())
         assert len(calls) == 1
+        assert calls[0][1]["resolution"] == "song_id"
         assert calls[0][1]["include_original"] is True
     finally:
         store.shutdown()
@@ -141,6 +142,79 @@ def test_pocket_batch_preserves_legacy_names_on_local_validation_error(
         wait_for(lambda: store.get_job(job.id).status == "error")
         saved = json.loads((tmp_path / "web" / "jobs" / f"{job.id}.json").read_text())
         assert saved["progress"]["legacy"] == ["Old One", "Old Two"]
+        assert saved["progress"]["legacy_count"] == 2
         assert saved["result"]["legacy"] == ["Old One", "Old Two"]
+        assert saved["result"]["legacy_count"] == 2
+    finally:
+        store.shutdown()
+
+
+def test_pocket_batch_job_bounds_names_and_keeps_complete_counts(
+    tmp_path, monkeypatch
+):
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.service import BatchItem, BatchResult
+    from bunri.web.jobs import (
+        MAX_JOB_FILE_BYTES,
+        MAX_POCKET_JOB_NAMES_PER_STATE,
+        _validate_job_record,
+    )
+
+    item_count = 5_000
+    name_tail = "\x01" * 249
+    statuses = ("done", "error", "pending")
+    items = [
+        BatchItem(f"{index:05d}-{name_tail}", statuses[index % len(statuses)])
+        for index in range(item_count)
+    ]
+    legacy = [f"{index:05d}-{name_tail}" for index in range(item_count)]
+    uncapped_names = json.dumps(
+        {"done": [item.safe_name for item in items], "legacy": legacy}
+    ).encode("utf-8")
+    assert len(uncapped_names) > MAX_JOB_FILE_BYTES
+
+    monkeypatch.setattr(
+        jobs_module,
+        "sync_all",
+        lambda *_args, **_kwargs: BatchResult(
+            total=item_count,
+            legacy=legacy,
+            items=items,
+        ),
+    )
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        job = store.create_pocket_job(
+            song_id=None,
+            digest=None,
+            safe_name=None,
+            sync_lock=SyncLock(tmp_path).acquire(),
+        )
+        wait_for(lambda: store.get_job(job.id).status == "error")
+        record_path = tmp_path / "web" / "jobs" / f"{job.id}.json"
+        saved = json.loads(record_path.read_text(encoding="utf-8"))
+
+        assert record_path.stat().st_size > MAX_JOB_FILE_BYTES * 0.7
+        assert record_path.stat().st_size <= MAX_JOB_FILE_BYTES
+        assert _validate_job_record(saved, job.id) is None
+        assert saved["progress"]["completed"] == len(
+            [item for item in items if item.status == "done"]
+        )
+        assert saved["progress"]["failed_count"] == len(
+            [item for item in items if item.status == "error"]
+        )
+        assert saved["progress"]["pending_count"] == len(
+            [item for item in items if item.status == "pending"]
+        )
+        assert saved["progress"]["legacy_count"] == item_count
+        assert len(saved["progress"]["done"]) == MAX_POCKET_JOB_NAMES_PER_STATE
+        assert len(saved["progress"]["failed"]) == MAX_POCKET_JOB_NAMES_PER_STATE
+        assert len(saved["progress"]["pending"]) == MAX_POCKET_JOB_NAMES_PER_STATE
+        assert len(saved["progress"]["legacy"]) == MAX_POCKET_JOB_NAMES_PER_STATE
+        assert saved["result"]["completed"] == saved["progress"]["completed"]
+        assert saved["result"]["failed"] == saved["progress"]["failed_count"]
+        assert saved["result"]["pending"] == saved["progress"]["pending_count"]
+        assert saved["result"]["legacy_count"] == item_count
+        assert len(saved["result"]["legacy"]) == MAX_POCKET_JOB_NAMES_PER_STATE
     finally:
         store.shutdown()

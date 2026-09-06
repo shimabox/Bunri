@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 
 from bunri.package_metadata import SourceIdentity
 from bunri.pocket.config import read_config
@@ -157,15 +157,20 @@ def inventory(out_dir: Path, *, include_original: bool = True) -> PackageInvento
 
 def resolve_package(
     out_dir: Path,
-    song_id: str,
+    selector: str,
     *,
+    resolution: Literal["safe_name", "song_id"],
     expected_digest: str | None = None,
     include_original: bool = True,
 ) -> LocalPackage:
     scanned = _scan_packages(out_dir, include_original=include_original)
     by_name = {entry.safe_name: entry for entry in scanned}
-    if expected_digest is None and song_id in by_name:
-        entry = by_name[song_id]
+    if resolution == "safe_name":
+        if expected_digest is not None:
+            raise ValueError("expected_digest is only valid for song_id resolution")
+        entry = by_name.get(selector)
+        if entry is None:
+            raise PocketServiceError("同期する曲が見つかりません。", kind="not_found")
         if entry.package is None:
             exc = entry.error
             assert exc is not None
@@ -186,17 +191,13 @@ def resolve_package(
         if _identity_issues(peers):
             raise PocketServiceError("曲の identity が競合しているためアップロードできません。", kind="conflict")
         return selected
+    if resolution != "song_id":
+        raise ValueError(f"unknown package resolution mode: {resolution}")
     matches = [
         entry for entry in scanned
         if entry.identity is not None
-        and (
-            entry.identity.cache_key == song_id
-            or (expected_digest is not None and entry.identity.digest == expected_digest)
-        )
+        and entry.identity.cache_key == selector
     ]
-    named = by_name.get(song_id)
-    if named is not None and named.error is not None and named.error.kind == "legacy":
-        raise PocketServiceError("このパッケージは再生成が必要です。", kind="legacy")
     if not matches:
         raise PocketServiceError("同期する曲が見つかりません。", kind="not_found")
     if len(matches) != 1 or _identity_issues(matches):
@@ -349,8 +350,9 @@ def safe_error(exc: BaseException) -> str:
 
 def sync_one(
     out_dir: Path,
-    song_id: str,
+    selector: str,
     *,
+    resolution: Literal["safe_name", "song_id"],
     expected_digest: str | None = None,
     include_original: bool = True,
     lock: SyncLock | None = None,
@@ -364,7 +366,8 @@ def sync_one(
     try:
         package = resolve_package(
             out_dir,
-            song_id,
+            selector,
+            resolution=resolution,
             expected_digest=expected_digest,
             include_original=include_original,
         )

@@ -755,6 +755,8 @@
 
   function pocketJobCount(job, name) {
     if (job.result && typeof job.result[name] === "number") return job.result[name];
+    if (job.result && typeof job.result[name + "_count"] === "number") return job.result[name + "_count"];
+    if (job.progress && typeof job.progress[name + "_count"] === "number") return job.progress[name + "_count"];
     if (job.progress && Array.isArray(job.progress[name])) return job.progress[name].length;
     if (job.progress && typeof job.progress[name] === "number") return job.progress[name];
     return 0;
