@@ -688,6 +688,14 @@
     });
   }
 
+  function hasActiveSeparationJobs(songs) {
+    return songs.some(function (song) {
+      return song.targets.some(function (job) {
+        return job.status === "queued" || job.status === "running";
+      });
+    });
+  }
+
   function pocketBadge(status, job) {
     if (job && (
       job.status === "queued" || job.status === "running" || job.status === "error"
@@ -940,7 +948,10 @@
           pocketButton.addEventListener("click", function () {
             pocketButton.disabled = true;
             postPocket(API_POCKET_SYNC + "/" + encodeURIComponent(pocketStatus.song_id))
-              .catch(function (err) { window.alert(err.message || "アップロードを開始できません"); });
+              .catch(function (err) {
+                window.alert(err.message || "アップロードを開始できません");
+                renderSongs(songsCache);
+              });
           });
         }
         pocketMain.appendChild(pocketButton);
@@ -1126,6 +1137,7 @@
 
   function refreshSongs() {
     var hadActivePocket = hasActivePocketJobs(songsCache);
+    var hadActiveSeparation = hasActiveSeparationJobs(songsCache);
     return fetch(API_SONGS)
       .then(function (res) { return res.json(); })
       .then(function (songs) {
@@ -1133,6 +1145,9 @@
         schedulePoll(songs);
         if (activePocketJobId !== null) refreshActivePocketJob();
         if (hadActivePocket && !hasActivePocketJobs(songs)) refreshPocketStatus();
+        if (pocketConnected && hadActiveSeparation && !hasActiveSeparationJobs(songs)) {
+          refreshPocketStatus();
+        }
         return songs;
       })
       .catch(function () {
