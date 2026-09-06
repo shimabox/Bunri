@@ -37,6 +37,7 @@ class _PackageFakeSeparator:
 
     def __init__(self, **kwargs: Any) -> None:
         self.output_dir = Path(kwargs["output_dir"])
+        self.model_file_dir = kwargs["model_file_dir"]
         _PackageFakeSeparator.instances.append(self)
 
     def list_supported_model_files(self) -> dict[str, Any]:
@@ -47,6 +48,9 @@ class _PackageFakeSeparator:
 
     def load_model(self, model_filename: str) -> None:
         pass
+
+    def download_file_if_not_exists(self, url: str, output_path: str) -> None:
+        raise AssertionError(f"unexpected model download: {url} -> {output_path}")
 
     def separate(
         self, audio_file_path: str, custom_output_names: dict[str, str] | None = None
@@ -73,8 +77,12 @@ def _reset_instances():
 @pytest.fixture(autouse=True)
 def _fake_separator(monkeypatch):
     from audio_separator import separator as separator_module
+    from bunri import separate as separate_module
 
     monkeypatch.setattr(separator_module, "Separator", _PackageFakeSeparator)
+    monkeypatch.setattr(
+        separate_module, "_download_if_missing", lambda url, dest, expected_sha256: None
+    )
 
 
 @pytest.fixture()
