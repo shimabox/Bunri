@@ -245,6 +245,88 @@ def test_remote_only_tracks_survive_unknown_shelf_status(tmp_path):
 
 
 @_needs_browser
+def test_disconnected_unknown_status_clears_pocket_ui(tmp_path):
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    digest = "a" * 40
+    web_song_id = hashlib.sha256(digest.encode()).hexdigest()
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": digest,
+        "title": "Local Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": None,
+        "package": None,
+        "log": None,
+        "upload": None,
+    }), encoding="utf-8")
+    connected_status = {
+        "connected": True,
+        "package_count": 1,
+        "target_count": 1,
+        "songs": [{
+            "web_song_id": web_song_id,
+            "song_id": digest[:12],
+            "title": "Local Song",
+            "state": "synced",
+            "can_sync": False,
+        }],
+        "remote_only": [{"song_id": "abcdef123456", "title": "Shelf Song"}],
+    }
+    disconnected_status = {
+        "connected": False,
+        "state": "unknown",
+        "message": "Pocket の接続設定を読み込めません。",
+        "package_count": 0,
+        "target_count": 0,
+        "songs": connected_status["songs"],
+        "remote_only": connected_status["remote_only"],
+    }
+    responses = [connected_status, disconnected_status]
+
+    def mock_pocket(page):
+        page.route("**/api/pocket/job", lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"connected": True, "job": None}),
+        ))
+
+        def status_handler(route):
+            body = responses.pop(0) if len(responses) > 1 else responses[0]
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(body),
+            )
+
+        page.route("**/api/pocket/status", status_handler)
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_pocket
+    ) as page:
+        page.wait_for_selector("#sw-pocket-banner:not([hidden])")
+        page.wait_for_selector("#sw-pocket-controls:not([hidden])")
+        page.wait_for_selector(".sw-pocket-row", state="attached")
+        page.wait_for_selector("#sw-remote-only:not([hidden])")
+
+        page.click("#sw-pocket-refresh")
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-banner').hidden && "
+            "document.getElementById('sw-pocket-controls').hidden && "
+            "document.querySelector('.sw-pocket-row') === null"
+        )
+
+        assert page.locator("#sw-remote-only").is_hidden()
+        assert page.locator(".sw-remote-only-item").count() == 0
+
+
+@_needs_browser
 def test_separation_upload_stays_enabled_during_an_unrelated_pocket_job(tmp_path):
     active_digest = "a" * 40
 

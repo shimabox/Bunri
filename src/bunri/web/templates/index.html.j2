@@ -1276,18 +1276,23 @@
       .then(function (res) { return res.json(); })
       .then(function (status) {
         if (generation !== pocketStatusGeneration) return;
-        if (status.state !== "unknown") setPocketConnected(status.connected);
+        var preserveRemoteOnly = status.connected === true && status.state === "unknown";
+        setPocketConnected(status.connected);
         pocketStatuses = Object.create(null);
-        (status.songs || []).forEach(function (item) {
-          if (item.web_song_id) pocketStatuses[item.web_song_id] = item;
-        });
+        if (pocketConnected) {
+          (status.songs || []).forEach(function (item) {
+            if (item.web_song_id) pocketStatuses[item.web_song_id] = item;
+          });
+        }
         if (status.state === "unknown") {
           remoteOnlyError.textContent = status.message || "棚の状態を確認できません。";
           remoteOnlyError.hidden = false;
         } else {
-          remoteOnlyTracks = status.remote_only || [];
           remoteOnlyError.textContent = "";
           remoteOnlyError.hidden = true;
+        }
+        if (!preserveRemoteOnly) {
+          remoteOnlyTracks = pocketConnected ? (status.remote_only || []) : [];
         }
         renderRemoteOnly();
         pocketCountText = "出力先の全パッケージ " + (status.package_count || 0) + "件中、同期対象 " + (status.target_count || 0) + "件";
