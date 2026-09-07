@@ -901,7 +901,10 @@
           return refreshSongs();
         }
         delete songExpandedStates[song.id];
-        return refreshSongs().then(function () { songsHeading.focus(); });
+        return refreshSongs().then(function () {
+          songsHeading.focus();
+          if (pocketConnected) return refreshPocketStatus();
+        });
       })
       .catch(function (err) {
         deleteSubmitting = false;
