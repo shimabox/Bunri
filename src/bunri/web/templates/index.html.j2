@@ -71,6 +71,11 @@
   .sw-pocket-row { border-bottom: 1px solid #f1e8da; padding: 10px 0 12px; }
   .sw-pocket-row-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .sw-pocket-message { margin: 6px 0 0; color: #8a7f74; font-size: 0.78rem; }
+  .sw-remote-only { margin-top: 24px; }
+  .sw-remote-only[hidden] { display: none; }
+  .sw-remote-only-list { list-style: none; margin: 10px 0 0; padding: 0; }
+  .sw-remote-only-item { display: flex; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #f1e8da; }
+  .sw-remote-only-id { color: #8a7f74; font-family: ui-monospace, monospace; font-size: 0.78rem; }
 
   .sw-dropzone {
     border: 2px dashed #e6d9c4;
@@ -479,6 +484,11 @@
     </div>
     <p id="sw-empty" class="sw-empty">まだ曲はありません。</p>
     <ul id="sw-job-list" class="sw-job-list"></ul>
+    <section id="sw-remote-only" class="sw-remote-only" aria-labelledby="sw-remote-only-title" hidden>
+      <h3 id="sw-remote-only-title">棚にのみある曲</h3>
+      <p class="sw-pocket-note">読み取り専用です。削除するには CLI の --select または --song-id を使ってください。</p>
+      <ul id="sw-remote-only-list" class="sw-remote-only-list"></ul>
+    </section>
   </section>
 </main>
 
@@ -491,7 +501,12 @@
       <li>練習パッケージ</li>
       <li>この曲の全ジョブ履歴とログ</li>
       <li>ほかの曲と共有していないアップロード元とキャッシュ</li>
+      <li id="sw-delete-pocket-summary" hidden>棚の library、manifest、media</li>
     </ul>
+    <label id="sw-delete-pocket-option" hidden>
+      <input type="checkbox" id="sw-delete-pocket"> Bunri Pocket の棚からも削除する
+    </label>
+    <p id="sw-delete-pocket-note" class="sw-pocket-note" hidden>棚削除の確認後にローカルデータを削除します。</p>
     <p class="sw-delete-warning">この操作は取り消せません。</p>
     <div class="sw-delete-actions">
       <button type="button" id="sw-delete-cancel" class="sw-btn">キャンセル</button>
@@ -536,12 +551,19 @@
   var deleteCancel = document.getElementById("sw-delete-cancel");
   var deleteConfirm = document.getElementById("sw-delete-confirm");
   var deleteError = document.getElementById("sw-delete-error");
+  var deletePocketOption = document.getElementById("sw-delete-pocket-option");
+  var deletePocket = document.getElementById("sw-delete-pocket");
+  var deletePocketSummary = document.getElementById("sw-delete-pocket-summary");
+  var deletePocketNote = document.getElementById("sw-delete-pocket-note");
   var pocketBanner = document.getElementById("sw-pocket-banner");
   var pocketControls = document.getElementById("sw-pocket-controls");
   var pocketAll = document.getElementById("sw-pocket-all");
   var pocketRefresh = document.getElementById("sw-pocket-refresh");
   var pocketCount = document.getElementById("sw-pocket-count");
   var pocketSummary = document.getElementById("sw-pocket-summary");
+  var remoteOnlySection = document.getElementById("sw-remote-only");
+  var remoteOnlyList = document.getElementById("sw-remote-only-list");
+  var remoteOnlyTracks = [];
 
   var pendingFile = null;
   var pollTimer = null;
@@ -616,7 +638,8 @@
   }
 
   function updateUploadEnabled() {
-    uploadBtn.disabled = !pendingFile || selectedTargets().length === 0;
+    uploadBtn.disabled = !pendingFile || selectedTargets().length === 0
+      || activePocketJobId !== null || hasActivePocketJobs(songsCache);
   }
 
   targetInputs.forEach(function (input) {
@@ -818,6 +841,11 @@
     var labels = song.targets.map(function (job) { return job.target_label; });
     deleteTargets.textContent = labels.length + "楽器: " + labels.join("、");
     deleteError.textContent = "";
+    var pocketStatus = pocketStatuses[song.id];
+    deletePocket.checked = false;
+    deletePocketOption.hidden = !(pocketConnected && pocketStatus && pocketStatus.can_delete);
+    deletePocketSummary.hidden = true;
+    deletePocketNote.hidden = true;
     deleteCancel.disabled = false;
     deleteConfirm.disabled = false;
     deleteConfirm.textContent = "削除する";
@@ -841,6 +869,10 @@
     event.preventDefault();
     if (!deleteSubmitting) closeDeleteDialog(true);
   });
+  deletePocket.addEventListener("change", function () {
+    deletePocketSummary.hidden = !deletePocket.checked;
+    deletePocketNote.hidden = !deletePocket.checked;
+  });
   deleteConfirm.addEventListener("click", function () {
     if (deleteSubmitting || !deleteDialogSong) return;
     var song = deleteDialogSong;
@@ -849,15 +881,25 @@
     deleteConfirm.disabled = true;
     deleteConfirm.textContent = "削除中…";
     deleteError.textContent = "";
-    fetch(API_SONGS + "/" + encodeURIComponent(song.id), { method: "DELETE" })
+    var removeFromPocket = deletePocket.checked;
+    var deleteUrl = API_SONGS + "/" + encodeURIComponent(song.id)
+      + (removeFromPocket ? "?pocket=true" : "");
+    fetch(deleteUrl, { method: "DELETE" })
       .then(function (res) {
         if (!res.ok) {
           return res.json().catch(function () { return {}; }).then(function (body) {
             throw new Error(body.detail || ("削除に失敗しました (" + res.status + ")"));
           });
         }
+        return res.status === 202 ? res.json() : null;
+      })
+      .then(function (body) {
         deleteDialog.close();
         deleteDialogSong = null;
+        if (body && body.job_id) {
+          activePocketJobId = body.job_id;
+          return refreshSongs();
+        }
         delete songExpandedStates[song.id];
         return refreshSongs().then(function () { songsHeading.focus(); });
       })
@@ -888,6 +930,7 @@
 
     songsCache = songs;
     pocketAll.disabled = pocketChecking || hasActivePocketJobs(songs) || activePocketJobId !== null;
+    updateUploadEnabled();
     jobListEl.innerHTML = "";
     emptyMsg.hidden = songs.length !== 0;
 
@@ -944,6 +987,10 @@
         var pocketMain = document.createElement("div");
         pocketMain.className = "sw-pocket-row-main";
         var pocketState = pocketBadge(pocketStatus, song.pocket_job);
+        if (song.pocket_job && song.pocket_job.kind === "pocket_delete"
+          && (song.pocket_job.status === "queued" || song.pocket_job.status === "running")) {
+          pocketState = { text: "棚から削除中", cls: "sw-badge-running" };
+        }
         var pocketBadgeEl = document.createElement("span");
         pocketBadgeEl.className = "sw-badge " + pocketState.cls;
         pocketBadgeEl.textContent = pocketState.text;
@@ -972,6 +1019,8 @@
         if (pocketMessageText) {
           var pocketMessage = document.createElement("p");
           pocketMessage.className = "sw-pocket-message";
+          pocketMessage.setAttribute("role", "status");
+          pocketMessage.setAttribute("aria-live", "polite");
           pocketMessage.textContent = pocketMessageText;
           pocketRow.appendChild(pocketMessage);
         }
@@ -1219,17 +1268,42 @@
         (status.songs || []).forEach(function (item) {
           if (item.web_song_id) pocketStatuses[item.web_song_id] = item;
         });
+        remoteOnlyTracks = status.remote_only || [];
+        renderRemoteOnly();
         pocketCountText = "出力先の全パッケージ " + (status.package_count || 0) + "件中、同期対象 " + (status.target_count || 0) + "件";
         renderPocketCount();
       })
       .catch(function () {
         setPocketConnected(false);
+        remoteOnlyTracks = [];
+        renderRemoteOnly();
       })
       .finally(function () {
         pocketChecking = false;
         renderSongs(songsCache);
         schedulePoll(songsCache);
       });
+  }
+
+  function renderRemoteOnly() {
+    remoteOnlyList.innerHTML = "";
+    remoteOnlySection.hidden = !pocketConnected || remoteOnlyTracks.length === 0;
+    remoteOnlyTracks.forEach(function (track) {
+      var item = document.createElement("li");
+      item.className = "sw-remote-only-item";
+      var title = document.createElement("span");
+      title.textContent = track.title;
+      var id = document.createElement("span");
+      id.className = "sw-remote-only-id";
+      id.textContent = track.song_id;
+      var badge = document.createElement("span");
+      badge.className = "sw-badge sw-badge-queued";
+      badge.textContent = "棚のみ";
+      item.appendChild(title);
+      item.appendChild(id);
+      item.appendChild(badge);
+      remoteOnlyList.appendChild(item);
+    });
   }
 
   pocketAll.addEventListener("click", function () {

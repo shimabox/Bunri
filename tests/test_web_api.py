@@ -827,6 +827,64 @@ def test_delete_song_returns_204_and_removes_it_from_both_lists(client):
     assert client.delete(f"/api/songs/{song_id}").status_code == 404
 
 
+def test_delete_song_with_pocket_flag_returns_202_and_uses_server_side_identity(client, monkeypatch):
+    import base64
+    import bunri.web.jobs as jobs_module
+    from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata, write_package_metadata
+    from bunri.pocket.config import PocketConfig, save_config
+
+    content = b"pocket-delete"
+    digest = hashlib.sha1(content).hexdigest()
+    created = _upload(client, content=content, title="Delete Pocket")
+    _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+    package = client.out_dir / "Delete Pocket"
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Delete Pocket",
+            "Delete Pocket",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("mp3", "wav")),),
+        ),
+    )
+    (package / "Delete Pocket.original.mp3").write_bytes(content)
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    calls = []
+    monkeypatch.setattr(jobs_module, "delete_track", lambda _out, target, **kwargs: calls.append(target))
+    web_song_id = client.get("/api/songs").json()[0]["id"]
+
+    response = client.delete(f"/api/songs/{web_song_id}?pocket=true")
+
+    assert response.status_code == 202
+    assert set(response.json()) == {"job_id"}
+    _wait_until(lambda: client.get(f"/api/jobs/{response.json()['job_id']}").json()["status"] == "done")
+    assert calls[0].song_id == digest[:12]
+    assert calls[0].digest == digest
+
+
+def test_pocket_status_reports_validated_remote_only_tracks(client, monkeypatch):
+    import base64
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import LibraryTrack
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    monkeypatch.setattr(app_module, "inspect_packages", lambda *_args: ())
+    monkeypatch.setattr(
+        app_module,
+        "list_library_tracks",
+        lambda *_args, **_kwargs: (LibraryTrack("abcdef123456", "Remote <script>"),),
+    )
+
+    response = client.get("/api/pocket/status")
+
+    assert response.status_code == 200
+    assert response.json()["remote_only"] == [
+        {"song_id": "abcdef123456", "title": "Remote <script>"}
+    ]
+
+
 def test_delete_unknown_song_is_404(client):
     assert client.delete("/api/songs/not-a-song").status_code == 404
 

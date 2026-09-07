@@ -22,6 +22,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         length = int(self.headers["Content-Length"]); body = self.rfile.read(length); self._record(body)
         self.send_response(201); self.send_header("Content-Length", "0"); self.send_header("ETag", '"stored"'); self.send_header("X-Bunri-Content-SHA256", self.headers["X-Bunri-Content-SHA256"]); self.end_headers()
+    def do_DELETE(self):
+        self._record(); self.send_response(204); self.send_header("Content-Length", "0"); self.end_headers()
 
 
 @pytest.fixture
@@ -83,3 +85,43 @@ def test_unsupported_schema_error_keeps_supported_major(server, monkeypatch):
         PocketHTTPClient(server, "secret").get_json("manifest/aaaaaaaaaaaa")
     assert (exc.value.status, exc.value.code, exc.value.supported_major) == (409, "UNSUPPORTED_SCHEMA_MAJOR", 2)
     assert "secret" not in str(exc.value)
+
+
+def test_delete_track_uses_api_route_bearer_user_agent_no_body_and_30_second_timeout(server):
+    class RecordingOpener:
+        def __init__(self):
+            self.timeout = None
+
+        def open(self, request, timeout):
+            self.timeout = timeout
+            return __import__("urllib.request").request.urlopen(request, timeout=timeout)
+
+    opener = RecordingOpener()
+    PocketHTTPClient(server, "delete-secret", opener=opener, metadata_timeout=1).delete_track("abcdef123456")
+    method, path, headers, body = Handler.requests[-1]
+    assert (method, path, body) == ("DELETE", "/api/v1/tracks/abcdef123456", b"")
+    assert headers["Authorization"] == "Bearer delete-secret"
+    assert headers["User-Agent"] == f"bunri/{bunri_version}"
+    assert "Origin" not in headers and "Cookie" not in headers and "Content-Length" not in headers
+    assert opener.timeout == 30
+
+
+@pytest.mark.parametrize("status", [401, 404, 409, 422, 429, 503])
+def test_delete_track_rejects_every_non_204_without_disclosing_secret(server, monkeypatch, status):
+    def rejected(self):
+        self._record()
+        body = json.dumps({"error": {"code": "REJECTED"}}).encode()
+        self.send_response(status)
+        self.send_header("Retry-After", "tomorrow" if status == 429 else "")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    monkeypatch.setattr(Handler, "do_DELETE", rejected)
+    with pytest.raises(PocketHTTPError) as caught:
+        PocketHTTPClient(server, "delete-secret").delete_track("abcdef123456")
+    assert caught.value.status == status
+    assert "delete-secret" not in str(caught.value)
+    assert "http://" not in str(caught.value)
+    if status == 429:
+        assert caught.value.retry_after is None

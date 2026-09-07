@@ -151,6 +151,68 @@ def test_pocket_sync_all_reports_every_legacy_package_on_local_validation_error(
     assert "再生成が必要: Old Two" in output
     assert "ローカル検証に失敗しました。" in output
 
+
+def test_pocket_delete_song_id_with_yes_needs_no_local_package(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+    from bunri.pocket.service import DeleteResult
+
+    calls = []
+    monkeypatch.setattr(pocket_cli, "read_config", lambda _out: PocketConfig("https://example.invalid", "unused"))
+    monkeypatch.setattr(
+        pocket_cli,
+        "delete_track",
+        lambda _out, target, **kwargs: calls.append(target) or DeleteResult(target.song_id),
+    )
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["delete", "--song-id", "abcdef123456", "--yes", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0].song_id == "abcdef123456" and calls[0].safe_name is None
+    assert "棚から削除しました: abcdef123456" in _plain(result.output)
+
+
+@pytest.mark.parametrize("arguments", [[], ["Song", "--song-id", "abcdef123456"], ["--select", "--song-id", "abcdef123456"]])
+def test_pocket_delete_requires_exactly_one_selector(arguments):
+    from bunri.pocket.cli import app as pocket_app
+
+    result = CliRunner().invoke(pocket_app, ["delete", *arguments], env=_STABLE_TERMINAL)
+    assert result.exit_code == 1
+    assert "いずれか1つだけ" in _plain(result.output)
+
+
+def test_pocket_delete_treats_twelve_hex_safe_name_only_as_safe_name(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+    from bunri.pocket.service import DeleteResult, DeleteTargetIdentity
+
+    resolved = DeleteTargetIdentity("b" * 12, "b" * 40, "aaaaaaaaaaaa", "Song")
+    monkeypatch.setattr(pocket_cli, "read_config", lambda _out: PocketConfig("https://example.invalid", "unused"))
+    monkeypatch.setattr(pocket_cli, "resolve_delete_target", lambda _out, name: resolved if name == "aaaaaaaaaaaa" else None)
+    calls = []
+    monkeypatch.setattr(pocket_cli, "delete_track", lambda _out, target, **kwargs: calls.append(target) or DeleteResult(target.song_id))
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["delete", "aaaaaaaaaaaa", "--yes", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [resolved]
+
+
+def test_pocket_delete_select_rejects_non_tty_and_yes_without_side_effect(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+
+    monkeypatch.setattr(pocket_cli, "read_config", lambda _out: PocketConfig("https://example.invalid", "unused"))
+    monkeypatch.setattr(pocket_cli, "list_library_tracks", lambda *_args, **_kwargs: pytest.fail("library fetched"))
+    result = CliRunner().invoke(pocket_cli.app, ["delete", "--select", "-o", str(tmp_path)], env=_STABLE_TERMINAL)
+    assert result.exit_code == 1 and "TTY" in _plain(result.output)
+    result = CliRunner().invoke(pocket_cli.app, ["delete", "--select", "--yes", "-o", str(tmp_path)], env=_STABLE_TERMINAL)
+    assert result.exit_code == 1 and "同時に指定できません" in _plain(result.output)
+
 runner = CliRunner()
 
 # Typer renders help and errors through rich, which adapts to whatever

@@ -642,6 +642,45 @@ def test_delete_song_rejects_final_and_fixed_parent_symlinks(tmp_path):
     assert (saved_jobs / "j-delete.json").exists()
 
 
+def test_delete_song_excludes_only_its_own_active_pocket_delete(tmp_path):
+    from bunri.web.jobs import Job, JobStore, SongDeleteConflict, SongNotFoundError
+
+    store = JobStore(tmp_path, runner=lambda *args: 1)
+    own = Job(
+        id="j-own-delete",
+        digest="",
+        title="",
+        target="",
+        status="running",
+        created_at="2026-09-07T00:00:00+00:00",
+        kind="pocket_delete",
+        pocket_song_id="a" * 12,
+        pocket_digest="a" * 40,
+        pocket_safe_name="Song",
+    )
+    other = Job(
+        id="j-other-pocket",
+        digest="",
+        title="",
+        target="",
+        status="running",
+        created_at="2026-09-07T00:00:01+00:00",
+        kind="pocket_single",
+        pocket_song_id="b" * 12,
+        pocket_digest="b" * 40,
+        pocket_safe_name="Other",
+    )
+    try:
+        store._jobs[own.id] = own
+        with pytest.raises(SongNotFoundError):
+            store.delete_song(song_id("a" * 40), exclude_pocket_job_id=own.id)
+        store._jobs[other.id] = other
+        with pytest.raises(SongDeleteConflict):
+            store.delete_song(song_id("a" * 40), exclude_pocket_job_id=own.id)
+    finally:
+        store.shutdown()
+
+
 def test_delete_song_rejects_non_regular_candidate_before_any_deletion(tmp_path):
     digest = "9" * 40
     _write_terminal_job(tmp_path, "j-fifo", digest, "Song")

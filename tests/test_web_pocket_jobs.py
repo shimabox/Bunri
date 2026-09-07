@@ -49,6 +49,87 @@ def test_pocket_job_uses_direct_service_and_omits_separation_fields(tmp_path, mo
         store.shutdown()
 
 
+def test_pocket_delete_runs_remote_before_local_and_records_complete_result(tmp_path, monkeypatch):
+    import bunri.web.jobs as jobs_module
+
+    order = []
+    monkeypatch.setattr(jobs_module, "delete_track", lambda *_args, **_kwargs: order.append("remote"))
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    monkeypatch.setattr(
+        store,
+        "delete_song",
+        lambda requested, **kwargs: order.append(("local", requested, kwargs["exclude_pocket_job_id"])),
+    )
+    try:
+        job = store.create_pocket_delete_job(
+            song_id="a" * 12,
+            digest="a" * 40,
+            safe_name="Song",
+            sync_lock=SyncLock(tmp_path).acquire(),
+        )
+        wait_for(lambda: store.get_job(job.id).status == "done")
+        finished = store.get_job(job.id)
+        assert order == ["remote", ("local", jobs_module.song_id("a" * 40), job.id)]
+        assert finished.result == {"pocket_deleted": True, "local_deleted": True}
+    finally:
+        store.shutdown()
+
+
+def test_pocket_delete_remote_failure_keeps_local_and_stores_safe_retry_message(tmp_path, monkeypatch):
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.http import PocketHTTPError
+
+    monkeypatch.setattr(
+        jobs_module,
+        "delete_track",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PocketHTTPError(503, "UNAVAILABLE", "https://secret.invalid/token")
+        ),
+    )
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    monkeypatch.setattr(store, "delete_song", lambda *_args, **_kwargs: pytest.fail("local deletion started"))
+    try:
+        job = store.create_pocket_delete_job(
+            song_id="a" * 12,
+            digest="a" * 40,
+            safe_name="Song",
+            sync_lock=SyncLock(tmp_path).acquire(),
+        )
+        wait_for(lambda: store.get_job(job.id).status == "error")
+        failed = store.get_job(job.id)
+        assert failed.result == {"pocket_deleted": False, "local_deleted": False}
+        assert "ローカルデータは削除していません" in failed.error
+        assert "secret" not in failed.error
+    finally:
+        store.shutdown()
+
+
+def test_pocket_delete_local_failure_records_partial_success(tmp_path, monkeypatch):
+    import bunri.web.jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module, "delete_track", lambda *_args, **_kwargs: None)
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    monkeypatch.setattr(
+        store,
+        "delete_song",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("private path")),
+    )
+    try:
+        job = store.create_pocket_delete_job(
+            song_id="a" * 12,
+            digest="a" * 40,
+            safe_name="Song",
+            sync_lock=SyncLock(tmp_path).acquire(),
+        )
+        wait_for(lambda: store.get_job(job.id).status == "error")
+        failed = store.get_job(job.id)
+        assert failed.result == {"pocket_deleted": True, "local_deleted": False}
+        assert "棚からは削除済み" in failed.error
+        assert "private path" not in failed.error
+    finally:
+        store.shutdown()
+
+
 def test_running_pocket_job_is_requeued_without_subprocess_recovery(tmp_path, monkeypatch):
     import bunri.web.jobs as jobs_module
 

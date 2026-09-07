@@ -163,6 +163,32 @@ def _write_pocket_all_record(
 
 
 @_needs_browser
+def test_remote_only_tracks_render_as_read_only_text(tmp_path):
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url:
+        def mock_status(page):
+            page.route("**/api/pocket/status", lambda route: route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "package_count": 0,
+                    "target_count": 0,
+                    "songs": [],
+                    "remote_only": [{"song_id": "abcdef123456", "title": "<b>Remote</b>"}],
+                }),
+            ))
+
+        with _open_page(base_url, before_goto=mock_status) as page:
+            page.wait_for_selector("#sw-remote-only:not([hidden])")
+            item = page.locator(".sw-remote-only-item")
+            assert item.locator("span").first.text_content() == "<b>Remote</b>"
+            assert item.locator(".sw-badge").text_content() == "棚のみ"
+            assert item.locator("button").count() == 0
+            assert item.locator("b").count() == 0
+
+
+@_needs_browser
 def test_done_job_with_empty_downloads_does_not_render_download_controls(tmp_path):
     out_dir = tmp_path / "out"
     jobs_dir = out_dir / "web" / "jobs"
