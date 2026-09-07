@@ -4,6 +4,7 @@ import base64
 import shutil
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -26,18 +27,28 @@ from bunri.pocket.service import (
 TOKEN = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
 
 
-def make_package(out: Path, name: str, digest: str) -> None:
+def make_package(
+    out: Path, name: str, digest: str, *, metadata_name: str | None = None
+) -> None:
     directory = out / name
     directory.mkdir(parents=True)
     metadata = PackageMetadata(
         name,
-        name,
+        metadata_name or name,
         SourceIdentity("sha1", digest, digest[:12]),
         (TargetMetadata("guitar", ("mp3",)),),
     )
     write_package_metadata(directory / ".bunri-package.json", metadata)
     for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
         (directory / f"{name}.{suffix}").write_bytes(suffix.encode())
+
+
+class EmptyRemoteClient:
+    def get_json(self, path):
+        return None
+
+    def head_media(self, song_id, name):
+        return None
 
 
 def test_all_package_names_is_complete_deterministic_and_excludes_internal_paths(tmp_path):
@@ -60,6 +71,57 @@ def test_inventory_reports_all_legacy_but_rejects_duplicate_identity(tmp_path):
         inventory(tmp_path)
     assert caught.value.kind == "local"
     assert caught.value.legacy == ("Old1", "Old2")
+
+
+def test_nfd_package_is_inspected_inventoried_and_resolved_by_either_form(tmp_path):
+    nfc_name = "ガラスのブルース"
+    nfd_name = unicodedata.normalize("NFD", nfc_name)
+    make_package(tmp_path, nfd_name, "a" * 40, metadata_name=nfc_name)
+
+    found = inventory(tmp_path)
+    statuses = inspect_packages(tmp_path, EmptyRemoteClient())
+    by_nfc = resolve_package(tmp_path, nfc_name, resolution="safe_name")
+    by_nfd = resolve_package(tmp_path, nfd_name, resolution="safe_name")
+
+    assert [package.directory.name for package in found.packages] == [nfd_name]
+    assert len(statuses) == 1
+    assert statuses[0].safe_name == nfd_name
+    assert statuses[0].remote.state == "not_synced"
+    assert by_nfc.directory == by_nfd.directory == tmp_path / nfd_name
+
+    save_config(tmp_path, PocketConfig("https://example.invalid", TOKEN))
+
+    class FailingRemoteClient:
+        def __init__(self):
+            self.calls = 0
+
+        def get_json(self, path):
+            self.calls += 1
+            raise PocketHTTPError(503, "UNAVAILABLE", "https://example.invalid")
+
+    client = FailingRemoteClient()
+    result = sync_all(tmp_path, client=client)
+    assert client.calls == 1
+    assert [item.status for item in result.items] == ["error"]
+
+
+def test_canonically_equivalent_package_names_do_not_conflict_identity(
+    tmp_path, monkeypatch
+):
+    import bunri.pocket.service as service_module
+
+    nfc_name = "ばらの花"
+    nfd_name = unicodedata.normalize("NFD", nfc_name)
+    make_package(tmp_path, nfc_name, "a" * 40)
+    monkeypatch.setattr(
+        service_module, "all_package_names", lambda _out: [nfc_name, nfd_name]
+    )
+
+    found = inventory(tmp_path)
+    statuses = inspect_packages(tmp_path, EmptyRemoteClient())
+
+    assert len(found.packages) == 2
+    assert all(not status.remote.conflict for status in statuses)
 
 
 class RefusingClient:

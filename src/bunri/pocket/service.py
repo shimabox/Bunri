@@ -9,7 +9,13 @@ from typing import Callable, Iterable, Literal
 from bunri.package_metadata import SourceIdentity
 from bunri.pocket.config import read_config
 from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
-from bunri.pocket.local import LocalPackage, LocalPreflightError, all_package_names, preflight
+from bunri.pocket.local import (
+    LocalPackage,
+    LocalPreflightError,
+    all_package_names,
+    package_name_key,
+    preflight,
+)
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.protocol import ProtocolError, merge_library, merge_manifest
 from bunri.pocket.sync import SyncError, SyncResult, _library, _manifest, synchronize
@@ -120,7 +126,9 @@ def _identity_issues(entries: Iterable[ScannedPackage]) -> list[str]:
     for entry in entries:
         if entry.identity is None:
             continue
-        digest_names.setdefault(entry.identity.digest, set()).add(entry.safe_name)
+        digest_names.setdefault(entry.identity.digest, set()).add(
+            package_name_key(entry.safe_name)
+        )
         id_digests.setdefault(entry.identity.cache_key, set()).add(entry.identity.digest)
     issues = []
     for digest, names in sorted(digest_names.items()):
@@ -164,11 +172,11 @@ def resolve_package(
     include_original: bool = True,
 ) -> LocalPackage:
     scanned = _scan_packages(out_dir, include_original=include_original)
-    by_name = {entry.safe_name: entry for entry in scanned}
+    by_name = {package_name_key(entry.safe_name): entry for entry in scanned}
     if resolution == "safe_name":
         if expected_digest is not None:
             raise ValueError("expected_digest is only valid for song_id resolution")
-        entry = by_name.get(selector)
+        entry = by_name.get(package_name_key(selector))
         if entry is None:
             raise PocketServiceError("同期する曲が見つかりません。", kind="not_found")
         if entry.package is None:
@@ -272,7 +280,9 @@ def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageSt
     for entry in scanned:
         if entry.identity is None:
             continue
-        digest_names.setdefault(entry.identity.digest, set()).add(entry.safe_name)
+        digest_names.setdefault(entry.identity.digest, set()).add(
+            package_name_key(entry.safe_name)
+        )
         id_digests.setdefault(entry.identity.cache_key, set()).add(entry.identity.digest)
     conflict_digests = {digest for digest, names in digest_names.items() if len(names) > 1}
     conflict_ids = {song_id for song_id, digests in id_digests.items() if len(digests) > 1}

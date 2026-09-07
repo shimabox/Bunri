@@ -45,9 +45,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from bunri.package_metadata import read_package_metadata
 from bunri.registry import REGISTRY
 from bunri.pocket.lock import SyncLock, SyncLockBusy
+from bunri.pocket.local import package_name_key, read_package_metadata_for_directory
 from bunri.pocket.service import (
     BatchResult,
     PocketServiceError,
@@ -1562,7 +1562,7 @@ class JobStore:
                     or package_dir.resolve().parent != out_dir
                 ):
                     continue
-                metadata = read_package_metadata(
+                metadata = read_package_metadata_for_directory(
                     package_dir / ".bunri-package.json",
                     package_name,
                     allow_unknown_targets=True,
@@ -1570,7 +1570,7 @@ class JobStore:
             except (OSError, ValueError):
                 continue
             if metadata.source.digest == digest:
-                names.add(package_name)
+                names.add(package_name_key(package_name))
         return names
 
     @staticmethod
@@ -1581,7 +1581,9 @@ class JobStore:
             value = progress.get(name)
             if not isinstance(value, list):
                 return set()
-            return {item for item in value if isinstance(item, str)}
+            return {
+                package_name_key(item) for item in value if isinstance(item, str)
+            }
 
         if package_names & progress_names("failed"):
             return True, replace(job, status="error")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,40 @@ class LocalPackage:
     directory: Path
     metadata: PackageMetadata
     assets: tuple[LocalAsset, ...]
+
+
+def package_name_key(name: str) -> str:
+    """Return the canonical key used to compare package names."""
+    return unicodedata.normalize("NFC", name)
+
+
+def package_names_equal(left: str, right: str) -> bool:
+    return package_name_key(left) == package_name_key(right)
+
+
+def read_package_metadata_for_directory(
+    path: Path,
+    directory_name: str,
+    *,
+    allow_unknown_targets: bool = False,
+) -> PackageMetadata:
+    """Read metadata after comparing its declared name canonically."""
+    if not is_real_file_in(path, path.parent.resolve()):
+        raise ValueError(f"package metadata is not a regular file: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid package metadata: {path}") from exc
+    declared_name = value.get("safe_name") if isinstance(value, dict) else None
+    if not isinstance(declared_name, str) or not package_names_equal(
+        declared_name, directory_name
+    ):
+        raise ValueError("package metadata safe_name does not match its directory")
+    return read_package_metadata(
+        path,
+        declared_name,
+        allow_unknown_targets=allow_unknown_targets,
+    )
 
 
 def validate_safe_name(name: str) -> None:
@@ -111,7 +146,8 @@ def _sidecar_issues(value: object, safe_name: str) -> tuple[list[str], SourceIde
         issues.append("unsupported package metadata schema_version")
     if not isinstance(value.get("title"), str) or not value["title"]:
         issues.append("package metadata title must be non-empty")
-    if not isinstance(value.get("safe_name"), str) or value["safe_name"] != safe_name:
+    declared_name = value.get("safe_name")
+    if not isinstance(declared_name, str) or not package_names_equal(declared_name, safe_name):
         issues.append("package metadata safe_name does not match its directory")
     source = value.get("source")
     identity, source_issues = _source_identity(source)
@@ -165,7 +201,12 @@ def preflight(
     issues, identity = _sidecar_issues(raw, safe_name)
     metadata: PackageMetadata | None = None
     if not issues:
-        metadata = read_package_metadata(sidecar, safe_name, allow_unknown_targets=True)
+        assert isinstance(raw, dict) and isinstance(raw.get("safe_name"), str)
+        metadata = read_package_metadata(
+            sidecar,
+            raw["safe_name"],
+            allow_unknown_targets=True,
+        )
         target_values = [(target.target, target.formats) for target in metadata.targets]
     else:
         raw_targets = raw.get("targets") if isinstance(raw, dict) else None
