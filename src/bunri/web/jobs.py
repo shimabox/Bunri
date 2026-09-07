@@ -1212,7 +1212,7 @@ class JobStore:
     def _job_path(self, job_id: str) -> Path:
         return self.jobs_dir / f"{job_id}.json"
 
-    def _write_job(self, job: Job) -> None:
+    def _write_job(self, job: Job) -> bool:
         try:
             self._verified_jobs_dir()
         except UnsafeOutputPath as exc:
@@ -1221,7 +1221,7 @@ class JobStore:
             # whatever in-memory state it has and its record on disk -- which
             # is somebody else's file -- is left exactly as it was.
             _warn(f"[bunri-web] job {job.id}: not saving its record -- {exc}")
-            return
+            return False
         path = self._job_path(job.id)
         encoded = _serialize_job_within_limit(job)
         if len(encoded.encode("utf-8", errors="backslashreplace")) > MAX_JOB_FILE_BYTES:
@@ -1250,6 +1250,7 @@ class JobStore:
             )
             tmp.write_bytes(encoded.encode("utf-8", errors="backslashreplace"))
         os.replace(tmp, path)  # atomic on the same filesystem
+        return True
 
     def _quarantine_job_file(self, path: Path, reason: str) -> None:
         """Rename an unreadable/invalid job file out of the way so it stops
@@ -2005,7 +2006,10 @@ class JobStore:
             self._jobs[job_id] = job
             self._pocket_locks[job_id] = sync_lock
             try:
-                self._write_job(job)
+                if not self._write_job(job):
+                    raise UnsafeOutputPath(
+                        "Pocket delete job record could not be saved safely"
+                    )
                 self._queue.put(job_id)
             except BaseException:
                 self._jobs.pop(job_id, None)

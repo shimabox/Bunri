@@ -2405,6 +2405,29 @@ def test_a_relocated_jobs_directory_is_neither_read_nor_written(tmp_path):
         store.shutdown(join_timeout=5.0)
 
 
+def test_separation_job_still_runs_when_its_record_cannot_be_saved(tmp_path):
+    """Separation keeps its existing best-effort persistence semantics."""
+    upload = _make_upload(tmp_path)
+    runner = FakeRunner()
+    store = JobStore(tmp_path, runner=runner)
+    jobs_dir = tmp_path / "web" / "jobs"
+    saved_jobs = tmp_path / "saved-jobs"
+    jobs_dir.rename(saved_jobs)
+    outside = tmp_path / "outside-jobs"
+    outside.mkdir()
+    jobs_dir.symlink_to(outside, target_is_directory=True)
+
+    try:
+        job, created = store.create_job(upload, digest="d1", requested_title="Song")
+
+        assert created is True
+        _wait_until(lambda: store.get_job(job.id).status == "done")
+        assert len(runner.calls) == 1
+        assert list(outside.iterdir()) == []
+    finally:
+        store.shutdown(join_timeout=5.0)
+
+
 def test_a_failed_pid_write_stops_the_subprocess_instead_of_orphaning_it(tmp_path, monkeypatch):
     """Opening the sidecar before spawning covers the usual case -- we refuse
     to start a process whose pid we cannot record. It does not cover the

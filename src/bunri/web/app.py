@@ -602,6 +602,12 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                 )
             except SyncLockBusy as exc:
                 raise HTTPException(status_code=409, detail=safe_delete_error(exc))
+            except OSError:
+                mutation_lock.release()
+                raise HTTPException(
+                    status_code=500,
+                    detail="削除ジョブを安全に保存できません。",
+                )
             except BaseException:
                 mutation_lock.release()
                 raise
