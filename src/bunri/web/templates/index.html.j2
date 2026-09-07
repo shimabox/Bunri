@@ -16,9 +16,14 @@
       "Yu Gothic", Arial, sans-serif;
   }
   header.sw-header {
-    padding: 20px 24px;
+    padding: 20px 0;
     background: #fffdfa;
     border-bottom: 1px solid #f1e8da;
+  }
+  .sw-header-inner {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 0 24px;
   }
   h1.sw-title {
     margin: 0 0 4px;
@@ -40,6 +45,7 @@
   main.sw-main {
     padding: 22px 24px 40px;
     max-width: 760px;
+    margin: 0 auto;
   }
   section.sw-section { margin-bottom: 28px; }
   h2.sw-h2 {
@@ -420,9 +426,11 @@
   </defs>
 </svg>
 <header class="sw-header">
-  <h1 class="sw-title">Bunri</h1>
-  <p class="sw-sub">音源から楽器別の練習パッケージを作る</p>
-  <div id="sw-pocket-banner" class="sw-pocket-banner" hidden>Bunri Pocket 連携中</div>
+  <div class="sw-header-inner">
+    <h1 class="sw-title">Bunri</h1>
+    <p class="sw-sub">音源から楽器別の練習パッケージを作る</p>
+    <div id="sw-pocket-banner" class="sw-pocket-banner" hidden>Bunri Pocket 連携中</div>
+  </div>
 </header>
 
 <main class="sw-main">
