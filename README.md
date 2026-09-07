@@ -1,12 +1,12 @@
 # Bunri
 
-Bunri (分離, "separation") extracts a single instrument stem (guitar by default; bass, drums, vocals, piano also supported) from a song and builds a practice package: the instrument alone, the backing track without it, the original, and an offline HTML player with A-B loop and pitch-preserving slow-down. Separation runs locally and never uploads the input audio. Only an explicit `bunri pocket` command sends finished MP3 files to a Bunri Pocket storage owned by the user. Documentation is in Japanese.
+Bunri (分離, "separation") extracts a single instrument stem (guitar by default; bass, drums, vocals, piano also supported) from a song and builds a practice package: the instrument alone, the backing track without it, the original, and an offline HTML player with A-B loop and pitch-preserving slow-down. Separation runs locally and never uploads the input audio. Finished MP3 files are sent only when the user explicitly initiates a Pocket upload with the `bunri pocket` CLI or the Web UI, and the destination is Bunri Pocket storage owned by the user. Documentation is in Japanese.
 
 | アップロード | 曲一覧 | 練習プレイヤー |
 |---|---|---|
 | ![アップロード](docs/images/upload.png) | ![曲一覧](docs/images/web-ui.png) | ![練習プレイヤー](docs/images/player.png) |
 
-音源から特定の楽器パート(まずはギター)の stem を抽出し、練習用パッケージ(その楽器だけ / その楽器を抜いた伴奏 / 原曲 + オフラインで再生できる HTML プレイヤー)を生成するツールです。分離処理はお使いのマシン内で完結し、入力音源が外部に送信されることはありません。明示的に `bunri pocket` を実行した場合だけ、分離後の MP3 を利用者自身が所有する Pocket storage へ送信します。Web UI も localhost 内だけで動作します。
+音源から特定の楽器パート(まずはギター)の stem を抽出し、練習用パッケージ(その楽器だけ / その楽器を抜いた伴奏 / 原曲 + オフラインで再生できる HTML プレイヤー)を生成するツールです。分離処理はお使いのマシン内で完結し、入力音源が外部に送信されることはありません。分離後の MP3 が送信されるのは、利用者が CLI の `bunri pocket` または Web UI のアップロード操作を明示的に実行した場合だけで、送信先は利用者自身が所有する Pocket storage です。Web UI も localhost 内だけで動作します。
 
 ## クイックスタート
 
@@ -92,6 +92,8 @@ bunri-web -o path/to/out    # 出力先ディレクトリ(既定: out。bunri CL
 bunri-web --no-open         # 起動時のブラウザ自動オープンを無効化
 ```
 
+同じ出力先で Bunri Pocket に接続済みの場合、Web UI に「Bunri Pocket 連携中」と表示されます。曲ごとの `棚にある` / `未同期` / `差分あり` の確認と個別アップロード、出力先の全パッケージを対象にした全曲アップロードを利用できます。全曲アップロードには、Web の曲一覧にない CLI 生成パッケージも含まれます。接続先 URL や upload token は画面や API には表示されません。
+
 ### できあがるファイル(ギターの場合)
 
 曲 `song.m4a` を分離すると、`out/song/` に次のファイルができます。
@@ -169,9 +171,15 @@ bunri song.mp3 -o path/to/out               # 出力先ディレクトリ
 bunri pocket connect https://your-pocket.example -o out
 bunri pocket sync '曲名' -o out
 bunri pocket sync '曲名' -o out --no-original
+bunri pocket sync --all -o out
+bunri pocket sync --all -o out --no-original
 ```
 
 `sync` の曲名は表示名の検索語ではなく、`out/` 直下の directory 名です。`--no-original` は今回 original MP3 を新しく送らない指定であり、Pocket にある original を削除しません。upload token は `out/.pocket/config.json` に平文で保存され、接続先ごとに `-o` で分かれます。接続情報を消すには対象の `out/.pocket` を削除してください。
+
+`.bunri-package.json` のない旧パッケージは同期せず「再生成が必要」と表示します。元の入力音源から再生成してください。`out/.cache/` に同じ入力と target のキャッシュが残っていれば、分離処理は省略されます。一括同期では旧パッケージをすべて報告し、それ以外の有効なパッケージの同期を続けます。
+
+同じ出力先への Pocket 同期は CLI と Web を通じて1つずつ実行されます。別の同期が進行中の場合は待機せず拒否されます。途中で通信に失敗した一括同期はその曲で停止しますが、同期処理は冪等なので、問題を解消して同じ操作を再実行すると棚の状態へ収束します。
 
 既存の分離 input に bare file 名 `pocket` を使う場合は、Pocket command と区別するため `bunri ./pocket` と指定してください。
 

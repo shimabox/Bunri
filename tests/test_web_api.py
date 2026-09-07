@@ -81,6 +81,330 @@ def _job_status(client, job_id: str) -> str:
     return client.get(f"/api/jobs/{job_id}").json()["status"]
 
 
+def test_pocket_status_is_hidden_when_not_connected(client):
+    response = client.get("/api/pocket/status")
+    assert response.status_code == 200
+    assert response.json() == {"connected": False, "target_count": 0, "songs": []}
+    assert "Bunri Pocket 連携中" in client.get("/").text
+
+
+def test_pocket_sync_lock_conflict_returns_409_without_creating_job(client):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.lock import SyncLock
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    held = SyncLock(client.out_dir).acquire()
+    try:
+        response = client.post("/api/pocket/sync")
+    finally:
+        held.release()
+    assert response.status_code == 409
+    assert client.get("/api/jobs").json() == []
+    assert "example.invalid" not in response.text and token not in response.text
+
+
+def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, monkeypatch):
+    import base64
+    import json
+
+    import bunri.web.jobs as jobs_module
+    from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata, write_package_metadata
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.sync import SyncResult
+
+    token = base64.urlsafe_b64encode(b"secret" * 8).decode().rstrip("=")
+    save_config(client.out_dir, PocketConfig("https://example.invalid/private", token))
+    package = client.out_dir / "Song"
+    package.mkdir()
+    digest = "a" * 40
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Song",
+            "Song",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+        (package / f"Song.{suffix}").write_bytes(b"audio")
+    sync_calls = []
+    monkeypatch.setattr(
+        jobs_module,
+        "sync_one",
+        lambda *args, **kwargs: sync_calls.append((args, kwargs)) or SyncResult(),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_download_files",
+        lambda _job: pytest.fail("display downloads must not be a Pocket sync input"),
+    )
+
+    response = client.post("/api/pocket/sync/" + digest[:12])
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    _wait_until(lambda: _job_status(client, job_id) == "done")
+    detail = client.get(f"/api/jobs/{job_id}").json()
+    stored = json.loads((client.out_dir / "web" / "jobs" / f"{job_id}.json").read_text())
+    assert detail["kind"] == stored["kind"] == "pocket_single"
+    assert len(sync_calls) == 1
+    assert sync_calls[0][1]["resolution"] == "song_id"
+    assert sync_calls[0][1]["expected_digest"] == digest
+    assert sync_calls[0][1]["include_original"] is True
+    assert token not in response.text + json.dumps(detail) + json.dumps(stored)
+    assert "example.invalid" not in response.text + json.dumps(detail) + json.dumps(stored)
+
+
+def test_pocket_single_sync_resolves_song_id_before_same_named_directory(
+    client, monkeypatch
+):
+    import base64
+
+    import bunri.web.jobs as jobs_module
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.sync import SyncResult
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+
+    def make_package(name: str, digest: str) -> None:
+        package = client.out_dir / name
+        package.mkdir()
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                name,
+                name,
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",)),),
+            ),
+        )
+        for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+            (package / f"{name}.{suffix}").write_bytes(b"audio")
+
+    make_package("aaaaaaaaaaaa", "b" * 40)
+    make_package("Actual Song", "a" * 40)
+    monkeypatch.setattr(jobs_module, "sync_one", lambda *args, **kwargs: SyncResult())
+
+    response = client.post("/api/pocket/sync/" + "a" * 12)
+
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    _wait_until(lambda: _job_status(client, job_id) == "done")
+    saved = client.get(f"/api/jobs/{job_id}").json()
+    assert saved["song_id"] == "a" * 12
+    assert client.app.state.job_store.get_job(job_id).pocket_safe_name == "Actual Song"
+
+
+def test_pocket_job_tracking_never_waits_for_the_remote_inspection(tmp_path, monkeypatch):
+    """A reload must be able to resume following a batch even when the remote
+    shelf is unreachable, so the tracking route inspects nothing remote."""
+    import base64
+    import json
+
+    from bunri.pocket.config import PocketConfig, save_config
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(tmp_path, PocketConfig("https://example.invalid", token))
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    job_id = "j-pocket-finished"
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps({
+        "id": job_id,
+        "kind": "pocket_all",
+        "status": "error",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": "Pocket の同期に失敗しました。後で再実行してください。",
+        "progress": {
+            "total": 2,
+            "completed": 1,
+            "current": None,
+            "legacy": [],
+            "done": ["Done Song"],
+            "failed": ["Failed Song"],
+            "pending": [],
+        },
+        "result": {"total": 2, "completed": 1, "failed": 1, "pending": 0, "legacy": []},
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        app_module,
+        "inspect_packages",
+        lambda *_args, **_kwargs: pytest.fail("job tracking must not inspect the remote shelf"),
+    )
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        response = c.get("/api/pocket/job")
+
+    assert response.status_code == 200
+    assert response.json()["connected"] is True
+    assert response.json()["job"]["id"] == job_id
+    assert response.json()["job"]["status"] == "error"
+    assert response.json()["job"]["kind"] == "pocket_all"
+    assert token not in response.text and "example.invalid" not in response.text
+
+
+def test_queued_pocket_job_blocks_a_second_pocket_job_of_another_kind(tmp_path):
+    """A `queued` Pocket job holds no cross-process lock yet -- it takes one
+    when the worker reaches it. Letting a different kind register beside it
+    would hand that lock to whichever ran first and fail the other."""
+    import base64
+    import json
+    import threading
+
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+    from bunri.pocket.config import PocketConfig, save_config
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(tmp_path, PocketConfig("https://example.invalid", token))
+    digest = "a" * 40
+    package = tmp_path / "Song"
+    package.mkdir()
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Song",
+            "Song",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+        (package / f"Song.{suffix}").write_bytes(b"audio")
+
+    uploads_dir = tmp_path / "web" / "uploads"
+    uploads_dir.mkdir(parents=True)
+    (uploads_dir / "song.mp3").write_bytes(b"fake-audio-bytes")
+    # Recovery re-queues in created_at order, so the separation job occupies
+    # the single worker and leaves the batch waiting in the queue -- exactly
+    # the state a restart leaves behind.
+    _write_job_file(
+        tmp_path,
+        "j-separate-busy",
+        status="queued",
+        started_at=None,
+        finished_at=None,
+        package=None,
+        created_at="2026-09-05T00:00:00+00:00",
+    )
+    (tmp_path / "web" / "jobs" / "j-pocket-all.json").write_text(json.dumps({
+        "id": "j-pocket-all",
+        "kind": "pocket_all",
+        "status": "running",
+        "created_at": "2026-09-05T00:00:01+00:00",
+        "started_at": "2026-09-05T00:00:02+00:00",
+        "finished_at": None,
+        "error": None,
+        "progress": None,
+        "result": None,
+    }), encoding="utf-8")
+
+    release = threading.Event()
+    running = threading.Event()
+
+    def blocking_runner(upload_path, out_dir, title, target, log_path):
+        running.set()
+        release.wait(timeout=10)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("blocked\n", encoding="utf-8")
+        return 1
+
+    app = create_app(tmp_path, runner=blocking_runner)
+    with TestClient(app) as c:
+        try:
+            assert running.wait(timeout=5)
+            _wait_until(lambda: _job_status(c, "j-pocket-all") == "queued")
+            response = c.post("/api/pocket/sync/" + digest[:12])
+            jobs = c.get("/api/jobs").json()
+        finally:
+            release.set()
+
+    assert response.status_code == 409
+    assert token not in response.text and "example.invalid" not in response.text
+    assert sorted(job["id"] for job in jobs) == ["j-pocket-all", "j-separate-busy"]
+
+
+def test_songs_apply_batch_results_only_to_matching_packages(tmp_path, monkeypatch):
+    import json
+
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    digests = {
+        "Done Song": "1" * 40,
+        "Failed Song": "2" * 40,
+        "Pending Song": "3" * 40,
+    }
+    for index, (safe_name, digest) in enumerate(digests.items()):
+        _write_job_file(
+            tmp_path,
+            f"j-separate-{index}",
+            digest=digest,
+            title=safe_name,
+        )
+        package = tmp_path / safe_name
+        package.mkdir()
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                safe_name,
+                safe_name,
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",)),),
+            ),
+        )
+    jobs_dir = tmp_path / "web" / "jobs"
+    (jobs_dir / "j-pocket-all.json").write_text(json.dumps({
+        "id": "j-pocket-all",
+        "kind": "pocket_all",
+        "status": "error",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": "Pocket の同期に失敗しました。後で再実行してください。",
+        "progress": {
+            "total": 3,
+            "completed": 1,
+            "current": None,
+            "legacy": [],
+            "done": ["Done Song"],
+            "failed": ["Failed Song"],
+            "pending": ["Pending Song"],
+        },
+        "result": {"total": 3, "completed": 1, "failed": 1, "pending": 1, "legacy": []},
+    }), encoding="utf-8")
+    monkeypatch.setattr(app_module, "_download_files", lambda _job: [])
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        songs = {song["title"]: song for song in c.get("/api/songs").json()}
+
+    assert songs["Done Song"]["pocket_job"]["status"] == "done"
+    assert songs["Done Song"]["pocket_job"]["error"] is None
+    assert songs["Failed Song"]["pocket_job"]["status"] == "error"
+    assert songs["Pending Song"]["pocket_job"] is None
+
+
 # ---------------------------------------------------------------------------
 def test_upload_returns_202_and_job_appears_queued_or_running(client):
     res = _upload(client, title="My Song")

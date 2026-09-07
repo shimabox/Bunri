@@ -17,7 +17,7 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -106,13 +106,15 @@ _needs_browser = pytest.mark.skipif(not _HAVE_BROWSER, reason="playwright chromi
 
 
 @contextlib.contextmanager
-def _open_page(base_url: str):
+def _open_page(base_url: str, *, before_goto: Callable[[Any], None] | None = None):
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         try:
             page = browser.new_page()
+            if before_goto is not None:
+                before_goto(page)
             page.goto(base_url + "/")
             page.wait_for_function(
                 "window.__bunriWeb && typeof window.__bunriWeb.getJobs === 'function'",
@@ -134,6 +136,30 @@ def _upload_from_page(page, audio_path: Path, *, targets: tuple[str, ...] = ("gu
         else:
             checkbox.uncheck()
     page.click("#sw-upload-btn")
+
+
+def _write_pocket_all_record(
+    out_dir: Path,
+    *,
+    job_id: str,
+    status: str,
+    error: str | None,
+    progress: dict[str, Any],
+) -> None:
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    finished_at = None if status in ("queued", "running") else "2026-09-05T00:00:02+00:00"
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps({
+        "id": job_id,
+        "kind": "pocket_all",
+        "status": status,
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00" if status != "queued" else None,
+        "finished_at": finished_at,
+        "error": error,
+        "progress": progress,
+        "result": None,
+    }), encoding="utf-8")
 
 
 @_needs_browser
@@ -172,6 +198,489 @@ def test_done_job_with_empty_downloads_does_not_render_download_controls(tmp_pat
         assert target.locator(".sw-downloads").count() == 0
         assert target.locator(".sw-download-group").count() == 0
         assert target.locator("a.sw-download-link").count() == 0
+
+
+@_needs_browser
+def test_pocket_error_job_renders_failure_badge_and_safe_message(tmp_path, monkeypatch):
+    import base64
+
+    import bunri.web.app as app_module
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+    from bunri.pocket.config import PocketConfig, save_config
+
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    digest = "a" * 40
+    package = out_dir / "Song"
+    package.mkdir()
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Song",
+            "Song",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+        (package / f"Song.{suffix}").write_bytes(b"audio")
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": digest,
+        "title": "Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": None,
+        "package": "Song/Song.guitar.player.html",
+        "log": "web/logs/j-separate.log",
+        "upload": "web/uploads/song.mp3",
+    }), encoding="utf-8")
+    safe_message = "Pocket の同期に失敗しました。後で再実行してください。"
+    (jobs_dir / "j-pocket.json").write_text(json.dumps({
+        "id": "j-pocket",
+        "kind": "pocket_single",
+        "status": "error",
+        "created_at": "2026-09-05T00:00:03+00:00",
+        "started_at": "2026-09-05T00:00:04+00:00",
+        "finished_at": "2026-09-05T00:00:05+00:00",
+        "error": safe_message,
+        "pocket_song_id": digest[:12],
+        "pocket_digest": digest,
+        "pocket_safe_name": "Song",
+        "progress": None,
+        "result": None,
+    }), encoding="utf-8")
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+
+    class OfflineShelf:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_json(self, _path):
+            return None
+
+    monkeypatch.setattr(app_module, "PocketHTTPClient", OfflineShelf)
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        page.wait_for_selector(".sw-pocket-row", state="attached")
+        page.locator("button.sw-job-toggle").click()
+        badge = page.locator(".sw-pocket-row .sw-badge")
+        page.wait_for_function(
+            "document.querySelector('.sw-pocket-row .sw-badge').textContent === '失敗'"
+        )
+        assert badge.get_attribute("class").endswith("sw-badge-error")
+        assert page.locator(".sw-pocket-message").text_content() == safe_message
+
+
+@_needs_browser
+def test_pocket_connection_and_checking_render_before_status_responds(tmp_path):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": "a" * 40,
+        "title": "Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": None,
+        "package": "Song/Song.guitar.player.html",
+        "log": "web/logs/j-separate.log",
+        "upload": "web/uploads/song.mp3",
+    }), encoding="utf-8")
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+
+    def hold_status(page):
+        page.route("**/api/pocket/status", lambda _route: None)
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=hold_status
+    ) as page:
+        page.wait_for_selector("#sw-pocket-banner:not([hidden])")
+        page.wait_for_selector(".sw-pocket-row", state="attached")
+        page.locator("button.sw-job-toggle").click()
+        badge = page.locator(".sw-pocket-row .sw-badge")
+        assert badge.is_visible()
+        assert badge.text_content() == "確認中"
+
+
+@_needs_browser
+def test_separation_completion_refreshes_pocket_status_for_new_song(tmp_path):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    status_state = {"calls": 0, "web_song_id": None}
+
+    def serve_pocket_status(page):
+        def handler(route):
+            status_state["calls"] += 1
+            web_song_id = status_state["web_song_id"]
+            songs = [] if web_song_id is None else [{
+                "web_song_id": web_song_id,
+                "song_id": "a" * 12,
+                "title": "New Song",
+                "safe_name": "New Song",
+                "state": "not_synced",
+                "can_sync": True,
+                "message": None,
+                "conflict": False,
+            }]
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "target_count": len(songs),
+                    "package_count": len(songs),
+                    "songs": songs,
+                }),
+            )
+
+        page.route("**/api/pocket/status", handler)
+
+    app = create_app(out_dir, runner=PageFakeRunner(delay=1.0))
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=serve_pocket_status
+    ) as page:
+        page.wait_for_function("document.getElementById('sw-pocket-controls').hidden === false")
+        assert status_state["calls"] == 1
+
+        _upload_from_page(page, tmp_path / "new-song.mp3")
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs()[0] && "
+            "['queued', 'running'].includes(window.__bunriWeb.getJobs()[0].status)",
+            timeout=5_000,
+        )
+        status_state["web_song_id"] = page.evaluate("window.__bunriWeb.getSongs()[0].id")
+
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs()[0].status === 'done' && "
+            "document.querySelector('.sw-pocket-row .sw-badge').textContent === '未同期'",
+            timeout=10_000,
+        )
+        assert status_state["calls"] == 2
+        assert page.locator(".sw-pocket-row button").is_enabled()
+        page.wait_for_function("window.__bunriWeb.isPolling() === false", timeout=5_000)
+
+
+@_needs_browser
+def test_single_pocket_upload_button_recovers_after_409(tmp_path):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.web.jobs import song_id
+
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    digest = "b" * 40
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": digest,
+        "title": "Retry Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": None,
+        "package": "Retry Song/Retry Song.guitar.player.html",
+        "log": "web/logs/j-separate.log",
+        "upload": "web/uploads/retry.mp3",
+    }), encoding="utf-8")
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    request_state = {"posts": 0}
+
+    def mock_pocket(page):
+        page.route("**/api/pocket/status", lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "connected": True,
+                "target_count": 1,
+                "package_count": 1,
+                "songs": [{
+                    "web_song_id": song_id(digest),
+                    "song_id": digest[:12],
+                    "title": "Retry Song",
+                    "safe_name": "Retry Song",
+                    "state": "not_synced",
+                    "can_sync": True,
+                    "message": None,
+                    "conflict": False,
+                }],
+            }),
+        ))
+
+        def reject_sync(route):
+            request_state["posts"] += 1
+            route.fulfill(
+                status=409,
+                content_type="application/json",
+                body=json.dumps({"detail": "別の Pocket 同期が実行中です。"}),
+            )
+
+        page.route("**/api/pocket/sync/*", reject_sync)
+        page.on("dialog", lambda dialog: dialog.dismiss())
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_pocket
+    ) as page:
+        page.wait_for_function(
+            "document.querySelector('.sw-pocket-row button') && "
+            "!document.querySelector('.sw-pocket-row button').disabled"
+        )
+        page.locator("button.sw-job-toggle").click()
+        button = page.locator(".sw-pocket-row button")
+
+        with page.expect_request("**/api/pocket/sync/*"):
+            button.click()
+        page.wait_for_function(
+            "document.querySelector('.sw-pocket-row button') && "
+            "!document.querySelector('.sw-pocket-row button').disabled"
+        )
+        assert request_state["posts"] == 1
+
+        with page.expect_request("**/api/pocket/sync/*"):
+            button.click()
+        assert request_state["posts"] == 2
+
+
+@_needs_browser
+def test_pocket_all_failure_summary_renders_without_song_cards(tmp_path, monkeypatch):
+    import base64
+
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    safe_message = "Pocket の同期に失敗しました。後で再実行してください。"
+
+    def fail_sync_all(*_args, progress=None, **_kwargs):
+        batch = BatchResult(
+            total=3,
+            legacy=[f"Legacy Song {index}" for index in range(101)],
+            items=[
+                BatchItem("Done Song", "done"),
+                BatchItem("Failed Song", "error", error=safe_message),
+                BatchItem("Pending Song", "pending"),
+            ],
+        )
+        if progress is not None:
+            progress(batch, None)
+        return batch
+
+    monkeypatch.setattr(jobs_module, "sync_all", fail_sync_all)
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        page.wait_for_selector("#sw-pocket-controls:not([hidden])")
+        assert page.locator("li.sw-job").count() == 0
+        page.locator("#sw-pocket-all").click()
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-summary').textContent.startsWith("
+            "'全曲アップロード失敗:')",
+            timeout=10_000,
+        )
+
+        summary = page.locator("#sw-pocket-summary")
+        assert summary.is_visible()
+        assert summary.text_content() == (
+            "全曲アップロード失敗: "
+            f"{safe_message}（完了 1件 / 失敗 1件 / 未実行 1件）（再生成が必要 101件）"
+        )
+        assert summary.get_attribute("class").endswith("is-error")
+
+
+@_needs_browser
+def test_reloaded_page_resumes_running_batch_and_renders_its_result(tmp_path, monkeypatch):
+    import base64
+
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    job_id = "j-pocket-reload"
+    _write_pocket_all_record(
+        out_dir,
+        job_id=job_id,
+        status="running",
+        error=None,
+        progress={
+            "total": 2,
+            "completed": 0,
+            "current": "First Song",
+            "legacy": [],
+            "done": [],
+            "failed": [],
+            "pending": ["First Song", "Second Song"],
+        },
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def finish_sync_all(*_args, progress=None, **_kwargs):
+        started.set()
+        release.wait(timeout=10)
+        batch = BatchResult(
+            total=2,
+            items=[BatchItem("First Song", "done"), BatchItem("Second Song", "done")],
+        )
+        if progress is not None:
+            progress(batch, None)
+        return batch
+
+    monkeypatch.setattr(jobs_module, "sync_all", finish_sync_all)
+    app = create_app(out_dir, runner=PageFakeRunner())
+    assert started.wait(timeout=5)
+    try:
+        with _running_server(app) as base_url, _open_page(base_url) as page:
+            page.reload()
+            page.wait_for_function(
+                "window.__bunriWeb && window.__bunriWeb.isPolling() === true",
+                timeout=10_000,
+            )
+            release.set()
+            page.wait_for_function(
+                "document.getElementById('sw-pocket-summary').textContent === "
+                "'全曲アップロード完了: 2件'",
+                timeout=10_000,
+            )
+            assert page.locator("#sw-pocket-summary").is_visible()
+            page.wait_for_function("window.__bunriWeb.isPolling() === false", timeout=10_000)
+    finally:
+        release.set()
+
+
+@_needs_browser
+def test_reloaded_page_resumes_polling_before_the_remote_check_answers(tmp_path, monkeypatch):
+    """An unreachable shelf costs one timeout per song. The reloaded page must
+    pick a running batch back up without waiting for that."""
+    import base64
+
+    import bunri.web.app as app_module
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    _write_pocket_all_record(
+        out_dir,
+        job_id="j-pocket-slow-remote",
+        status="running",
+        error=None,
+        progress={
+            "total": 2,
+            "completed": 0,
+            "current": "First Song",
+            "legacy": [],
+            "done": [],
+            "failed": [],
+            "pending": ["First Song", "Second Song"],
+        },
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_sync_all(*_args, progress=None, **_kwargs):
+        started.set()
+        release.wait(timeout=30)
+        batch = BatchResult(
+            total=2,
+            items=[BatchItem("First Song", "done"), BatchItem("Second Song", "done")],
+        )
+        if progress is not None:
+            progress(batch, None)
+        return batch
+
+    def unreachable_inspect(*_args, **_kwargs):
+        release.wait(timeout=30)
+        return ()
+
+    monkeypatch.setattr(jobs_module, "sync_all", blocking_sync_all)
+    monkeypatch.setattr(app_module, "inspect_packages", unreachable_inspect)
+    app = create_app(out_dir, runner=PageFakeRunner())
+    assert started.wait(timeout=5)
+    try:
+        with _running_server(app) as base_url, _open_page(base_url) as page:
+            page.wait_for_function(
+                "window.__bunriWeb.isPolling() === true", timeout=5_000
+            )
+            assert page.evaluate(
+                "document.getElementById('sw-pocket-count').textContent"
+            ) == "全曲アップロード: 0/2（First Song）"
+    finally:
+        release.set()
+
+
+@_needs_browser
+def test_reloaded_preflight_failure_summary_omits_empty_counts(tmp_path):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    safe_message = "ローカルパッケージを安全に同期できません。"
+    _write_pocket_all_record(
+        out_dir,
+        job_id="j-pocket-preflight",
+        status="error",
+        error=safe_message,
+        progress={
+            "total": 0,
+            "completed": 0,
+            "current": None,
+            "legacy": [],
+            "done": [],
+            "failed": [],
+            "pending": [],
+        },
+    )
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-summary').textContent === "
+            "'全曲アップロード失敗: ローカルパッケージを安全に同期できません。'",
+            timeout=10_000,
+        )
+        summary = page.locator("#sw-pocket-summary")
+        assert summary.is_visible()
+        assert "0件" not in summary.text_content()
 
 
 @_needs_browser

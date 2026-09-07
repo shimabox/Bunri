@@ -505,6 +505,117 @@ def test_delete_song_rejects_package_shared_with_another_song(tmp_path):
     assert len(store.list_jobs()) == 2
 
 
+def test_completed_pocket_job_does_not_claim_separation_package_or_upload(tmp_path):
+    digest = "7" * 40
+    separate = _write_terminal_job(tmp_path, "j-delete", digest, "", package_dir="untitled")
+    pocket = Job(
+        id="j-pocket",
+        digest="",
+        title="",
+        target="",
+        status="done",
+        created_at="2026-09-05T00:00:00+00:00",
+        kind="pocket_single",
+        pocket_song_id=digest[:12],
+        pocket_digest=digest,
+        pocket_safe_name="untitled",
+    )
+    _write_job_file(tmp_path, pocket)
+    package = tmp_path / "untitled"
+    package.mkdir()
+    upload = tmp_path / separate.upload
+    upload.parent.mkdir(parents=True)
+    upload.write_bytes(b"source")
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    store.delete_song(song_id(digest))
+
+    assert not package.exists()
+    assert not upload.exists()
+    assert store.get_job(pocket.id) is not None
+
+
+def test_completed_pocket_job_does_not_rename_untitled_separation_job(tmp_path):
+    pocket = Job(
+        id="j-pocket",
+        digest="",
+        title="",
+        target="",
+        status="done",
+        created_at="2026-09-05T00:00:00+00:00",
+        kind="pocket_all",
+    )
+    _write_job_file(tmp_path, pocket)
+    upload = _make_upload(tmp_path)
+    store = JobStore(tmp_path, runner=FakeRunner())
+
+    job, created = store.create_job(upload, "6" * 40, "")
+
+    assert created is True
+    assert safe_filename(job.title) == "untitled"
+
+
+def test_batch_pocket_job_uses_each_package_result_for_song_status(tmp_path):
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    digests = {
+        "Done Song": "1" * 40,
+        "Failed Song": "2" * 40,
+        "Pending Song": "3" * 40,
+    }
+    for index, (safe_name, digest) in enumerate(digests.items()):
+        _write_terminal_job(tmp_path, f"j-separate-{index}", digest, safe_name)
+        package = tmp_path / safe_name
+        package.mkdir()
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                safe_name,
+                safe_name,
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",)),),
+            ),
+        )
+    batch = Job(
+        id="j-pocket-all",
+        digest="",
+        title="",
+        target="",
+        status="error",
+        created_at="2026-09-05T00:00:00+00:00",
+        finished_at="2026-09-05T00:00:01+00:00",
+        error="Pocket の同期に失敗しました。後で再実行してください。",
+        kind="pocket_all",
+        progress={
+            "total": 3,
+            "completed": 1,
+            "current": None,
+            "legacy": [],
+            "done": ["Done Song"],
+            "failed": ["Failed Song"],
+            "pending": ["Pending Song"],
+        },
+    )
+    _write_job_file(tmp_path, batch)
+    store = JobStore(tmp_path, runner=FakeRunner())
+    try:
+        done = store.latest_pocket_job(digests["Done Song"])
+        failed = store.latest_pocket_job(digests["Failed Song"])
+        pending = store.latest_pocket_job(digests["Pending Song"])
+
+        assert done is not None and done.status == "done" and done.error is None
+        assert failed is not None and failed.status == "error"
+        assert failed.error == batch.error
+        assert pending is None
+    finally:
+        store.shutdown()
+
+
 def test_delete_song_rejects_final_and_fixed_parent_symlinks(tmp_path):
     digest = "e" * 40
     _write_terminal_job(tmp_path, "j-delete", digest, "Song")

@@ -8,16 +8,24 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from bunri.package_metadata import PackageMetadata, read_package_metadata
+from bunri.package_metadata import PackageMetadata, SourceIdentity, read_package_metadata
 from bunri.pocket.protocol import AssetInfo
 from bunri.registry import REGISTRY
 from bunri.safepath import is_real_file_in
 
 
 class LocalPreflightError(ValueError):
-    def __init__(self, issues: list[str], *, kind: str = "general", metadata: PackageMetadata | None = None) -> None:
+    def __init__(
+        self,
+        issues: list[str],
+        *,
+        kind: str = "general",
+        metadata: PackageMetadata | None = None,
+        identity: SourceIdentity | None = None,
+    ) -> None:
         super().__init__("; ".join(issues))
         self.issues, self.kind, self.metadata = issues, kind, metadata
+        self.identity = identity or (metadata.source if metadata is not None else None)
 
 
 @dataclass(frozen=True)
@@ -46,6 +54,26 @@ def package_candidates(out_dir: Path) -> list[str]:
     return sorted(x.name for x in children if not x.name.startswith(".") and x.name.casefold() != "web" and not x.is_symlink() and x.is_dir())[:20]
 
 
+def all_package_names(out_dir: Path) -> list[str]:
+    """Return every real package directory in a deterministic order."""
+    try:
+        children = list(out_dir.iterdir())
+    except OSError:
+        return []
+    blocked = {"web", ".cache", ".pocket"}
+    return sorted(
+        (
+            child.name
+            for child in children
+            if not child.name.startswith(".")
+            and child.name.casefold() not in blocked
+            and not child.is_symlink()
+            and child.is_dir()
+        ),
+        key=lambda name: (name.casefold(), name),
+    )
+
+
 def _hash(path: Path) -> tuple[int, str]:
     size = 0; digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -54,10 +82,29 @@ def _hash(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def _sidecar_issues(value: object, safe_name: str) -> list[str]:
+def _source_identity(value: object) -> tuple[SourceIdentity | None, list[str]]:
+    if not isinstance(value, dict):
+        return None, ["package metadata source must be an object"]
+    digest, key = value.get("digest"), value.get("cache_key")
+    issues: list[str] = []
+    if value.get("algorithm") != "sha1":
+        issues.append("package metadata source algorithm is invalid")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{40}", digest):
+        issues.append("package metadata source digest is invalid")
+    if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{12}", key):
+        issues.append("package metadata source cache_key is invalid")
+    elif isinstance(digest, str) and key != digest[:12]:
+        issues.append("package metadata source identity is inconsistent")
+    if issues:
+        return None, issues
+    assert isinstance(digest, str) and isinstance(key, str)
+    return SourceIdentity("sha1", digest, key), []
+
+
+def _sidecar_issues(value: object, safe_name: str) -> tuple[list[str], SourceIdentity | None]:
     """Collect all metadata violations while preserving enumerable targets."""
     if not isinstance(value, dict):
-        return ["package metadata must be an object"]
+        return ["package metadata must be an object"], None
     issues: list[str] = []
     version = value.get("schema_version")
     if isinstance(version, bool) or version != 1:
@@ -67,18 +114,8 @@ def _sidecar_issues(value: object, safe_name: str) -> list[str]:
     if not isinstance(value.get("safe_name"), str) or value["safe_name"] != safe_name:
         issues.append("package metadata safe_name does not match its directory")
     source = value.get("source")
-    if not isinstance(source, dict):
-        issues.append("package metadata source must be an object")
-    else:
-        digest, key = source.get("digest"), source.get("cache_key")
-        if source.get("algorithm") != "sha1":
-            issues.append("package metadata source algorithm is invalid")
-        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{40}", digest):
-            issues.append("package metadata source digest is invalid")
-        if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{12}", key):
-            issues.append("package metadata source cache_key is invalid")
-        elif isinstance(digest, str) and key != digest[:12]:
-            issues.append("package metadata source identity is inconsistent")
+    identity, source_issues = _source_identity(source)
+    issues.extend(source_issues)
     targets = value.get("targets")
     if not isinstance(targets, list):
         issues.append("package metadata targets must be an array")
@@ -100,10 +137,16 @@ def _sidecar_issues(value: object, safe_name: str) -> list[str]:
                 or len(set(formats)) != len(formats)
             ):
                 issues.append(f"invalid formats for package target {target}")
-    return issues
+    return issues, identity
 
 
-def preflight(out_dir: Path, safe_name: str, *, include_original: bool = True) -> LocalPackage:
+def preflight(
+    out_dir: Path,
+    safe_name: str,
+    *,
+    include_original: bool = True,
+    expected_digest: str | None = None,
+) -> LocalPackage:
     validate_safe_name(safe_name)
     package_dir = out_dir / safe_name
     if package_dir.is_symlink() or not package_dir.is_dir() or package_dir.resolve().parent != out_dir.resolve():
@@ -119,7 +162,7 @@ def preflight(out_dir: Path, safe_name: str, *, include_original: bool = True) -
         raw = json.loads(sidecar.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise LocalPreflightError([f"invalid package metadata: {sidecar}"]) from exc
-    issues = _sidecar_issues(raw, safe_name)
+    issues, identity = _sidecar_issues(raw, safe_name)
     metadata: PackageMetadata | None = None
     if not issues:
         metadata = read_package_metadata(sidecar, safe_name, allow_unknown_targets=True)
@@ -127,7 +170,7 @@ def preflight(out_dir: Path, safe_name: str, *, include_original: bool = True) -
     else:
         raw_targets = raw.get("targets") if isinstance(raw, dict) else None
         if not isinstance(raw_targets, list):
-            raise LocalPreflightError(issues)
+            raise LocalPreflightError(issues, identity=identity)
         target_values = []
         for item in raw_targets:
             if not isinstance(item, dict) or not isinstance(item.get("target"), str):
@@ -154,6 +197,17 @@ def preflight(out_dir: Path, safe_name: str, *, include_original: bool = True) -
         assets.append(LocalAsset(AssetInfo(remote, size, checksum, target, role), path))
     if issues:
         no_mp3 = any("formats に mp3" in issue for issue in issues)
-        raise LocalPreflightError(issues, kind="no_mp3" if no_mp3 else "general", metadata=metadata)
+        raise LocalPreflightError(
+            issues,
+            kind="no_mp3" if no_mp3 else "general",
+            metadata=metadata,
+            identity=identity,
+        )
     assert metadata is not None
+    if expected_digest is not None and metadata.source.digest != expected_digest:
+        raise LocalPreflightError(
+            ["package metadata source digest no longer matches the selected song"],
+            kind="identity",
+            metadata=metadata,
+        )
     return LocalPackage(package_dir, metadata, tuple(assets))

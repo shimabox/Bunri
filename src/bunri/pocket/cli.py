@@ -5,14 +5,15 @@ from __future__ import annotations
 import shlex
 import sys
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
 
 from bunri.pocket.config import PocketConfig, read_config, save_config, validate_base_url, validate_capabilities, validate_token
 from bunri.pocket.http import PocketHTTPClient
-from bunri.pocket.local import LocalPreflightError, preflight
-from bunri.pocket.sync import SyncError, synchronize
+from bunri.pocket.lock import SyncLock, SyncLockBusy
+from bunri.pocket.service import PocketServiceError, safe_error, sync_all, sync_one
 
 app = typer.Typer(add_completion=False, rich_markup_mode="rich")
 console = Console()
@@ -47,35 +48,63 @@ def connect(
 
 @app.command()
 def sync(
-    safe_name: str = typer.Argument(..., metavar="SAFE_NAME"),
+    safe_name: Optional[str] = typer.Argument(None, metavar="SAFE_NAME"),
     output: Path = typer.Option(Path("out"), "--output", "-o", help="Output directory"),
     original: bool = typer.Option(True, "--original/--no-original", help="Upload original MP3"),
+    all_packages: bool = typer.Option(False, "--all", help="Synchronize every package"),
 ) -> None:
     out = output
+    if (safe_name is None) == (not all_packages):
+        _fail("SAFE_NAME と --all のどちらか一方だけを指定してください。")
     try: config = read_config(out)
     except (OSError, ValueError) as exc: _fail(str(exc))
     if config is None:
         _fail("Pocket の接続設定がありません。アップロードは開始していません。\n先に接続してください:\n  bunri pocket connect <Pocket URL> -o " + shlex.quote(str(output)))
-    try: package = preflight(out, safe_name, include_original=original)
-    except LocalPreflightError as exc:
+    try:
+        lock = SyncLock(out).acquire()
+    except (OSError, SyncLockBusy) as exc:
+        _fail(safe_error(exc))
+    try:
+        if all_packages:
+            batch = sync_all(out, include_original=original, lock=lock)
+            for name in batch.legacy:
+                console.print(f"[yellow]再生成が必要:[/yellow] {name}")
+            for item in batch.items:
+                if item.status == "done":
+                    console.print(f"[green]完了:[/green] {item.safe_name}")
+                elif item.status == "error":
+                    console.print(f"[red]失敗:[/red] {item.safe_name}: {item.error}")
+                else:
+                    console.print(f"未実行: {item.safe_name}")
+            console.print(
+                f"集計: 完了={batch.completed} 失敗={batch.failed} "
+                f"未実行={batch.pending} 再生成が必要={len(batch.legacy)}"
+            )
+            if batch.legacy:
+                console.print("旧パッケージは元の入力音源から再生成してください。キャッシュが残っていれば分離処理は省略されます。")
+            if batch.failed:
+                raise typer.Exit(1)
+            return
+        assert safe_name is not None
+        result = sync_one(
+            out,
+            safe_name,
+            resolution="safe_name",
+            include_original=original,
+            lock=lock,
+        )
+    except PocketServiceError as exc:
+        if all_packages and exc.legacy:
+            for name in exc.legacy:
+                console.print(f"[yellow]再生成が必要:[/yellow] {name}")
+            console.print("旧パッケージは元の入力音源から再生成してください。キャッシュが残っていれば分離処理は省略されます。")
         if exc.kind == "legacy":
-            command = shlex.join(["bunri", "/path/to/original.mp3", "-o", str(output), "--title", safe_name]) + " --target <target>"
-            _fail("Pocket 同期情報のない旧パッケージが見つかりました。アップロードは開始していません。\n- " + "\n- ".join(exc.issues) + f"\n\n元の入力音源からパッケージを再生成してください:\n  {command}\n\n{output}/.cache/ に同じ入力と target の分離キャッシュが残っていれば、分離処理は再実行されません。\nサイドカーを手作業で作成したり、Web の Job JSON から値を移さないでください。")
-        if exc.kind == "no_mp3" and exc.metadata is not None:
-            target = next((x.target for x in exc.metadata.targets if "mp3" not in x.formats), "<target>")
-            command = shlex.join(["bunri", "/path/to/original.mp3", "-o", str(output), "--title", exc.metadata.title, "--target", target, "--mp3"])
-            _fail("MP3 のない target があるため Pocket と同期できません。アップロードは開始していません。\n- " + "\n- ".join(exc.issues) + f"\n\n元の入力音源から MP3 を有効にして対象 target を再生成してください:\n  {command}")
-        _fail("パッケージを安全に同期できません。アップロードは開始していません。\n- " + "\n- ".join(exc.issues))
-    client = PocketHTTPClient(config.base_url, config.token)
-    try: result = synchronize(package, client, include_original=original)
-    except SyncError as exc:
-        if str(exc).startswith("DIGEST_COLLISION:"):
-            remote_digest = str(exc).split(":", 1)[1]
-            _fail(f"同じ12桁の song ID に別の入力音源が登録されています。アップロードは開始していません。\nsong_id: {package.metadata.source.cache_key}\nlocal digest: {package.metadata.source.digest}\nremote digest: {remote_digest}")
-        if str(exc).startswith("RACE_DIGEST_COLLISION:"):
-            _fail("同期中に同じ12桁の song ID へ別の入力音源が登録されました。\nmanifest と library は更新していません。preflight 後に media を上書きした可能性があります。棚の状態を確認してから再実行してください。")
+            _fail("Pocket 同期情報のない旧パッケージです。元の入力音源から再生成してください。キャッシュが残っていれば分離処理は省略されます。")
         _fail(str(exc))
-    except (OSError, RuntimeError, ValueError) as exc: _fail(str(exc))
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(safe_error(exc))
+    finally:
+        lock.release()
     console.print(f"Pocket 同期が完了しました: {config.base_url}")
     console.print(f"media: uploaded={result.media_uploaded} skipped={result.media_skipped}")
     console.print(f"manifest: updated={result.manifest_updated} skipped={result.manifest_skipped}")

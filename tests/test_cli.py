@@ -80,6 +80,77 @@ def test_pocket_sync_without_config_does_not_create_http_client(tmp_path, monkey
     assert result.exit_code == 1
     assert "Pocket の接続設定がありません" in _plain(result.output)
 
+
+def test_pocket_sync_resolves_its_argument_only_as_a_safe_name(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+    from bunri.pocket.sync import SyncResult
+
+    calls = []
+    monkeypatch.setattr(
+        pocket_cli,
+        "read_config",
+        lambda _out: PocketConfig("https://example.invalid", "unused-token"),
+    )
+    monkeypatch.setattr(
+        pocket_cli,
+        "sync_one",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or SyncResult(),
+    )
+
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["sync", "aaaaaaaaaaaa", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][0][1] == "aaaaaaaaaaaa"
+    assert calls[0][1]["resolution"] == "safe_name"
+
+
+@pytest.mark.parametrize("arguments", [[], ["Song", "--all"]])
+def test_pocket_sync_requires_exactly_one_selector(arguments):
+    from bunri.pocket.cli import app as pocket_app
+
+    result = CliRunner().invoke(pocket_app, ["sync", *arguments], env=_STABLE_TERMINAL)
+    assert result.exit_code == 1
+    assert "SAFE_NAME と --all のどちらか一方" in _plain(result.output)
+
+
+def test_pocket_sync_all_reports_every_legacy_package_on_local_validation_error(
+    tmp_path, monkeypatch
+):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+    from bunri.pocket.service import PocketServiceError
+
+    monkeypatch.setattr(
+        pocket_cli,
+        "read_config",
+        lambda _out: PocketConfig("https://example.invalid", "unused-token"),
+    )
+
+    def fail_sync_all(*_args, **_kwargs):
+        raise PocketServiceError(
+            "ローカル検証に失敗しました。",
+            kind="local",
+            legacy=("Old One", "Old Two"),
+        )
+
+    monkeypatch.setattr(pocket_cli, "sync_all", fail_sync_all)
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["sync", "--all", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+
+    output = _plain(result.output)
+    assert result.exit_code == 1
+    assert "再生成が必要: Old One" in output
+    assert "再生成が必要: Old Two" in output
+    assert "ローカル検証に失敗しました。" in output
+
 runner = CliRunner()
 
 # Typer renders help and errors through rich, which adapts to whatever
