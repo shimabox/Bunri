@@ -881,6 +881,15 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
                 return f"{kind} has an invalid source digest"
             if not isinstance(data.get("pocket_safe_name"), str) or not data["pocket_safe_name"]:
                 return f"{kind} has an invalid package name"
+            if _safe_package_segment(data["pocket_safe_name"]) is not None:
+                return f"{kind} has an unsafe package name"
+        if kind == "pocket_delete":
+            result = data.get("result")
+            if not isinstance(result, dict) or any(
+                type(result.get(name)) is not bool
+                for name in ("pocket_deleted", "local_deleted")
+            ):
+                return "pocket_delete has an invalid result"
         for name in _OPTIONAL_DATETIME_FIELDS:
             value = data.get(name)
             if value is not None and (not isinstance(value, str) or _datetime_problem(value, name) is not None):
@@ -2208,10 +2217,28 @@ class JobStore:
                 self._pocket_locks[job.id] = sync_lock
             if job.kind == "pocket_delete":
                 assert job.pocket_song_id is not None and job.pocket_digest is not None
+                safe_name = job.pocket_safe_name
+                remote_delete_was_confirmed = (
+                    isinstance(job.result, dict)
+                    and job.result.get("pocket_deleted") is True
+                )
+                if remote_delete_was_confirmed and safe_name is not None:
+                    package_dir = self.out_dir / safe_name
+                    sidecar = package_dir / ".bunri-package.json"
+                    package_dir_exists = package_dir.exists() or package_dir.is_symlink()
+                    sidecar_exists = sidecar.exists() or sidecar.is_symlink()
+                    if not package_dir_exists or not sidecar_exists:
+                        # The remote 204 was saved before local deletion began.
+                        # A missing package or sidecar is therefore progress
+                        # from that deletion, not evidence that an unverified
+                        # target may be sent to Pocket.  Keep reissuing the
+                        # idempotent DELETE, then let delete_song remove the
+                        # remaining job records and artifacts.
+                        safe_name = None
                 target = DeleteTargetIdentity(
                     song_id=job.pocket_song_id,
                     digest=job.pocket_digest,
-                    safe_name=job.pocket_safe_name,
+                    safe_name=safe_name,
                 )
                 delete_track(self.out_dir, target, lock=sync_lock)
                 job.result = {"pocket_deleted": True, "local_deleted": False}

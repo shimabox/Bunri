@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import base64
 import json
+import shutil
 import threading
 import time
 
 import pytest
 
+from bunri.package_metadata import (
+    PackageMetadata,
+    SourceIdentity,
+    TargetMetadata,
+    write_package_metadata,
+)
+from bunri.pocket.config import PocketConfig, save_config
 from bunri.pocket.lock import SyncLock, SyncLockBusy
-from bunri.pocket.service import PocketServiceError
+from bunri.pocket.service import DeleteTargetIdentity, PocketServiceError
 from bunri.pocket.sync import SyncResult
-from bunri.web.jobs import JobStore, SongNotFoundError
+from bunri.web.jobs import Job, JobStore, SongNotFoundError
 
 
 def wait_for(predicate, timeout: float = 5.0) -> None:
@@ -19,6 +28,63 @@ def wait_for(predicate, timeout: float = 5.0) -> None:
             return
         time.sleep(0.01)
     assert predicate()
+
+
+def write_job(out_dir, job: Job) -> None:
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    (jobs_dir / f"{job.id}.json").write_text(
+        json.dumps(job.to_dict()), encoding="utf-8"
+    )
+
+
+def make_local_song(out_dir, *, digest: str = "a" * 40) -> Job:
+    package = out_dir / "Song"
+    package.mkdir(parents=True)
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Song",
+            "Song",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+        (package / f"Song.{suffix}").write_bytes(b"audio")
+    job = Job(
+        id="j-local-song",
+        digest=digest,
+        title="Song",
+        target="guitar",
+        status="done",
+        created_at="2026-09-07T00:00:00+00:00",
+        finished_at="2026-09-07T00:00:01+00:00",
+        package="Song/Song.guitar.player.html",
+        log="web/logs/j-local-song.log",
+        upload="web/uploads/song.mp3",
+    )
+    write_job(out_dir, job)
+    return job
+
+
+def make_recoverable_delete(out_dir, *, pocket_deleted: bool) -> Job:
+    job = Job(
+        id="j-pocket-delete-recovery",
+        digest="",
+        title="",
+        target="",
+        status="running",
+        created_at="2026-09-07T00:00:02+00:00",
+        started_at="2026-09-07T00:00:03+00:00",
+        kind="pocket_delete",
+        pocket_song_id="a" * 12,
+        pocket_digest="a" * 40,
+        pocket_safe_name="Song",
+        result={"pocket_deleted": pocket_deleted, "local_deleted": False},
+    )
+    write_job(out_dir, job)
+    return job
 
 
 def test_pocket_job_uses_direct_service_and_omits_separation_fields(tmp_path, monkeypatch):
@@ -153,6 +219,76 @@ def test_pocket_delete_missing_local_song_after_remote_204_is_idempotent_success
         finished = store.get_job(job.id)
         assert finished.result == {"pocket_deleted": True, "local_deleted": True}
         assert finished.error is None
+    finally:
+        store.shutdown()
+
+
+@pytest.mark.parametrize("missing", ["package_directory", "sidecar"])
+def test_recovered_pocket_delete_finishes_partial_local_deletion(
+    tmp_path, monkeypatch, missing
+):
+    import bunri.web.jobs as jobs_module
+
+    local_job = make_local_song(tmp_path)
+    delete_job = make_recoverable_delete(tmp_path, pocket_deleted=True)
+    package = tmp_path / "Song"
+    if missing == "package_directory":
+        shutil.rmtree(package)
+    else:
+        (package / ".bunri-package.json").unlink()
+
+    remote_targets = []
+    monkeypatch.setattr(
+        jobs_module,
+        "delete_track",
+        lambda _out_dir, target, **_kwargs: remote_targets.append(target),
+    )
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        wait_for(lambda: store.get_job(delete_job.id).status == "done")
+
+        assert remote_targets == [
+            DeleteTargetIdentity(
+                song_id="a" * 12,
+                digest="a" * 40,
+                safe_name=None,
+            )
+        ]
+        assert not package.exists()
+        assert store.get_job(local_job.id) is None
+        assert not (tmp_path / "web" / "jobs" / f"{local_job.id}.json").exists()
+        assert store.get_job(delete_job.id).result == {
+            "pocket_deleted": True,
+            "local_deleted": True,
+        }
+    finally:
+        store.shutdown()
+
+
+def test_recovered_pocket_delete_still_rejects_tampering_before_remote_204(tmp_path):
+    local_job = make_local_song(tmp_path)
+    delete_job = make_recoverable_delete(tmp_path, pocket_deleted=False)
+    write_package_metadata(
+        tmp_path / "Song" / ".bunri-package.json",
+        PackageMetadata(
+            "Song",
+            "Song",
+            SourceIdentity("sha1", "b" * 40, "b" * 12),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(tmp_path, PocketConfig("https://example.invalid", token))
+
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        wait_for(lambda: store.get_job(delete_job.id).status == "error")
+
+        failed = store.get_job(delete_job.id)
+        assert failed.result == {"pocket_deleted": False, "local_deleted": False}
+        assert "identity" in failed.error
+        assert store.get_job(local_job.id) is not None
+        assert (tmp_path / "Song").is_dir()
     finally:
         store.shutdown()
 
