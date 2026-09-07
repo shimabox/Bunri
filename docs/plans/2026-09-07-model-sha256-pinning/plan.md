@@ -211,4 +211,3 @@ vocals ckpt は `MODEL_LICENSES.md` の既存記載値と一致し、htdemucs �
 | 検証コスト | vocals ckpt は約871 MB で、分離実行ごとに全体を読む | 完全性を優先して streaming hash を維持する。package cache hit 時は分離自体が走らない |
 | 既存キャッシュ | 古い・途中取得・改変ファイルは初回利用時に削除される | 意図した移行挙動とし、README に再実行で再取得される旨を記載する |
 | primary URL 廃止 | SHA-256 が正しくても取得 URL は消える可能性があり、TRvlvr の vocals URL は既に廃止例となった | 同一 SHA-256 を確認済みの mirror だけを追加可能とし、未確認 mirror へ自動切替しない |
-
