@@ -58,6 +58,7 @@ from bunri.pocket.service import (
     DeleteTargetIdentity,
     PocketServiceError,
     delete_track,
+    safe_delete_error,
     safe_error,
     sync_all,
     sync_one,
@@ -1415,8 +1416,8 @@ class JobStore:
                 recovered_lock = SyncLock(self.out_dir).acquire()
             except SyncLockBusy:
                 # An external sync was already active when the server started.
-                # Keep this job queued and let the worker retry once, without
-                # blocking startup or spinning on the lock.
+                # Keep this job queued; the worker retries at a bounded cadence
+                # without blocking startup or spinning on the lock.
                 pass
             else:
                 # Match newly registered Pocket jobs: once admitted to the
@@ -1670,20 +1671,26 @@ class JobStore:
         last so a failed partial deletion remains visible and retryable.
         """
         with self._lock:
-            active_pocket = [
-                job for job in self._jobs.values()
-                if job.kind != "separate"
-                and job.id != exclude_pocket_job_id
-                and job.status in ("queued", "running")
-            ]
-            if active_pocket:
-                raise SongDeleteConflict("Pocket sync is queued or running")
             targets = [
                 job for job in self._jobs.values()
                 if job.kind == "separate" and song_id(job.digest) == requested_song_id
             ]
             if not targets:
                 raise SongNotFoundError(requested_song_id)
+            target_digests = {job.digest for job in targets}
+            if any(
+                job.id != exclude_pocket_job_id
+                and job.status in ("queued", "running")
+                and (
+                    job.kind == "pocket_all"
+                    or (
+                        job.kind in ("pocket_single", "pocket_delete")
+                        and job.pocket_digest in target_digests
+                    )
+                )
+                for job in self._jobs.values()
+            ):
+                raise SongDeleteConflict("Pocket sync is queued or running for this song")
             if any(job.status in ("queued", "running") for job in targets):
                 raise SongDeleteConflict("song has queued or running jobs")
 
@@ -2184,7 +2191,20 @@ class JobStore:
         sync_lock = self._pocket_locks.get(job.id)
         try:
             if sync_lock is None:
-                sync_lock = SyncLock(self.out_dir).acquire()
+                try:
+                    sync_lock = SyncLock(self.out_dir).acquire()
+                except SyncLockBusy:
+                    # A recovered job can reach the worker before the external
+                    # operation that held the lock at startup has finished.
+                    # Keep it recoverable and retry at a bounded cadence.
+                    with self._lock:
+                        job.status = "queued"
+                        job.started_at = None
+                        job.finished_at = None
+                        self._write_job(job)
+                    if not self._stopping.wait(0.2):
+                        self._queue.put(job.id)
+                    return
                 self._pocket_locks[job.id] = sync_lock
             if job.kind == "pocket_delete":
                 assert job.pocket_song_id is not None and job.pocket_digest is not None
@@ -2199,6 +2219,10 @@ class JobStore:
                     self._write_job(job)
                 try:
                     self.delete_song(song_id(job.pocket_digest), exclude_pocket_job_id=job.id)
+                except SongNotFoundError:
+                    # A crash after local deletion but before the completed
+                    # result was saved is an idempotent success on recovery.
+                    pass
                 except Exception:
                     with self._lock:
                         job.status = "error"
@@ -2286,7 +2310,7 @@ class JobStore:
                                 "同じ操作を再実行できます。"
                             )
                         else:
-                            job.error = safe_error(exc)
+                            job.error = safe_delete_error(exc)
                     else:
                         job.error = safe_error(exc)
                     job.finished_at = _now_iso()

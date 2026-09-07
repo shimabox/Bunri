@@ -32,6 +32,7 @@ from bunri.pocket.service import (
     inspect_packages,
     list_library_tracks,
     resolve_package,
+    safe_delete_error,
     safe_error,
 )
 from bunri.web.jobs import (
@@ -581,11 +582,11 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                 )
             except PocketServiceError as exc:
                 status = 404 if exc.kind == "not_found" else 409
-                raise HTTPException(status_code=status, detail=safe_error(exc))
+                raise HTTPException(status_code=status, detail=safe_delete_error(exc))
             try:
                 mutation_lock = SyncLock(out_dir).acquire()
             except (OSError, SyncLockBusy) as exc:
-                raise HTTPException(status_code=409, detail=safe_error(exc))
+                raise HTTPException(status_code=409, detail=safe_delete_error(exc))
             try:
                 job = store.create_pocket_delete_job(
                     song_id=package.metadata.source.cache_key,
@@ -594,7 +595,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                     sync_lock=mutation_lock,
                 )
             except SyncLockBusy as exc:
-                raise HTTPException(status_code=409, detail=safe_error(exc))
+                raise HTTPException(status_code=409, detail=safe_delete_error(exc))
             except BaseException:
                 mutation_lock.release()
                 raise

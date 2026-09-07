@@ -827,6 +827,34 @@ def test_delete_song_returns_204_and_removes_it_from_both_lists(client):
     assert client.delete(f"/api/songs/{song_id}").status_code == 404
 
 
+def test_delete_song_returns_204_while_unrelated_pocket_single_is_active(client):
+    from bunri.web.jobs import Job
+
+    created = _upload(client, title="Delete while syncing another song")
+    _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+    web_song_id = client.get("/api/songs").json()[0]["id"]
+    unrelated = Job(
+        id="j-unrelated-pocket-single",
+        digest="",
+        title="",
+        target="",
+        status="running",
+        created_at="2026-09-07T00:00:00+00:00",
+        kind="pocket_single",
+        pocket_song_id="b" * 12,
+        pocket_digest="b" * 40,
+        pocket_safe_name="Other",
+    )
+    store = client.app.state.job_store
+    with store._lock:
+        store._jobs[unrelated.id] = unrelated
+
+    deleted = client.delete(f"/api/songs/{web_song_id}")
+
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+
+
 def test_delete_song_with_pocket_flag_returns_202_and_uses_server_side_identity(client, monkeypatch):
     import base64
     import bunri.web.jobs as jobs_module

@@ -24,6 +24,7 @@ from bunri.pocket.service import (
     list_library_tracks,
     resolve_package,
     resolve_delete_target,
+    safe_delete_error,
     safe_error,
     sync_all,
 )
@@ -414,7 +415,20 @@ def test_delete_503_is_safe_retryable_and_lock_is_released(tmp_path):
 
     with pytest.raises(PocketHTTPError) as caught:
         delete_track(tmp_path, DeleteTargetIdentity("abcdef123456"), client=Client())
-    message = safe_error(caught.value)
+    message = safe_delete_error(caught.value)
     assert "同じ song ID" in message
     assert "secret" not in message
     SyncLock(tmp_path).acquire().release()
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (503, "Pocket を利用できません。後で再実行してください。"),
+        (422, "Pocket との通信に失敗しました。後で再実行してください。"),
+    ],
+)
+def test_sync_safe_error_keeps_existing_http_wording(status, expected):
+    error = PocketHTTPError(status, "PRIVATE", "https://secret.invalid/token")
+
+    assert safe_error(error) == expected

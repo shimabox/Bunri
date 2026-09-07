@@ -642,8 +642,8 @@ def test_delete_song_rejects_final_and_fixed_parent_symlinks(tmp_path):
     assert (saved_jobs / "j-delete.json").exists()
 
 
-def test_delete_song_excludes_only_its_own_active_pocket_delete(tmp_path):
-    from bunri.web.jobs import Job, JobStore, SongDeleteConflict, SongNotFoundError
+def test_delete_song_excludes_own_delete_and_ignores_unrelated_single_sync(tmp_path):
+    from bunri.web.jobs import Job, JobStore, SongNotFoundError
 
     store = JobStore(tmp_path, runner=lambda *args: 1)
     own = Job(
@@ -675,8 +675,34 @@ def test_delete_song_excludes_only_its_own_active_pocket_delete(tmp_path):
         with pytest.raises(SongNotFoundError):
             store.delete_song(song_id("a" * 40), exclude_pocket_job_id=own.id)
         store._jobs[other.id] = other
-        with pytest.raises(SongDeleteConflict):
+        with pytest.raises(SongNotFoundError):
             store.delete_song(song_id("a" * 40), exclude_pocket_job_id=own.id)
+    finally:
+        store.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["pocket_single", "pocket_delete", "pocket_all"])
+def test_delete_song_rejects_related_or_global_active_pocket_job(tmp_path, kind):
+    digest = "a" * 40
+    _write_terminal_job(tmp_path, "j-local", digest, "Song")
+    pocket = Job(
+        id="j-active-pocket",
+        digest="",
+        title="",
+        target="",
+        status="running",
+        created_at="2026-09-07T00:00:00+00:00",
+        kind=kind,
+        pocket_song_id=digest[:12] if kind != "pocket_all" else None,
+        pocket_digest=digest if kind != "pocket_all" else None,
+        pocket_safe_name="Song" if kind != "pocket_all" else None,
+    )
+    store = JobStore(tmp_path, runner=lambda *args: 1)
+    try:
+        store._jobs[pocket.id] = pocket
+        with pytest.raises(SongDeleteConflict):
+            store.delete_song(song_id(digest))
+        assert store.get_job("j-local") is not None
     finally:
         store.shutdown()
 

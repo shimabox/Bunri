@@ -9,7 +9,7 @@ import pytest
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.service import PocketServiceError
 from bunri.pocket.sync import SyncResult
-from bunri.web.jobs import JobStore
+from bunri.web.jobs import JobStore, SongNotFoundError
 
 
 def wait_for(predicate, timeout: float = 5.0) -> None:
@@ -127,6 +127,79 @@ def test_pocket_delete_local_failure_records_partial_success(tmp_path, monkeypat
         assert "棚からは削除済み" in failed.error
         assert "private path" not in failed.error
     finally:
+        store.shutdown()
+
+
+def test_pocket_delete_missing_local_song_after_remote_204_is_idempotent_success(
+    tmp_path, monkeypatch
+):
+    import bunri.web.jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module, "delete_track", lambda *_args, **_kwargs: None)
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    monkeypatch.setattr(
+        store,
+        "delete_song",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SongNotFoundError("already deleted")),
+    )
+    try:
+        job = store.create_pocket_delete_job(
+            song_id="a" * 12,
+            digest="a" * 40,
+            safe_name="Song",
+            sync_lock=SyncLock(tmp_path).acquire(),
+        )
+        wait_for(lambda: store.get_job(job.id).status == "done")
+        finished = store.get_job(job.id)
+        assert finished.result == {"pocket_deleted": True, "local_deleted": True}
+        assert finished.error is None
+    finally:
+        store.shutdown()
+
+
+def test_recovered_pocket_delete_waits_for_busy_lock_then_succeeds(tmp_path, monkeypatch):
+    import bunri.web.jobs as jobs_module
+
+    jobs_dir = tmp_path / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    job_id = "j-pocket-delete-recovery"
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps({
+        "id": job_id,
+        "kind": "pocket_delete",
+        "status": "running",
+        "created_at": "2026-09-07T00:00:00+00:00",
+        "started_at": "2026-09-07T00:00:01+00:00",
+        "finished_at": None,
+        "error": None,
+        "pocket_song_id": "a" * 12,
+        "pocket_digest": "a" * 40,
+        "pocket_safe_name": "Song",
+        "progress": None,
+        "result": {"pocket_deleted": True, "local_deleted": False},
+    }))
+    held = SyncLock(tmp_path).acquire()
+    remote_called = threading.Event()
+    monkeypatch.setattr(
+        jobs_module,
+        "delete_track",
+        lambda *_args, **_kwargs: remote_called.set(),
+    )
+    monkeypatch.setattr(JobStore, "delete_song", lambda *_args, **_kwargs: None)
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        wait_for(lambda: store.get_job(job_id).status == "queued")
+        assert not remote_called.wait(timeout=0.3)
+        assert store.get_job(job_id).error is None
+
+        held.release()
+        wait_for(lambda: store.get_job(job_id).status == "done")
+        assert remote_called.is_set()
+        assert store.get_job(job_id).result == {
+            "pocket_deleted": True,
+            "local_deleted": True,
+        }
+    finally:
+        held.release()
         store.shutdown()
 
 

@@ -458,6 +458,37 @@ def delete_track(
 
 def safe_error(exc: BaseException) -> str:
     if isinstance(exc, SyncLockBusy):
+        return "別の Pocket 同期が実行中です。完了後に再実行してください。"
+    if isinstance(exc, PocketHTTPError):
+        messages = {
+            401: "Pocket の認証に失敗しました。接続設定を更新してください。",
+            409: "Pocket と Bunri のデータ形式に互換性がありません。",
+            413: "送信するデータが Pocket の上限を超えています。",
+            429: "Pocket が要求を制限しました。後で再実行してください。",
+            503: "Pocket を利用できません。後で再実行してください。",
+        }
+        return messages.get(exc.status, "Pocket との通信に失敗しました。後で再実行してください。")
+    if isinstance(exc, SyncError):
+        if str(exc).startswith(("DIGEST_COLLISION:", "RACE_DIGEST_COLLISION:")):
+            return "同じ song ID に別の入力音源があるため同期できません。"
+        return "Pocket の同期に失敗しました。棚の状態を確認して再実行してください。"
+    if isinstance(exc, PocketServiceError):
+        messages = {
+            "not_connected": "Pocket の接続設定がありません。",
+            "legacy": "このパッケージは再生成が必要です。",
+            "not_found": "同期する曲が見つかりません。",
+            "conflict": "曲の identity が競合しているためアップロードできません。",
+            "local": "ローカルパッケージを安全に同期できません。",
+        }
+        return messages.get(exc.kind, "Pocket の同期を開始できません。")
+    if isinstance(exc, LocalPreflightError):
+        return "ローカルパッケージを安全に同期できません。"
+    return "Pocket の同期に失敗しました。後で再実行してください。"
+
+
+def safe_delete_error(exc: BaseException) -> str:
+    """Return a secret-free error message for a shelf deletion."""
+    if isinstance(exc, SyncLockBusy):
         return "別の Pocket 操作が実行中です。完了後に再実行してください。"
     if isinstance(exc, PocketHTTPError):
         messages = {
@@ -473,25 +504,21 @@ def safe_error(exc: BaseException) -> str:
                 f" Retry-After: {exc.retry_after}" if exc.retry_after else ""
             )
         return messages.get(exc.status, "Pocket との通信に失敗しました。後で再実行してください。")
-    if isinstance(exc, SyncError):
-        if str(exc).startswith(("DIGEST_COLLISION:", "RACE_DIGEST_COLLISION:")):
-            return "同じ song ID に別の入力音源があるため同期できません。"
-        return "Pocket の同期に失敗しました。棚の状態を確認して再実行してください。"
     if isinstance(exc, PocketServiceError):
         messages = {
             "not_connected": "Pocket の接続設定がありません。",
             "legacy": "このパッケージは再生成が必要です。",
-            "not_found": "同期する曲が見つかりません。",
-            "conflict": "曲の identity が競合しているためアップロードできません。",
-            "local": "ローカルパッケージを安全に同期できません。",
+            "not_found": "削除する曲が見つかりません。",
+            "conflict": "曲の identity が競合しているため削除できません。",
+            "local": "ローカルパッケージを安全に確認できません。",
             "remote_invalid": "棚の library が破損しています。棚の内容は変更されていません。",
             "invalid_song_id": "song ID は小文字16進12桁で指定してください。",
             "delete_unknown": "棚からの削除を確認できませんでした。同じ song ID で再実行できます。",
         }
-        return messages.get(exc.kind, "Pocket の同期を開始できません。")
+        return messages.get(exc.kind, "Pocket の削除を開始できません。")
     if isinstance(exc, LocalPreflightError):
-        return "ローカルパッケージを安全に同期できません。"
-    return "Pocket の同期に失敗しました。後で再実行してください。"
+        return "ローカルパッケージを安全に確認できません。"
+    return "Pocket の削除に失敗しました。後で再実行してください。"
 
 
 def sync_one(

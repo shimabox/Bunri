@@ -20,6 +20,7 @@ from bunri.pocket.service import (
     delete_track,
     list_library_tracks,
     resolve_delete_target,
+    safe_delete_error,
     safe_error,
     sync_all,
     sync_one,
@@ -169,7 +170,7 @@ def delete_command(
             selected = tracks[choice - 1]
             target = DeleteTargetIdentity(song_id=selected.song_id, title=selected.title)
     except (PocketServiceError, OSError, RuntimeError, ValueError) as exc:
-        message = safe_error(exc)
+        message = safe_delete_error(exc)
         if safe_name is not None:
             message += " --song-id または --select で対象を指定できます。"
         _fail(message)
@@ -190,11 +191,11 @@ def delete_command(
     try:
         mutation_lock = SyncLock(output).acquire()
     except (OSError, SyncLockBusy) as exc:
-        _fail(safe_error(exc))
+        _fail(safe_delete_error(exc))
     try:
         result = delete_track(output, target, lock=mutation_lock)
     except (PocketServiceError, OSError, RuntimeError, ValueError) as exc:
-        _fail(safe_error(exc))
+        _fail(safe_delete_error(exc))
     finally:
         mutation_lock.release()
     console.print(f"棚から削除しました: {result.song_id}")
