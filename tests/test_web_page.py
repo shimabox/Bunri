@@ -1351,3 +1351,115 @@ def test_local_only_delete_refreshes_remote_only_tracks(tmp_path):
         assert page.locator(".sw-remote-only-item span").first.text_content() == "Shelf Song"
         assert page.locator(".sw-remote-only-id").text_content() == pocket_song_id
         assert status_state["calls"] == 3
+
+
+@_needs_browser
+def test_local_delete_ignores_older_pocket_status_response(tmp_path, monkeypatch):
+    import base64
+
+    import bunri.web.app as app_module
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import LibraryTrack, PackageStatus, RemoteStatus
+
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    digest = "a" * 40
+    pocket_song_id = digest[:12]
+    package = out_dir / "Shelf Song"
+    package.mkdir()
+    (package / "Shelf Song.guitar.player.html").write_text(
+        "<html><body>player ok</body></html>", encoding="utf-8"
+    )
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": digest,
+        "title": "Shelf Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-08T00:00:00+00:00",
+        "started_at": "2026-09-08T00:00:01+00:00",
+        "finished_at": "2026-09-08T00:00:02+00:00",
+        "error": None,
+        "package": "Shelf Song/Shelf Song.guitar.player.html",
+        "log": None,
+        "upload": None,
+    }), encoding="utf-8")
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    status_calls = 0
+
+    def inspect_with_delayed_first_response(*_args, **_kwargs):
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls == 1:
+            first_started.set()
+            release_first.wait(timeout=30)
+            return (PackageStatus(
+                "Shelf Song",
+                "Shelf Song",
+                pocket_song_id,
+                digest,
+                RemoteStatus("synced", False),
+            ),)
+        return ()
+
+    monkeypatch.setattr(app_module, "inspect_packages", inspect_with_delayed_first_response)
+    monkeypatch.setattr(
+        app_module,
+        "list_library_tracks",
+        lambda *_args, **_kwargs: (LibraryTrack(pocket_song_id, "Shelf Song"),),
+    )
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    try:
+        with _running_server(app) as base_url, _open_page(base_url) as page:
+            assert first_started.wait(timeout=5)
+            page.wait_for_selector("#sw-pocket-controls:not([hidden])")
+
+            fresh_status_calls = 0
+
+            def serve_fresh_status(route):
+                nonlocal fresh_status_calls
+                fresh_status_calls += 1
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "connected": True,
+                        "target_count": 0,
+                        "package_count": 0,
+                        "songs": [],
+                        "remote_only": [{
+                            "song_id": pocket_song_id,
+                            "title": "Shelf Song",
+                        }],
+                    }),
+                )
+
+            page.route("**/api/pocket/status", serve_fresh_status)
+            page.click("button.sw-job-toggle")
+            page.click("button.sw-delete-song-btn")
+            page.click("#sw-delete-confirm")
+
+            page.wait_for_function("window.__bunriWeb.getSongs().length === 0", timeout=10_000)
+            page.click("#sw-pocket-refresh")
+            page.wait_for_selector("#sw-remote-only:not([hidden])", timeout=10_000)
+            assert fresh_status_calls >= 1
+            assert page.locator(".sw-remote-only-item").count() == 1
+
+            with page.expect_response("**/api/pocket/status") as old_response:
+                release_first.set()
+            old_response.value.finished()
+
+            assert page.locator("#sw-remote-only").is_visible()
+            assert page.locator(".sw-remote-only-item").count() == 1
+            assert page.locator(".sw-remote-only-id").text_content() == pocket_song_id
+            assert page.locator("#sw-pocket-count").text_content() == (
+                "出力先の全パッケージ 0件中、同期対象 0件"
+            )
+    finally:
+        release_first.set()

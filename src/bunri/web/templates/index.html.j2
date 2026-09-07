@@ -576,6 +576,8 @@
   var pocketChecking = false;
   var pocketStatuses = Object.create(null);
   var activePocketJobId = null;
+  var pocketJobGeneration = 0;
+  var pocketStatusGeneration = 0;
   // The package tally comes from the remote status call and the batch progress
   // from the job poll; they share one line, so each keeps its own text and the
   // progress wins whenever a batch is in flight.
@@ -1242,9 +1244,11 @@
   // shelf: an unreachable Pocket must not delay a reload from picking a
   // running batch back up.
   function refreshPocketJob() {
+    var generation = ++pocketJobGeneration;
     return fetch(API_POCKET_JOB)
       .then(function (res) { return res.json(); })
       .then(function (body) {
+        if (generation !== pocketJobGeneration) return;
         setPocketConnected(body.connected);
         var job = body.job;
         renderPocketProgress(job);
@@ -1261,11 +1265,13 @@
   }
 
   function refreshPocketStatus() {
+    var generation = ++pocketStatusGeneration;
     pocketChecking = true;
     if (songsCache.length) renderSongs(songsCache);
     return fetch(API_POCKET_STATUS)
       .then(function (res) { return res.json(); })
       .then(function (status) {
+        if (generation !== pocketStatusGeneration) return;
         setPocketConnected(status.connected);
         pocketStatuses = Object.create(null);
         (status.songs || []).forEach(function (item) {
@@ -1277,11 +1283,13 @@
         renderPocketCount();
       })
       .catch(function () {
+        if (generation !== pocketStatusGeneration) return;
         setPocketConnected(false);
         remoteOnlyTracks = [];
         renderRemoteOnly();
       })
       .finally(function () {
+        if (generation !== pocketStatusGeneration) return;
         pocketChecking = false;
         renderSongs(songsCache);
         schedulePoll(songsCache);
