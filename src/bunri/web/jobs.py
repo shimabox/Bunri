@@ -47,7 +47,11 @@ from typing import Any, Callable, Iterable, Optional
 
 from bunri.registry import REGISTRY
 from bunri.pocket.lock import SyncLock, SyncLockBusy
-from bunri.pocket.local import package_name_key, read_package_metadata_for_directory
+from bunri.pocket.local import (
+    all_package_names,
+    package_name_key,
+    read_package_metadata_for_directory,
+)
 from bunri.pocket.service import (
     BatchResult,
     PocketServiceError,
@@ -1549,6 +1553,9 @@ class JobStore:
         display download URLs as synchronization identity.
         """
         names: set[str] = set()
+        name_groups: dict[str, set[str]] = {}
+        for package_name in all_package_names(self.out_dir):
+            name_groups.setdefault(package_name_key(package_name), set()).add(package_name)
         out_dir = self.out_dir.resolve()
         for job in jobs:
             if job.kind != "separate" or job.digest != digest or job.package is None:
@@ -1569,8 +1576,9 @@ class JobStore:
                 )
             except (OSError, ValueError):
                 continue
-            if metadata.source.digest == digest:
-                names.add(package_name_key(package_name))
+            key = package_name_key(package_name)
+            if metadata.source.digest == digest and len(name_groups.get(key, ())) == 1:
+                names.add(key)
         return names
 
     @staticmethod

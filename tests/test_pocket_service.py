@@ -105,23 +105,30 @@ def test_nfd_package_is_inspected_inventoried_and_resolved_by_either_form(tmp_pa
     assert [item.status for item in result.items] == ["error"]
 
 
-def test_canonically_equivalent_package_names_do_not_conflict_identity(
-    tmp_path, monkeypatch
-):
-    import bunri.pocket.service as service_module
-
+def test_canonically_equivalent_directories_are_rejected_as_name_conflict(tmp_path):
     nfc_name = "ばらの花"
     nfd_name = unicodedata.normalize("NFD", nfc_name)
     make_package(tmp_path, nfc_name, "a" * 40)
-    monkeypatch.setattr(
-        service_module, "all_package_names", lambda _out: [nfc_name, nfd_name]
-    )
+    try:
+        make_package(tmp_path, nfd_name, "b" * 40)
+    except FileExistsError:
+        pytest.skip("filesystem does not distinguish NFC and NFD filenames")
 
-    found = inventory(tmp_path)
-    statuses = inspect_packages(tmp_path, EmptyRemoteClient())
+    with pytest.raises(PocketServiceError, match="NFC正規化後に同じ名前"):
+        inventory(tmp_path)
+    for selector in (nfc_name, nfd_name):
+        with pytest.raises(PocketServiceError) as caught:
+            resolve_package(tmp_path, selector, resolution="safe_name")
+        assert caught.value.kind == "conflict"
+    for song_id in ("a" * 12, "b" * 12):
+        with pytest.raises(PocketServiceError) as caught:
+            resolve_package(tmp_path, song_id, resolution="song_id")
+        assert caught.value.kind == "conflict"
 
-    assert len(found.packages) == 2
-    assert all(not status.remote.conflict for status in statuses)
+    statuses = inspect_packages(tmp_path, RefusingClient())
+    assert {status.safe_name for status in statuses} == {nfc_name, nfd_name}
+    assert all(status.remote.conflict for status in statuses)
+    assert all(not status.remote.can_sync for status in statuses)
 
 
 class RefusingClient:

@@ -140,6 +140,24 @@ def _identity_issues(entries: Iterable[ScannedPackage]) -> list[str]:
     return issues
 
 
+def _package_name_groups(
+    entries: Iterable[ScannedPackage],
+) -> dict[str, tuple[ScannedPackage, ...]]:
+    groups: dict[str, list[ScannedPackage]] = {}
+    for entry in entries:
+        groups.setdefault(package_name_key(entry.safe_name), []).append(entry)
+    return {key: tuple(group) for key, group in groups.items()}
+
+
+def _package_name_issues(entries: Iterable[ScannedPackage]) -> list[str]:
+    issues = []
+    for group in _package_name_groups(entries).values():
+        if len(group) > 1:
+            names = ", ".join(repr(entry.safe_name) for entry in group)
+            issues.append(f"NFC正規化後に同じ名前になるパッケージがあります: {names}")
+    return issues
+
+
 def inventory(out_dir: Path, *, include_original: bool = True) -> PackageInventory:
     scanned = _scan_packages(out_dir, include_original=include_original)
     packages: list[LocalPackage] = []
@@ -152,6 +170,7 @@ def inventory(out_dir: Path, *, include_original: bool = True) -> PackageInvento
             legacy.append(entry.safe_name)
         elif entry.error is not None:
             problems.extend(f"{entry.safe_name}: {issue}" for issue in entry.error.issues)
+    problems.extend(_package_name_issues(scanned))
     problems.extend(_identity_issues(scanned))
     if problems:
         raise PocketServiceError(
@@ -172,13 +191,19 @@ def resolve_package(
     include_original: bool = True,
 ) -> LocalPackage:
     scanned = _scan_packages(out_dir, include_original=include_original)
-    by_name = {package_name_key(entry.safe_name): entry for entry in scanned}
+    by_name = _package_name_groups(scanned)
     if resolution == "safe_name":
         if expected_digest is not None:
             raise ValueError("expected_digest is only valid for song_id resolution")
-        entry = by_name.get(package_name_key(selector))
-        if entry is None:
+        entries = by_name.get(package_name_key(selector), ())
+        if not entries:
             raise PocketServiceError("同期する曲が見つかりません。", kind="not_found")
+        if len(entries) > 1:
+            raise PocketServiceError(
+                "正規化すると同じ名前になるパッケージが複数あるためアップロードできません。",
+                kind="conflict",
+            )
+        entry = entries[0]
         if entry.package is None:
             exc = entry.error
             assert exc is not None
@@ -208,7 +233,12 @@ def resolve_package(
     ]
     if not matches:
         raise PocketServiceError("同期する曲が見つかりません。", kind="not_found")
-    if len(matches) != 1 or _identity_issues(matches):
+    name_groups = _package_name_groups(scanned)
+    if (
+        len(matches) != 1
+        or _identity_issues(matches)
+        or len(name_groups[package_name_key(matches[0].safe_name)]) > 1
+    ):
         raise PocketServiceError("曲の identity が競合しているためアップロードできません。", kind="conflict")
     match = matches[0]
     if match.package is None:
@@ -275,6 +305,9 @@ def inspect_remote(package: LocalPackage, client: PocketHTTPClient) -> RemoteSta
 
 def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageStatus, ...]:
     scanned = _scan_packages(out_dir, include_original=True)
+    conflict_names = {
+        key for key, entries in _package_name_groups(scanned).items() if len(entries) > 1
+    }
     digest_names: dict[str, set[str]] = {}
     id_digests: dict[str, set[str]] = {}
     for entry in scanned:
@@ -288,25 +321,29 @@ def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageSt
     conflict_ids = {song_id for song_id, digests in id_digests.items() if len(digests) > 1}
 
     conflicted = RemoteStatus(
-        "different", False, "曲の identity が競合しているためアップロードできません。", True
+        "different",
+        False,
+        "曲のパッケージ名または identity が競合しているためアップロードできません。",
+        True,
     )
     statuses: list[PackageStatus] = []
     for entry in scanned:
         source = entry.identity
-        in_conflict = source is not None and (
-            source.digest in conflict_digests or source.cache_key in conflict_ids
+        in_conflict = package_name_key(entry.safe_name) in conflict_names or (
+            source is not None
+            and (source.digest in conflict_digests or source.cache_key in conflict_ids)
         )
         if entry.package is None:
             exc = entry.error
             assert exc is not None
-            if exc.kind == "legacy":
+            if in_conflict:
+                remote = conflicted
+            elif exc.kind == "legacy":
                 remote = RemoteStatus(
                     "legacy",
                     False,
                     "元の入力音源から再生成してください。キャッシュが残っていれば分離処理は省略されます。",
                 )
-            elif in_conflict:
-                remote = conflicted
             else:
                 remote = RemoteStatus("unknown", False, "ローカルパッケージを確認できません。")
             statuses.append(PackageStatus(

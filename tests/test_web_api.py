@@ -511,6 +511,76 @@ def test_songs_match_batch_progress_across_unicode_normalization(tmp_path, monke
     assert song["pocket_job"]["status"] == "done"
 
 
+def test_songs_do_not_share_batch_progress_across_colliding_package_names(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    nfc_name = "ばらの花"
+    nfd_name = unicodedata.normalize("NFD", nfc_name)
+    digests = ("a" * 40, "b" * 40)
+    for index, (name, digest) in enumerate(zip((nfc_name, nfd_name), digests)):
+        _write_job_file(tmp_path, f"j-collision-{index}", digest=digest, title=name)
+        package = tmp_path / name
+        try:
+            package.mkdir()
+        except FileExistsError:
+            pytest.skip("filesystem does not distinguish NFC and NFD filenames")
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                name,
+                name,
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",)),),
+            ),
+        )
+    jobs_dir = tmp_path / "web" / "jobs"
+    (jobs_dir / "j-pocket-collision.json").write_text(
+        json.dumps({
+            "id": "j-pocket-collision",
+            "kind": "pocket_all",
+            "status": "error",
+            "created_at": "2026-09-05T00:00:00+00:00",
+            "started_at": "2026-09-05T00:00:01+00:00",
+            "finished_at": "2026-09-05T00:00:02+00:00",
+            "error": "failed",
+            "progress": {
+                "total": 2,
+                "completed": 0,
+                "current": None,
+                "legacy": [],
+                "done": [],
+                "failed": [nfc_name],
+                "pending": [nfd_name],
+            },
+            "result": {
+                "total": 2,
+                "completed": 0,
+                "failed": 1,
+                "pending": 1,
+                "legacy": [],
+            },
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "_download_files", lambda _job: [])
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        songs = client.get("/api/songs").json()
+
+    assert len(songs) == 2
+    assert all(song["pocket_job"] is None for song in songs)
+
+
 # ---------------------------------------------------------------------------
 def test_upload_returns_202_and_job_appears_queued_or_running(client):
     res = _upload(client, title="My Song")
