@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,30 @@ def test_preflight_hashes_assets_in_contract_order(tmp_path):
     package = preflight(out, "Song")
     assert [x.descriptor.remote_name for x in package.assets] == ["original.mp3", "guitar.mp3", "guitar.backing.mp3"]
     assert all(x.descriptor.bytes > 0 and len(x.descriptor.sha256) == 64 for x in package.assets)
+
+
+def test_preflight_accepts_nfd_directory_with_nfc_sidecar(tmp_path):
+    nfc_name = "ざらめのゆき"
+    nfd_name = unicodedata.normalize("NFD", nfc_name)
+    out = tmp_path / "out"
+    directory = out / nfd_name
+    directory.mkdir(parents=True)
+    write_package_metadata(
+        directory / ".bunri-package.json",
+        PackageMetadata(
+            nfc_name,
+            nfc_name,
+            SourceIdentity("sha1", "a" * 40, "a" * 12),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+        (directory / f"{nfd_name}.{suffix}").write_bytes(b"audio")
+
+    package = preflight(out, nfd_name)
+
+    assert package.directory.name == nfd_name
+    assert package.metadata.safe_name == nfc_name
 
 
 def test_no_original_excludes_existing_file(tmp_path):

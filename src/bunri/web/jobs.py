@@ -45,9 +45,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from bunri.package_metadata import read_package_metadata
 from bunri.registry import REGISTRY
 from bunri.pocket.lock import SyncLock, SyncLockBusy
+from bunri.pocket.local import (
+    all_package_names,
+    package_name_key,
+    read_package_metadata_for_directory,
+)
 from bunri.pocket.service import (
     BatchResult,
     PocketServiceError,
@@ -1549,6 +1553,9 @@ class JobStore:
         display download URLs as synchronization identity.
         """
         names: set[str] = set()
+        name_groups: dict[str, set[str]] = {}
+        for package_name in all_package_names(self.out_dir):
+            name_groups.setdefault(package_name_key(package_name), set()).add(package_name)
         out_dir = self.out_dir.resolve()
         for job in jobs:
             if job.kind != "separate" or job.digest != digest or job.package is None:
@@ -1562,15 +1569,16 @@ class JobStore:
                     or package_dir.resolve().parent != out_dir
                 ):
                     continue
-                metadata = read_package_metadata(
+                metadata = read_package_metadata_for_directory(
                     package_dir / ".bunri-package.json",
                     package_name,
                     allow_unknown_targets=True,
                 )
             except (OSError, ValueError):
                 continue
-            if metadata.source.digest == digest:
-                names.add(package_name)
+            key = package_name_key(package_name)
+            if metadata.source.digest == digest and len(name_groups.get(key, ())) == 1:
+                names.add(key)
         return names
 
     @staticmethod
@@ -1581,7 +1589,9 @@ class JobStore:
             value = progress.get(name)
             if not isinstance(value, list):
                 return set()
-            return {item for item in value if isinstance(item, str)}
+            return {
+                package_name_key(item) for item in value if isinstance(item, str)
+            }
 
         if package_names & progress_names("failed"):
             return True, replace(job, status="error")

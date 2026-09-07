@@ -26,6 +26,7 @@ from bunri.registry import REGISTRY
 from bunri.pocket.config import read_config
 from bunri.pocket.http import PocketHTTPClient
 from bunri.pocket.lock import SyncLock, SyncLockBusy
+from bunri.pocket.local import package_name_key
 from bunri.pocket.service import (
     PocketServiceError,
     inspect_packages,
@@ -442,13 +443,13 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                 ),
                 safe_filename(song.title),
             )
-            safe_to_web_id[package_name] = song.id
+            safe_to_web_id[package_name_key(package_name)] = song.id
         songs = [
             {
                 "web_song_id": (
                     digest_to_web_id.get(item.digest)
                     if item.digest is not None
-                    else safe_to_web_id.get(item.safe_name)
+                    else safe_to_web_id.get(package_name_key(item.safe_name))
                 ),
                 "song_id": item.song_id,
                 "title": item.title,
