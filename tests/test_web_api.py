@@ -97,7 +97,7 @@ def test_pocket_status_matches_web_song_id_across_unicode_normalization(
 
     from bunri.pocket.config import PocketConfig, save_config
 
-    nfc_name = "ガラスのブルース"
+    nfc_name = "ガンバのバラード"
     nfd_name = unicodedata.normalize("NFD", nfc_name)
     digest = "a" * 40
     _write_job_file(tmp_path, "j-normalized", digest=digest, title=nfc_name)
@@ -458,7 +458,7 @@ def test_songs_match_batch_progress_across_unicode_normalization(tmp_path, monke
         write_package_metadata,
     )
 
-    nfc_name = "ばらの花"
+    nfc_name = "ざらめのゆき"
     nfd_name = unicodedata.normalize("NFD", nfc_name)
     digest = "a" * 40
     _write_job_file(tmp_path, "j-separate-nfd", digest=digest, title=nfd_name)
@@ -523,7 +523,7 @@ def test_songs_do_not_share_batch_progress_across_colliding_package_names(
         write_package_metadata,
     )
 
-    nfc_name = "ばらの花"
+    nfc_name = "ざらめのゆき"
     nfd_name = unicodedata.normalize("NFD", nfc_name)
     digests = ("a" * 40, "b" * 40)
     for index, (name, digest) in enumerate(zip((nfc_name, nfd_name), digests)):

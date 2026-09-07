@@ -30,7 +30,7 @@ def test_preflight_hashes_assets_in_contract_order(tmp_path):
 
 
 def test_preflight_accepts_nfd_directory_with_nfc_sidecar(tmp_path):
-    nfc_name = "ばらの花"
+    nfc_name = "ざらめのゆき"
     nfd_name = unicodedata.normalize("NFD", nfc_name)
     out = tmp_path / "out"
     directory = out / nfd_name

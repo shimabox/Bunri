@@ -74,7 +74,7 @@ def test_inventory_reports_all_legacy_but_rejects_duplicate_identity(tmp_path):
 
 
 def test_nfd_package_is_inspected_inventoried_and_resolved_by_either_form(tmp_path):
-    nfc_name = "ガラスのブルース"
+    nfc_name = "ガンバのバラード"
     nfd_name = unicodedata.normalize("NFD", nfc_name)
     make_package(tmp_path, nfd_name, "a" * 40, metadata_name=nfc_name)
 
@@ -106,7 +106,7 @@ def test_nfd_package_is_inspected_inventoried_and_resolved_by_either_form(tmp_pa
 
 
 def test_canonically_equivalent_directories_are_rejected_as_name_conflict(tmp_path):
-    nfc_name = "ばらの花"
+    nfc_name = "ざらめのゆき"
     nfd_name = unicodedata.normalize("NFD", nfc_name)
     make_package(tmp_path, nfc_name, "a" * 40)
     try:
