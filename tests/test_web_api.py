@@ -104,6 +104,7 @@ def test_pocket_status_matches_web_song_id_across_unicode_normalization(
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
     save_config(tmp_path, PocketConfig("https://example.invalid", token))
     monkeypatch.setattr(app_module, "PocketHTTPClient", lambda *_args: object())
+    monkeypatch.setattr(app_module, "list_library_tracks", lambda *_args, **_kwargs: ())
     monkeypatch.setattr(
         app_module,
         "inspect_packages",
