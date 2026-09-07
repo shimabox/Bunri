@@ -484,6 +484,7 @@
     </div>
     <p id="sw-empty" class="sw-empty">まだ曲はありません。</p>
     <ul id="sw-job-list" class="sw-job-list"></ul>
+    <p id="sw-remote-only-error" class="sw-upload-error" role="status" aria-live="polite" hidden></p>
     <section id="sw-remote-only" class="sw-remote-only" aria-labelledby="sw-remote-only-title" hidden>
       <h3 id="sw-remote-only-title">棚にのみある曲</h3>
       <p class="sw-pocket-note">読み取り専用です。削除するには CLI の --select または --song-id を使ってください。</p>
@@ -561,6 +562,7 @@
   var pocketRefresh = document.getElementById("sw-pocket-refresh");
   var pocketCount = document.getElementById("sw-pocket-count");
   var pocketSummary = document.getElementById("sw-pocket-summary");
+  var remoteOnlyError = document.getElementById("sw-remote-only-error");
   var remoteOnlySection = document.getElementById("sw-remote-only");
   var remoteOnlyList = document.getElementById("sw-remote-only-list");
   var remoteOnlyTracks = [];
@@ -640,8 +642,7 @@
   }
 
   function updateUploadEnabled() {
-    uploadBtn.disabled = !pendingFile || selectedTargets().length === 0
-      || activePocketJobId !== null || hasActivePocketJobs(songsCache);
+    uploadBtn.disabled = !pendingFile || selectedTargets().length === 0;
   }
 
   targetInputs.forEach(function (input) {
@@ -666,6 +667,9 @@
       .then(function (res) {
         if (!res.ok) {
           return res.json().catch(function () { return {}; }).then(function (body) {
+            if (res.status === 409) {
+              throw new Error("この曲は棚から削除中です。完了後に再度お試しください。");
+            }
             throw new Error(body.detail || ("アップロードに失敗しました (" + res.status + ")"));
           });
         }
@@ -1272,20 +1276,27 @@
       .then(function (res) { return res.json(); })
       .then(function (status) {
         if (generation !== pocketStatusGeneration) return;
-        setPocketConnected(status.connected);
+        if (status.state !== "unknown") setPocketConnected(status.connected);
         pocketStatuses = Object.create(null);
         (status.songs || []).forEach(function (item) {
           if (item.web_song_id) pocketStatuses[item.web_song_id] = item;
         });
-        remoteOnlyTracks = status.remote_only || [];
+        if (status.state === "unknown") {
+          remoteOnlyError.textContent = status.message || "棚の状態を確認できません。";
+          remoteOnlyError.hidden = false;
+        } else {
+          remoteOnlyTracks = status.remote_only || [];
+          remoteOnlyError.textContent = "";
+          remoteOnlyError.hidden = true;
+        }
         renderRemoteOnly();
         pocketCountText = "出力先の全パッケージ " + (status.package_count || 0) + "件中、同期対象 " + (status.target_count || 0) + "件";
         renderPocketCount();
       })
       .catch(function () {
         if (generation !== pocketStatusGeneration) return;
-        setPocketConnected(false);
-        remoteOnlyTracks = [];
+        remoteOnlyError.textContent = "棚の状態を確認できません。";
+        remoteOnlyError.hidden = false;
         renderRemoteOnly();
       })
       .finally(function () {

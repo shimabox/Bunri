@@ -12,6 +12,7 @@ _chromium_available skip pattern tests/test_player_html.py uses.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import socket
 import threading
@@ -186,6 +187,129 @@ def test_remote_only_tracks_render_as_read_only_text(tmp_path):
             assert item.locator(".sw-badge").text_content() == "棚のみ"
             assert item.locator("button").count() == 0
             assert item.locator("b").count() == 0
+
+
+@_needs_browser
+def test_remote_only_tracks_survive_unknown_shelf_status(tmp_path):
+    responses = [
+        {
+            "connected": True,
+            "package_count": 0,
+            "target_count": 0,
+            "songs": [],
+            "remote_only": [{"song_id": "abcdef123456", "title": "Shelf Song"}],
+        },
+        {
+            "connected": True,
+            "state": "unknown",
+            "message": "棚の状態を確認できません。",
+            "package_count": 0,
+            "target_count": 0,
+            "songs": [],
+            "remote_only": [],
+        },
+    ]
+
+    def mock_status(page):
+        page.route("**/api/pocket/job", lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"connected": True, "job": None}),
+        ))
+
+        def handler(route):
+            body = responses.pop(0) if len(responses) > 1 else responses[0]
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(body),
+            )
+
+        page.route("**/api/pocket/status", handler)
+
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_status
+    ) as page:
+        page.wait_for_selector("#sw-remote-only:not([hidden])")
+        assert page.locator(".sw-remote-only-item").count() == 1
+
+        page.click("#sw-pocket-refresh")
+        page.wait_for_selector("#sw-remote-only-error:not([hidden])")
+
+        assert page.locator("#sw-remote-only-error").text_content() == (
+            "棚の状態を確認できません。"
+        )
+        assert page.locator(".sw-remote-only-item").count() == 1
+        assert page.locator(".sw-remote-only-item span").first.text_content() == "Shelf Song"
+
+
+@_needs_browser
+def test_separation_upload_stays_enabled_during_an_unrelated_pocket_job(tmp_path):
+    active_digest = "a" * 40
+
+    def mock_active_pocket_job(page):
+        page.route("**/api/pocket/job", lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "connected": True,
+                "job": {
+                    "id": "j-pocket-delete",
+                    "kind": "pocket_delete",
+                    "status": "running",
+                    "pocket_digest": active_digest,
+                    "elapsed_seconds": 1,
+                },
+            }),
+        ))
+
+    app = create_app(tmp_path / "out", runner=PageFakeRunner(delay=1.0))
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_active_pocket_job
+    ) as page:
+        audio_path = tmp_path / "unrelated.mp3"
+        audio_path.write_bytes(b"different-audio")
+        assert hashlib.sha1(audio_path.read_bytes()).hexdigest() != active_digest
+        page.set_input_files("#sw-file-input", str(audio_path))
+        page.wait_for_selector("#sw-confirm:not([hidden])")
+
+        assert page.locator("#sw-upload-btn").is_enabled()
+        page.click("#sw-upload-btn")
+        page.wait_for_function("window.__bunriWeb.getJobs().length === 1")
+
+
+@_needs_browser
+def test_separation_upload_shows_safe_message_for_pending_delete_409(tmp_path):
+    def reject_upload(page):
+        def handler(route):
+            if route.request.method == "POST":
+                route.fulfill(
+                    status=409,
+                    content_type="application/json",
+                    body=json.dumps({"detail": "internal conflict detail"}),
+                )
+            else:
+                route.continue_()
+
+        page.route("**/api/jobs", handler)
+
+    app = create_app(tmp_path / "out", runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=reject_upload
+    ) as page:
+        audio_path = tmp_path / "deleting.mp3"
+        audio_path.write_bytes(b"same-audio")
+        page.set_input_files("#sw-file-input", str(audio_path))
+        page.wait_for_selector("#sw-confirm:not([hidden])")
+        page.click("#sw-upload-btn")
+        page.wait_for_function(
+            "document.getElementById('sw-upload-error').textContent.length > 0"
+        )
+
+        assert page.locator("#sw-upload-error").text_content() == (
+            "この曲は棚から削除中です。完了後に再度お試しください。"
+        )
 
 
 @_needs_browser

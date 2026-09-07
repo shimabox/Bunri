@@ -807,6 +807,50 @@ def test_upload_conflicting_with_pending_delete_is_409_without_orphan(
             release.set()
 
 
+def test_upload_with_another_digest_is_registered_during_pending_delete(
+    tmp_path, monkeypatch
+):
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.lock import SyncLock
+
+    release = threading.Event()
+    remote_started = threading.Event()
+
+    def blocking_delete(*_args, **_kwargs):
+        remote_started.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(jobs_module, "delete_track", blocking_delete)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        deleting_content = b"audio being deleted"
+        first = _upload(c, content=deleting_content, title="Deleting Song")
+        _wait_until(lambda: _job_status(c, first.json()["job_id"]) == "done")
+        deleting_digest = hashlib.sha1(deleting_content).hexdigest()
+        store = c.app.state.job_store
+        store.create_pocket_delete_job(
+            song_id=deleting_digest[:12],
+            digest=deleting_digest,
+            safe_name="Deleting Song",
+            sync_lock=SyncLock(tmp_path).acquire(),
+        )
+        assert remote_started.wait(timeout=5)
+        try:
+            other_content = b"unrelated audio"
+            response = _upload(c, content=other_content, title="Other Song")
+            job = store.get_job(response.json()["job_id"])
+            registered = (job.kind, job.digest, job.status)
+        finally:
+            release.set()
+
+    assert response.status_code == 202
+    assert registered == (
+        "separate",
+        hashlib.sha1(other_content).hexdigest(),
+        "queued",
+    )
+
+
 def test_songs_group_digest_and_use_latest_jobs_in_target_order(tmp_path):
     _write_job_file(
         tmp_path, "j-old-guitar", digest="digest-a", title="Old title", target="guitar",
@@ -1010,6 +1054,33 @@ def test_pocket_status_reports_validated_remote_only_tracks(client, monkeypatch)
     assert response.json()["remote_only"] == [
         {"song_id": "abcdef123456", "title": "Remote <script>"}
     ]
+
+
+def test_pocket_status_distinguishes_library_failure_from_an_empty_shelf(
+    client, monkeypatch
+):
+    import base64
+    from bunri.pocket.config import PocketConfig, save_config
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    monkeypatch.setattr(app_module, "inspect_packages", lambda *_args: ())
+
+    monkeypatch.setattr(app_module, "list_library_tracks", lambda *_args, **_kwargs: ())
+    empty = client.get("/api/pocket/status").json()
+
+    def fail_library(*_args, **_kwargs):
+        raise RuntimeError("private remote detail")
+
+    monkeypatch.setattr(app_module, "list_library_tracks", fail_library)
+    unknown = client.get("/api/pocket/status").json()
+
+    assert "state" not in empty
+    assert empty["remote_only"] == []
+    assert unknown["state"] == "unknown"
+    assert unknown["message"] == "棚の状態を確認できません。"
+    assert unknown["remote_only"] == []
+    assert "private remote detail" not in str(unknown)
 
 
 def test_delete_unknown_song_is_404(client):
