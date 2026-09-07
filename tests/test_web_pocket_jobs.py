@@ -265,6 +265,78 @@ def test_recovered_pocket_delete_finishes_partial_local_deletion(
         store.shutdown()
 
 
+def test_recovered_pocket_delete_finishes_when_audio_is_already_missing(
+    tmp_path, monkeypatch
+):
+    import bunri.web.jobs as jobs_module
+
+    local_job = make_local_song(tmp_path)
+    delete_job = make_recoverable_delete(tmp_path, pocket_deleted=True)
+    (tmp_path / "Song" / "Song.guitar.mp3").unlink()
+
+    remote_targets = []
+    monkeypatch.setattr(
+        jobs_module,
+        "delete_track",
+        lambda _out_dir, target, **_kwargs: remote_targets.append(target),
+    )
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        wait_for(lambda: store.get_job(delete_job.id).status == "done")
+
+        assert remote_targets == [
+            DeleteTargetIdentity(
+                song_id="a" * 12,
+                digest="a" * 40,
+                safe_name=None,
+            )
+        ]
+        assert not (tmp_path / "Song").exists()
+        assert store.get_job(local_job.id) is None
+    finally:
+        store.shutdown()
+
+
+def test_recovered_confirmed_pocket_delete_stops_on_sidecar_identity_change(
+    tmp_path, monkeypatch
+):
+    import bunri.pocket.service as service_module
+
+    local_job = make_local_song(tmp_path)
+    delete_job = make_recoverable_delete(tmp_path, pocket_deleted=True)
+    (tmp_path / "Song" / "Song.guitar.mp3").unlink()
+    write_package_metadata(
+        tmp_path / "Song" / ".bunri-package.json",
+        PackageMetadata(
+            "Song",
+            "Song",
+            SourceIdentity("sha1", "b" * 40, "b" * 12),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(tmp_path, PocketConfig("https://example.invalid", token))
+    remote_calls = []
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            remote_calls.append("client-created")
+
+    monkeypatch.setattr(service_module, "PocketHTTPClient", UnexpectedClient)
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        wait_for(lambda: store.get_job(delete_job.id).status == "error")
+
+        failed = store.get_job(delete_job.id)
+        assert failed.result == {"pocket_deleted": True, "local_deleted": False}
+        assert "identity" in failed.error
+        assert remote_calls == []
+        assert store.get_job(local_job.id) is not None
+        assert (tmp_path / "Song").is_dir()
+    finally:
+        store.shutdown()
+
+
 def test_recovered_pocket_delete_still_rejects_tampering_before_remote_204(tmp_path):
     local_job = make_local_song(tmp_path)
     delete_job = make_recoverable_delete(tmp_path, pocket_deleted=False)

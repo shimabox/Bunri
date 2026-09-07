@@ -104,6 +104,8 @@ def sync(
             include_original=original,
             lock=lock,
         )
+    except typer.Exit:
+        raise
     except PocketServiceError as exc:
         if all_packages and exc.legacy:
             for name in exc.legacy:
@@ -169,6 +171,8 @@ def delete_command(
                 _fail("選択した番号が範囲外です。")
             selected = tracks[choice - 1]
             target = DeleteTargetIdentity(song_id=selected.song_id, title=selected.title)
+    except typer.Exit:
+        raise
     except (PocketServiceError, OSError, RuntimeError, ValueError) as exc:
         message = safe_delete_error(exc)
         if safe_name is not None:

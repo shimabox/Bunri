@@ -362,13 +362,19 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
 
         digest = digest_hash.hexdigest()
         dest = uploads_dir / f"{digest}{ext}"
-        if dest.exists():
+        stored_new_upload = not dest.exists()
+        if not stored_new_upload:
             tmp_path.unlink(missing_ok=True)  # already have this exact content on disk
         else:
             os.replace(tmp_path, dest)  # atomic rename on the same filesystem
 
         requested_title = (title or "").strip() or Path(filename).stem or "untitled"
-        results = store.create_jobs(dest, digest, requested_title, requested_targets)
+        try:
+            results = store.create_jobs(dest, digest, requested_title, requested_targets)
+        except SongDeleteConflict as exc:
+            if stored_new_upload:
+                store.delete_unreferenced_upload(dest)
+            raise HTTPException(status_code=409, detail=str(exc))
         jobs = [
             {"id": job.id, "target": job.target, "dedup": not created}
             for job, created in results

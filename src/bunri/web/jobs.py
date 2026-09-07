@@ -1767,6 +1767,20 @@ class JobStore:
             for job_id in target_ids:
                 del self._jobs[job_id]
 
+    def delete_unreferenced_upload(self, upload_path: Path) -> None:
+        """Delete a newly stored upload only when no job record owns it."""
+        with self._lock:
+            try:
+                upload = Path(upload_path.relative_to(self.out_dir))
+            except ValueError:
+                raise UnsafeOutputPath("upload is outside the output directory")
+            if any(
+                job.upload is not None and Path(job.upload) == upload
+                for job in self._jobs.values()
+            ):
+                return
+            delete_output_targets(self.out_dir, [DeleteTarget(upload, "file")])
+
     # -- title / folder collision handling -------------------------------
     def _resolve_title(self, requested_title: str, digest: str) -> str:
         """Same folder-naming rule as package.py's _safe_filename, plus a
@@ -2225,15 +2239,37 @@ class JobStore:
                 if remote_delete_was_confirmed and safe_name is not None:
                     package_dir = self.out_dir / safe_name
                     sidecar = package_dir / ".bunri-package.json"
-                    package_dir_exists = package_dir.exists() or package_dir.is_symlink()
-                    sidecar_exists = sidecar.exists() or sidecar.is_symlink()
-                    if not package_dir_exists or not sidecar_exists:
+                    if package_dir.is_symlink() or sidecar.is_symlink():
+                        raise PocketServiceError(
+                            "選択した曲の identity が変更されました。", kind="conflict"
+                        )
+                    if not package_dir.exists() or not sidecar.exists():
                         # The remote 204 was saved before local deletion began.
                         # A missing package or sidecar is therefore progress
                         # from that deletion, not evidence that an unverified
                         # target may be sent to Pocket.  Keep reissuing the
                         # idempotent DELETE, then let delete_song remove the
                         # remaining job records and artifacts.
+                        safe_name = None
+                    else:
+                        try:
+                            metadata = read_package_metadata_for_directory(sidecar, safe_name)
+                        except (OSError, ValueError) as exc:
+                            raise PocketServiceError(
+                                "選択した曲の identity が変更されました。", kind="conflict"
+                            ) from exc
+                        source = metadata.source
+                        if (
+                            source.digest != job.pocket_digest
+                            or source.cache_key != job.pocket_song_id
+                        ):
+                            raise PocketServiceError(
+                                "選択した曲の identity が変更されました。", kind="conflict"
+                            )
+                        # Once the saved 204 and sidecar identity agree, asset
+                        # completeness is no longer a precondition: missing
+                        # audio can itself be progress from interrupted local
+                        # cleanup. The idempotent remote DELETE is still sent.
                         safe_name = None
                 target = DeleteTargetIdentity(
                     song_id=job.pocket_song_id,

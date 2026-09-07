@@ -152,6 +152,36 @@ def test_pocket_sync_all_reports_every_legacy_package_on_local_validation_error(
     assert "ローカル検証に失敗しました。" in output
 
 
+def test_pocket_sync_all_failure_does_not_recapture_exit(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    monkeypatch.setattr(
+        pocket_cli,
+        "read_config",
+        lambda _out: PocketConfig("https://example.invalid", "unused-token"),
+    )
+    monkeypatch.setattr(
+        pocket_cli,
+        "sync_all",
+        lambda *_args, **_kwargs: BatchResult(
+            total=1,
+            items=[BatchItem("Song", "error", error="個別の同期エラー")],
+        ),
+    )
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["sync", "--all", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+
+    output = _plain(result.output)
+    assert result.exit_code == 1
+    assert "失敗: Song: 個別の同期エラー" in output
+    assert "Pocket の同期に失敗しました。後で再実行してください。" not in output
+
+
 def test_pocket_delete_song_id_with_yes_needs_no_local_package(tmp_path, monkeypatch):
     import bunri.pocket.cli as pocket_cli
     from bunri.pocket.config import PocketConfig
@@ -172,6 +202,28 @@ def test_pocket_delete_song_id_with_yes_needs_no_local_package(tmp_path, monkeyp
     assert result.exit_code == 0, result.output
     assert calls[0].song_id == "abcdef123456" and calls[0].safe_name is None
     assert "棚から削除しました: abcdef123456" in _plain(result.output)
+
+
+def test_pocket_delete_invalid_song_id_prints_one_error(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+
+    monkeypatch.setattr(
+        pocket_cli,
+        "read_config",
+        lambda _out: PocketConfig("https://example.invalid", "unused"),
+    )
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["delete", "--song-id", "INVALID", "--yes", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+
+    output = _plain(result.output)
+    assert result.exit_code == 1
+    assert output.count("error:") == 1
+    assert "song ID は小文字16進12桁" in output
+    assert "Pocket の削除に失敗しました" not in output
 
 
 @pytest.mark.parametrize("arguments", [[], ["Song", "--song-id", "abcdef123456"], ["--select", "--song-id", "abcdef123456"]])

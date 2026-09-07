@@ -770,6 +770,43 @@ def test_partial_target_dedup_creates_only_the_missing_target(client):
     assert jobs[1]["dedup"] is False
 
 
+def test_upload_conflicting_with_pending_delete_is_409_without_orphan(
+    tmp_path, monkeypatch
+):
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.lock import SyncLock
+
+    release = threading.Event()
+    remote_started = threading.Event()
+
+    def blocking_delete(*_args, **_kwargs):
+        remote_started.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(jobs_module, "delete_track", blocking_delete)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        content = b"same audio in another container extension"
+        first = _upload(c, name="song.mp3", content=content, title="Song")
+        _wait_until(lambda: _job_status(c, first.json()["job_id"]) == "done")
+        digest = hashlib.sha1(content).hexdigest()
+        store = c.app.state.job_store
+        store.create_pocket_delete_job(
+            song_id=digest[:12],
+            digest=digest,
+            safe_name="Song",
+            sync_lock=SyncLock(tmp_path).acquire(),
+        )
+        assert remote_started.wait(timeout=5)
+        try:
+            response = _upload(c, name="song.wav", content=content, title="Song")
+            uploads = {path.name for path in (tmp_path / "web" / "uploads").iterdir()}
+            assert response.status_code == 409
+            assert uploads == {f"{digest}.mp3"}
+        finally:
+            release.set()
+
+
 def test_songs_group_digest_and_use_latest_jobs_in_target_order(tmp_path):
     _write_job_file(
         tmp_path, "j-old-guitar", digest="digest-a", title="Old title", target="guitar",
