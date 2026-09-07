@@ -62,11 +62,11 @@ REGISTRY: dict[str, TargetSpec] = {
     "vocals": TargetSpec(
         target="vocals",
         stem_name="Vocals",
-        # Top vocals model in audio-separator's own catalog by measured SDR
+        # Top vocals model in audio-separator's bundled catalog by measured SDR
         # (12.60, vs 12.52 for the next Mel-Roformer and 10.79 for
-        # htdemucs_ft) as of 0.44.3. A catalog built-in, so audio-separator
-        # downloads it itself -- none of the becruily bootstrap applies. Its
-        # two stems are vocals/other, so the backing track is simply the
+        # htdemucs_ft) as of 0.44.3. separate.py downloads and SHA-256 verifies
+        # its checkpoint and YAML before loading it through a fixed catalog.
+        # Its two stems are vocals/other, so the backing track is simply the
         # "other" stem: a ready-made karaoke mix.
         default_model="vocals_mel_band_roformer.ckpt",
         fallback_model="htdemucs_6s.yaml",

@@ -9,6 +9,7 @@ output can be verified exactly.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -67,6 +68,7 @@ class FakeSeparator:
 
         self.init_kwargs = kwargs
         self.output_dir = Path(kwargs["output_dir"])
+        self.model_file_dir = kwargs["model_file_dir"]
         # Snapshot what the real availability checks report *right now*, exactly like
         # Separator.setup_torch_device() would during __init__, so tests can tell
         # whether separate() patched them for this construction.
@@ -82,6 +84,9 @@ class FakeSeparator:
         # _inject_becruily_catalog wrapper (never faked -- only the network
         # download underneath it is) add its entry without special-casing.
         return {}
+
+    def download_file_if_not_exists(self, url: str, output_path: str) -> None:
+        raise AssertionError(f"unexpected model download: {url} -> {output_path}")
 
     def load_model(self, model_filename: str) -> None:
         self.loaded_model = model_filename
@@ -125,6 +130,22 @@ class TwoStemFakeSeparator(FakeSeparator):
         ("Guitar", "mix_(Guitar)_2stem", 0.20),
         ("Other", "mix_(Other)_2stem", 0.30),
     ]
+
+
+class AnyTargetFakeSeparator(FakeSeparator):
+    """Writes whichever target stem the caller requests plus an Other stem."""
+
+    def separate(
+        self, audio_file_path: str, custom_output_names: dict[str, str] | None = None
+    ) -> list[str]:
+        self.separate_calls.append((audio_file_path, custom_output_names))
+        target_label, target_name = next(iter((custom_output_names or {}).items()))
+        written: list[str] = []
+        for name, value in ((target_name, 0.20), (f"mix_(Other)_{target_label}", 0.30)):
+            filename = f"{name}.wav"
+            sf.write(str(self.output_dir / filename), _wave(value), _SR, subtype="FLOAT")
+            written.append(filename)
+        return written
 
 
 class ClippingFakeSeparator(FakeSeparator):
@@ -211,14 +232,11 @@ def _reset_fake_separator_instances():
 
 
 @pytest.fixture(autouse=True)
-def _stub_becruily_download(monkeypatch):
+def _stub_pinned_model_download(monkeypatch):
     """Every test in this file drives a Fake Separator; nothing here should
-    ever touch the network. The guitar spec's default model is the becruily
-    guitar Roformer, which triggers an HF-download bootstrap for whichever of
-    its two files aren't already cached locally -- stub the download function
-    to a no-op for every test by default. The bootstrap tests below override
-    this again (monkeypatch supports repeated calls within one test) with a
-    recording fake to verify it's actually invoked.
+    ever touch the network. Registered models are bootstrapped before loading,
+    so stub the download function for every test by default. Focused tests
+    below override this with recording or real local-only implementations.
     """
     monkeypatch.setattr(
         separate_module, "_download_if_missing", lambda url, dest, expected_sha256: None
@@ -446,7 +464,7 @@ def test_run_restores_torch_availability_checks_after_forcing_cpu(tmp_path, monk
 # The guitar spec's default_model is the becruily guitar Mel-Band Roformer.
 # Everything below drives that through separate() (model=None, i.e. the
 # caller didn't override it) with FakeSeparator subclasses -- never a real
-# audio-separator model -- and the _stub_becruily_download autouse fixture
+# audio-separator model -- and the _stub_pinned_model_download autouse fixture
 # above keeps the HF download bootstrap from ever touching the network.
 
 
@@ -483,15 +501,11 @@ def test_run_becruily_default_triggers_bootstrap(tmp_path, monkeypatch):
     fake = FakeSeparator.instances[0]
     assert fake.loaded_model == _GUITAR_SPEC.default_model
     assert result.model_used == _GUITAR_SPEC.default_model
-    # The catalog injection wrapper (never faked) really ran against this
-    # instance: list_supported_model_files now reports the becruily entry.
-    catalog = fake.list_supported_model_files()
-    assert _GUITAR_SPEC.default_model in {
-        info["filename"] for info in catalog.get("MDXC", {}).values()
-    }
+    # The fixed catalog is temporary and must not leak past load_model().
+    assert fake.list_supported_model_files() == {}
 
 
-def test_run_htdemucs_model_skips_becruily_bootstrap(tmp_path, monkeypatch):
+def test_run_htdemucs_model_triggers_pinned_bootstrap(tmp_path, monkeypatch):
     monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
     download_calls: list[tuple[str, Path, str]] = []
     monkeypatch.setattr(
@@ -503,8 +517,281 @@ def test_run_htdemucs_model_skips_becruily_bootstrap(tmp_path, monkeypatch):
 
     separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
 
-    assert download_calls == []
+    assert [(dest.name, sha) for _, dest, sha in download_calls] == [
+        (
+            "5c90dfd2-34c22ccb.th",
+            "34c22ccb381c6f9fdbf324f04e1e2fe21aaaf293f5ded163a162697ff9a02ddd",
+        ),
+        (
+            "htdemucs_6s.yaml",
+            "207405151270af8fd81c2373c25d27950916682ac91dca7884a11ce13dad6f58",
+        ),
+    ]
+    assert download_calls[0][0] == (
+        "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/"
+        "5c90dfd2-34c22ccb.th"
+    )
+    assert download_calls[1][0] == (
+        "https://github.com/TRvlvr/model_repo/releases/download/"
+        "all_public_uvr_models/htdemucs_6s.yaml"
+    )
     assert FakeSeparator.instances[0].loaded_model == "htdemucs_6s.yaml"
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    [
+        (
+            "vocals_mel_band_roformer.ckpt",
+            [
+                (
+                    "vocals_mel_band_roformer.ckpt",
+                    "https://github.com/nomadkaraoke/python-audio-separator/releases/"
+                    "download/model-configs/vocals_mel_band_roformer.ckpt",
+                    "87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e",
+                ),
+                (
+                    "vocals_mel_band_roformer.yaml",
+                    "https://github.com/nomadkaraoke/python-audio-separator/releases/"
+                    "download/model-configs/vocals_mel_band_roformer.yaml",
+                    "b958b29c8f7195f0d86bee6759a33980db675c4ecaf2fcaa80fa125828e6cd38",
+                ),
+            ],
+        ),
+        (
+            "htdemucs_6s.yaml",
+            [
+                (
+                    "5c90dfd2-34c22ccb.th",
+                    "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/"
+                    "5c90dfd2-34c22ccb.th",
+                    "34c22ccb381c6f9fdbf324f04e1e2fe21aaaf293f5ded163a162697ff9a02ddd",
+                ),
+                (
+                    "htdemucs_6s.yaml",
+                    "https://github.com/TRvlvr/model_repo/releases/download/"
+                    "all_public_uvr_models/htdemucs_6s.yaml",
+                    "207405151270af8fd81c2373c25d27950916682ac91dca7884a11ce13dad6f58",
+                ),
+            ],
+        ),
+    ],
+)
+def test_pinned_model_manifest_has_fixed_assets(model_name, expected):
+    model = separate_module._PINNED_MODELS[model_name]
+
+    assert [(asset.filename, asset.url, asset.sha256) for asset in model.assets] == expected
+
+
+def test_load_waits_until_every_asset_is_verified(tmp_path, monkeypatch):
+    events: list[str] = []
+
+    class RecordingSeparator:
+        model_file_dir = str(tmp_path)
+
+        def load_model(self, model_name):
+            events.append(f"load:{model_name}")
+
+    monkeypatch.setattr(
+        separate_module,
+        "_download_if_missing",
+        lambda url, dest, sha: events.append(f"verify:{dest.name}"),
+    )
+
+    separate_module._load_model(RecordingSeparator(), "vocals_mel_band_roformer.ckpt")
+
+    assert events == [
+        "verify:vocals_mel_band_roformer.ckpt",
+        "verify:vocals_mel_band_roformer.yaml",
+        "load:vocals_mel_band_roformer.ckpt",
+    ]
+
+
+@pytest.mark.parametrize("failed_asset", [0, 1])
+def test_load_never_starts_when_either_pinned_asset_fails(
+    tmp_path, monkeypatch, failed_asset
+):
+    calls = 0
+
+    class RecordingSeparator:
+        model_file_dir = str(tmp_path)
+
+        def load_model(self, model_name):
+            nonlocal calls
+            calls += 1
+
+    attempt = 0
+
+    def fail_selected_asset(url, dest, sha):
+        nonlocal attempt
+        current = attempt
+        attempt += 1
+        if current == failed_asset:
+            raise RuntimeError(f"bad asset: {dest.name}")
+
+    monkeypatch.setattr(separate_module, "_download_if_missing", fail_selected_asset)
+
+    with pytest.raises(RuntimeError, match="bad asset"):
+        separate_module._load_model(
+            RecordingSeparator(), "vocals_mel_band_roformer.ckpt"
+        )
+
+    assert calls == 0
+
+
+@pytest.mark.parametrize("mismatched_filename", ["model.ckpt", "model.yaml"])
+def test_one_mismatched_cached_asset_is_removed_before_load(
+    tmp_path, monkeypatch, mismatched_filename
+):
+    good_bytes = {
+        "model.ckpt": b"checkpoint bytes",
+        "model.yaml": b"yaml bytes",
+    }
+    for filename, content in good_bytes.items():
+        (tmp_path / filename).write_bytes(
+            b"mismatched bytes" if filename == mismatched_filename else content
+        )
+
+    test_model = separate_module._PinnedModel(
+        model_type="MDXC",
+        friendly_name="test model",
+        stems=("Vocals", "Other"),
+        target_stem="Vocals",
+        assets=tuple(
+            separate_module._ModelAsset(
+                filename,
+                f"https://example.invalid/{filename}",
+                _sha256_hex(content),
+            )
+            for filename, content in good_bytes.items()
+        ),
+    )
+    monkeypatch.setitem(separate_module._PINNED_MODELS, "model.ckpt", test_model)
+    monkeypatch.setattr(separate_module, "_download_if_missing", _real_download_if_missing)
+    load_calls = 0
+
+    class RecordingSeparator:
+        model_file_dir = str(tmp_path)
+
+        def load_model(self, model_name):
+            nonlocal load_calls
+            load_calls += 1
+
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        separate_module._load_model(RecordingSeparator(), "model.ckpt")
+
+    assert load_calls == 0
+    assert not (tmp_path / mismatched_filename).exists()
+    other_filename = ({"model.ckpt", "model.yaml"} - {mismatched_filename}).pop()
+    assert (tmp_path / other_filename).read_bytes() == good_bytes[other_filename]
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError("boom"), SystemExit(2)])
+def test_fixed_catalog_and_downloader_are_always_restored(tmp_path, monkeypatch, failure):
+    observed_catalog: dict[str, Any] | None = None
+
+    class InspectingSeparator:
+        model_file_dir = str(tmp_path)
+
+        def list_supported_model_files(self):
+            return {"original": {}}
+
+        def download_file_if_not_exists(self, url, output_path):
+            raise AssertionError("original downloader must not run for a pinned model")
+
+        def load_model(self, model_name):
+            nonlocal observed_catalog
+            observed_catalog = self.list_supported_model_files()
+            for asset in separate_module._PINNED_MODELS[model_name].assets:
+                self.download_file_if_not_exists(
+                    "https://untrusted.invalid", tmp_path / asset.filename
+                )
+            if failure is not None:
+                raise failure
+
+    def place_asset(url, dest, sha):
+        dest.write_bytes(b"verified by test")
+
+    monkeypatch.setattr(separate_module, "_download_if_missing", place_asset)
+    separator = InspectingSeparator()
+
+    if failure is None:
+        separate_module._load_model(separator, "htdemucs_6s.yaml")
+    else:
+        with pytest.raises(type(failure)):
+            separate_module._load_model(separator, "htdemucs_6s.yaml")
+
+    assert observed_catalog is not None
+    assert list(observed_catalog) == ["Demucs"]
+    assert "list_supported_model_files" not in separator.__dict__
+    assert "download_file_if_not_exists" not in separator.__dict__
+    assert separator.list_supported_model_files() == {"original": {}}
+
+
+def test_fixed_downloader_rejects_an_unregistered_asset(tmp_path, monkeypatch):
+    class UnexpectedAssetSeparator:
+        model_file_dir = str(tmp_path)
+
+        def load_model(self, model_name):
+            self.download_file_if_not_exists(
+                "https://untrusted.invalid/extra.bin", tmp_path / "extra.bin"
+            )
+
+    monkeypatch.setattr(
+        separate_module,
+        "_download_if_missing",
+        lambda url, dest, sha: dest.write_bytes(b"verified by test"),
+    )
+
+    with pytest.raises(RuntimeError, match="unpinned model asset"):
+        separate_module._load_model(UnexpectedAssetSeparator(), "htdemucs_6s.yaml")
+
+
+def test_pinned_bootstrap_uses_separator_effective_model_directory(tmp_path, monkeypatch):
+    effective_dir = tmp_path / "audio-separator-env-override"
+    download_destinations: list[Path] = []
+    monkeypatch.setenv("AUDIO_SEPARATOR_MODEL_DIR", str(effective_dir))
+
+    class OverriddenModelDirSeparator(FakeSeparator):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.model_file_dir = os.environ["AUDIO_SEPARATOR_MODEL_DIR"]
+
+    monkeypatch.setattr(separator_module, "Separator", OverriddenModelDirSeparator)
+    monkeypatch.setattr(
+        separate_module,
+        "_download_if_missing",
+        lambda url, dest, sha: download_destinations.append(dest),
+    )
+    input_wav, work_dir = _prepare(tmp_path)
+
+    separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
+
+    assert len(download_destinations) == 2
+    assert {dest.parent for dest in download_destinations} == {effective_dir}
+
+
+def test_unregistered_becruily_like_name_is_delegated_without_bootstrap(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(separator_module, "Separator", FakeSeparator)
+    download_calls: list[tuple[str, Path, str]] = []
+    monkeypatch.setattr(
+        separate_module,
+        "_download_if_missing",
+        lambda url, dest, sha: download_calls.append((url, dest, sha)),
+    )
+    input_wav, work_dir = _prepare(tmp_path)
+
+    separate(
+        input_wav,
+        work_dir,
+        spec=_GUITAR_SPEC,
+        model="third_party_becruily_variant.ckpt",
+    )
+
+    assert download_calls == []
+    assert FakeSeparator.instances[0].loaded_model == "third_party_becruily_variant.ckpt"
 
 
 # --- SHA-256 verification of downloaded/cached model files ------------------
@@ -514,14 +801,19 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def test_download_if_missing_accepts_an_existing_file_with_a_matching_hash(tmp_path):
+def test_download_if_missing_accepts_an_existing_file_with_a_matching_hash(
+    tmp_path, monkeypatch
+):
     dest = tmp_path / "model.ckpt"
     content = b"totally real model weights"
     dest.write_bytes(content)
 
-    # Must not raise, and must not touch the file (no network call needed --
-    # spied via a urlretrieve monkeypatch would over-specify; absence of a
-    # raise plus content unchanged is the actual contract).
+    monkeypatch.setattr(
+        separate_module.urllib.request,
+        "urlretrieve",
+        lambda url, filename: pytest.fail("matching cache must not use the network"),
+    )
+
     _real_download_if_missing("https://example.invalid/model.ckpt", dest, _sha256_hex(content))
 
     assert dest.read_bytes() == content
@@ -598,6 +890,25 @@ def test_download_if_missing_uses_a_unique_temp_filename_not_a_fixed_dot_part(tm
     assert len(captured_tmp_names) == 2
     assert captured_tmp_names[0] != captured_tmp_names[1]
     assert all(name != "model.ckpt.part" for name in captured_tmp_names)
+
+
+def test_download_if_missing_preserves_permission_error_cause(tmp_path, monkeypatch):
+    dest = tmp_path / "model.ckpt"
+    denied = PermissionError("model directory is read-only")
+    monkeypatch.setattr(
+        separate_module.urllib.request,
+        "urlretrieve",
+        lambda url, filename: (_ for _ in ()).throw(denied),
+    )
+
+    with pytest.raises(PermissionError) as caught:
+        _real_download_if_missing(
+            "https://example.invalid/model.ckpt", dest, _sha256_hex(b"expected")
+        )
+
+    assert caught.value is denied
+    assert not dest.exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 # --- device strictness: explicit mps/cuda must be verified, not silently
@@ -693,6 +1004,75 @@ def test_run_becruily_default_falls_back_to_htdemucs_on_load_failure(tmp_path, m
     assert np.allclose(data, 0.20, atol=1e-6)
 
 
+@pytest.mark.parametrize("target", ["guitar", "vocals"])
+def test_default_model_fallback_verifies_htdemucs_assets(tmp_path, monkeypatch, target):
+    monkeypatch.setattr(separator_module, "Separator", FailsFirstLoadFakeSeparator)
+    verified: list[str] = []
+    monkeypatch.setattr(
+        separate_module,
+        "_download_if_missing",
+        lambda url, dest, sha: verified.append(dest.name),
+    )
+    input_wav, work_dir = _prepare(tmp_path)
+
+    result = separate(input_wav, work_dir, spec=get_target(target))
+
+    default_assets = {
+        "guitar": [
+            "mel_band_roformer_guitar_becruily.ckpt",
+            "config_mel_band_roformer_guitar_becruily.yaml",
+        ],
+        "vocals": [
+            "vocals_mel_band_roformer.ckpt",
+            "vocals_mel_band_roformer.yaml",
+        ],
+    }
+    assert verified == default_assets[target] + [
+        "5c90dfd2-34c22ccb.th",
+        "htdemucs_6s.yaml",
+    ]
+    assert result.model_used == "htdemucs_6s.yaml"
+
+
+def test_combined_error_keeps_default_and_fallback_verification_failures(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(separator_module, "Separator", FailsFirstLoadFakeSeparator)
+
+    def fail_fallback_asset(url, dest, sha):
+        if dest.name == "5c90dfd2-34c22ccb.th":
+            raise RuntimeError("fallback SHA-256 mismatch")
+
+    monkeypatch.setattr(separate_module, "_download_if_missing", fail_fallback_asset)
+    input_wav, work_dir = _prepare(tmp_path)
+
+    with pytest.raises(RuntimeError) as caught:
+        separate(input_wav, work_dir, spec=_GUITAR_SPEC)
+
+    message = str(caught.value)
+    assert "mel_band_roformer_guitar_becruily.ckpt" in message
+    assert "htdemucs_6s.yaml" in message
+    assert "fallback SHA-256 mismatch" in message
+
+
+@pytest.mark.parametrize("target", ["bass", "drums", "piano"])
+def test_shared_htdemucs_targets_use_the_same_pinned_assets(
+    tmp_path, monkeypatch, target
+):
+    monkeypatch.setattr(separator_module, "Separator", AnyTargetFakeSeparator)
+    verified: list[str] = []
+    monkeypatch.setattr(
+        separate_module,
+        "_download_if_missing",
+        lambda url, dest, sha: verified.append(dest.name),
+    )
+    input_wav, work_dir = _prepare(tmp_path)
+
+    separate(input_wav, work_dir, spec=get_target(target))
+
+    assert verified == ["5c90dfd2-34c22ccb.th", "htdemucs_6s.yaml"]
+
+
 def test_run_explicit_model_does_not_fall_back_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(separator_module, "Separator", FailsFirstLoadFakeSeparator)
     # Explicitly requested and distinct from the default: a failure here must
@@ -703,6 +1083,23 @@ def test_run_explicit_model_does_not_fall_back_on_failure(tmp_path, monkeypatch)
         separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="some_other_model.ckpt")
 
     assert len(FailsFirstLoadFakeSeparator.instances) == 1
+
+
+def test_explicit_pinned_model_is_verified_without_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(separator_module, "Separator", SystemExitOnLoadFakeSeparator)
+    verified: list[str] = []
+    monkeypatch.setattr(
+        separate_module,
+        "_download_if_missing",
+        lambda url, dest, sha: verified.append(dest.name),
+    )
+    input_wav, work_dir = _prepare(tmp_path)
+
+    with pytest.raises(RuntimeError, match="htdemucs_6s.yaml"):
+        separate(input_wav, work_dir, spec=_GUITAR_SPEC, model="htdemucs_6s.yaml")
+
+    assert verified == ["5c90dfd2-34c22ccb.th", "htdemucs_6s.yaml"]
+    assert len(SystemExitOnLoadFakeSeparator.instances) == 1
 
 
 def test_run_system_exit_from_load_model_becomes_runtime_error(tmp_path, monkeypatch):

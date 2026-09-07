@@ -159,7 +159,7 @@ def _construct_separator(separator_cls: Any, work_dir: Path, device: str) -> Any
         return separator_cls(**kwargs)
 
 
-# --- becruily guitar Mel-Band Roformer bootstrap ----------------------------
+# --- Pinned model bootstrap --------------------------------------------------
 #
 # TargetSpec.default_model (registry.py) isn't one of audio-separator's built-in
 # models -- HuggingFace's becruily/mel-band-roformer-guitar needs three things
@@ -168,16 +168,14 @@ def _construct_separator(separator_cls: Any, work_dir: Path, device: str) -> Any
 #
 #   1. audio-separator's own catalog (Separator.list_supported_model_files)
 #      has never heard of this model, so Separator.load_model() would refuse
-#      the filename outright. _inject_becruily_catalog wraps the catalog
-#      method to add an entry, in the same shape audio-separator builds for
-#      its own MDXC-architecture models.
+#      the filename outright. The fixed catalog below supplies an entry in
+#      the same shape audio-separator builds for its own MDXC models.
 #   2. That entry's files aren't hosted where audio-separator's own
 #      downloader looks (generic UVR/audio-separator release URLs), so they
-#      must already be sitting in model_file_dir before load_model() runs --
-#      Separator.download_model_files() then finds them present and skips
-#      downloading them itself (download_file_if_not_exists does a plain
-#      os.path.isfile check). audio-separator also picks its YAML-parsing
-#      path by filename (needs a "roformer"/"mel" substring -- see
+#      must already be sitting in model_file_dir before load_model() runs.
+#      During the load, Bunri's downloader guard confirms that only those
+#      verified files are requested. audio-separator also picks its
+#      YAML-parsing path by filename (needs a "roformer"/"mel" substring -- see
 #      load_model_data_from_yaml), which is why the local names below differ
 #      from the names HuggingFace hosts the files under.
 #   3. audio-separator 0.44.3 has its own bug, independent of the above:
@@ -209,11 +207,82 @@ _BECRUILY_CKPT_SHA256 = "83472bbf125774af5282d2e0b86df89eaf2dd45e8a4ec8d68e820eb
 _BECRUILY_YAML_SHA256 = "b681c3f886251b04b666b3f06e87ce65d7ec610e40b5d75915c01782e5444b0e"
 
 
-def _is_becruily_model(model_filename: str) -> bool:
-    """Gate for every becruily-specific code path below, so any other model
-    (including the htdemucs_6s fallback) never pays for HF downloads, the
-    catalog wrapper, or the MaskEstimator patch."""
-    return "becruily" in model_filename.lower()
+@dataclass(frozen=True)
+class _ModelAsset:
+    filename: str
+    url: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _PinnedModel:
+    model_type: str
+    friendly_name: str
+    stems: tuple[str, ...]
+    target_stem: str | None
+    assets: tuple[_ModelAsset, ...]
+
+
+_PINNED_MODELS: dict[str, _PinnedModel] = {
+    _BECRUILY_CKPT_LOCAL_NAME: _PinnedModel(
+        model_type="MDXC",
+        friendly_name=_BECRUILY_CATALOG_NAME,
+        stems=("Guitar", "Other"),
+        target_stem="Guitar",
+        assets=(
+            _ModelAsset(
+                _BECRUILY_CKPT_LOCAL_NAME,
+                f"{_BECRUILY_REPO_BASE}/{_BECRUILY_CKPT_HF_NAME}",
+                _BECRUILY_CKPT_SHA256,
+            ),
+            _ModelAsset(
+                _BECRUILY_YAML_LOCAL_NAME,
+                f"{_BECRUILY_REPO_BASE}/{_BECRUILY_YAML_HF_NAME}",
+                _BECRUILY_YAML_SHA256,
+            ),
+        ),
+    ),
+    "vocals_mel_band_roformer.ckpt": _PinnedModel(
+        model_type="MDXC",
+        friendly_name="Roformer Model: MelBand Roformer | Vocals by Kimberley Jensen",
+        stems=("Vocals", "Other"),
+        target_stem="Vocals",
+        assets=(
+            _ModelAsset(
+                "vocals_mel_band_roformer.ckpt",
+                "https://github.com/nomadkaraoke/python-audio-separator/releases/"
+                "download/model-configs/vocals_mel_band_roformer.ckpt",
+                "87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e",
+            ),
+            _ModelAsset(
+                "vocals_mel_band_roformer.yaml",
+                "https://github.com/nomadkaraoke/python-audio-separator/releases/"
+                "download/model-configs/vocals_mel_band_roformer.yaml",
+                "b958b29c8f7195f0d86bee6759a33980db675c4ecaf2fcaa80fa125828e6cd38",
+            ),
+        ),
+    ),
+    "htdemucs_6s.yaml": _PinnedModel(
+        model_type="Demucs",
+        friendly_name="Demucs v4: htdemucs_6s",
+        stems=("Vocals", "Drums", "Bass", "Other", "Guitar", "Piano"),
+        target_stem=None,
+        assets=(
+            _ModelAsset(
+                "5c90dfd2-34c22ccb.th",
+                "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/"
+                "5c90dfd2-34c22ccb.th",
+                "34c22ccb381c6f9fdbf324f04e1e2fe21aaaf293f5ded163a162697ff9a02ddd",
+            ),
+            _ModelAsset(
+                "htdemucs_6s.yaml",
+                "https://github.com/TRvlvr/model_repo/releases/download/"
+                "all_public_uvr_models/htdemucs_6s.yaml",
+                "207405151270af8fd81c2373c25d27950916682ac91dca7884a11ce13dad6f58",
+            ),
+        ),
+    ),
+}
 
 
 def _sha256_of(path: Path) -> str:
@@ -262,28 +331,14 @@ def _download_if_missing(url: str, dest: Path, expected_sha256: str) -> None:
                 f"(expected {expected_sha256}, got {actual})"
             )
         tmp.replace(dest)
-    finally:
-        tmp.unlink(missing_ok=True)  # no-op once replace() has moved it into place
-
-
-def _inject_becruily_catalog(separator: Any) -> None:
-    """Wrap this Separator instance's list_supported_model_files so it also
-    reports the becruily guitar model. Instance-local, not a package patch:
-    only Separator objects this function constructs are ever affected."""
-    original = separator.list_supported_model_files
-
-    def patched() -> dict[str, Any]:
-        catalog = original()
-        catalog.setdefault("MDXC", {})[_BECRUILY_CATALOG_NAME] = {
-            "filename": _BECRUILY_CKPT_LOCAL_NAME,
-            "scores": {},
-            "stems": ["Guitar", "Other"],
-            "target_stem": "Guitar",
-            "download_files": [_BECRUILY_CKPT_LOCAL_NAME, _BECRUILY_YAML_LOCAL_NAME],
-        }
-        return catalog
-
-    separator.list_supported_model_files = patched
+    except BaseException:
+        # Cleanup is best-effort and must never replace the original error
+        # (especially a PermissionError) with a secondary unlink failure.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 @contextmanager
@@ -306,21 +361,80 @@ def _patched_mask_estimator_mlp_expansion_factor():
         mbr.MaskEstimator = original
 
 
-def _bootstrap_becruily(separator: Any) -> None:
-    """Everything the becruily guitar model needs beyond a stock
-    audio-separator install, short of the MaskEstimator patch (that one has
-    to stay scoped around load_model() itself, not run ahead of it)."""
-    _download_if_missing(
-        f"{_BECRUILY_REPO_BASE}/{_BECRUILY_CKPT_HF_NAME}",
-        _MODEL_DIR / _BECRUILY_CKPT_LOCAL_NAME,
-        _BECRUILY_CKPT_SHA256,
-    )
-    _download_if_missing(
-        f"{_BECRUILY_REPO_BASE}/{_BECRUILY_YAML_HF_NAME}",
-        _MODEL_DIR / _BECRUILY_YAML_LOCAL_NAME,
-        _BECRUILY_YAML_SHA256,
-    )
-    _inject_becruily_catalog(separator)
+def _fixed_catalog(model_name: str, model: _PinnedModel) -> dict[str, Any]:
+    return {
+        model.model_type: {
+            model.friendly_name: {
+                "filename": model_name,
+                "scores": {},
+                "stems": list(model.stems),
+                "target_stem": model.target_stem,
+                "download_files": [asset.filename for asset in model.assets],
+            }
+        }
+    }
+
+
+@contextmanager
+def _pinned_audio_separator_io(separator: Any, model_name: str, model: _PinnedModel):
+    """Expose only one verified model to audio-separator while it loads.
+
+    The library still walks its normal catalog/downloader code, but neither
+    operation can consult a remote catalog or fetch unchecked bytes. Both
+    instance overrides are removed even when load_model raises SystemExit.
+    """
+    allowed = {asset.filename for asset in model.assets}
+    model_dir = Path(separator.model_file_dir)
+    had_catalog_override = "list_supported_model_files" in separator.__dict__
+    old_catalog_override = separator.__dict__.get("list_supported_model_files")
+    had_downloader_override = "download_file_if_not_exists" in separator.__dict__
+    old_downloader_override = separator.__dict__.get("download_file_if_not_exists")
+
+    def catalog() -> dict[str, Any]:
+        return _fixed_catalog(model_name, model)
+
+    def require_verified_asset(_url: str, output_path: str | os.PathLike[str]) -> None:
+        requested = Path(output_path)
+        if requested.parent != model_dir or requested.name not in allowed:
+            raise RuntimeError(
+                f"audio-separator requested unpinned model asset {requested}"
+            )
+        if not requested.is_file():
+            raise RuntimeError(
+                f"verified model asset disappeared before loading: {requested}"
+            )
+
+    separator.list_supported_model_files = catalog
+    separator.download_file_if_not_exists = require_verified_asset
+    try:
+        yield
+    finally:
+        if had_catalog_override:
+            separator.list_supported_model_files = old_catalog_override
+        else:
+            del separator.list_supported_model_files
+        if had_downloader_override:
+            separator.download_file_if_not_exists = old_downloader_override
+        else:
+            del separator.download_file_if_not_exists
+
+
+def _load_model(separator: Any, model_name: str) -> None:
+    model = _PINNED_MODELS.get(model_name)
+    if model is None:
+        separator.load_model(model_name)
+        return
+
+    model_dir = Path(separator.model_file_dir)
+    for asset in model.assets:
+        _download_if_missing(asset.url, model_dir / asset.filename, asset.sha256)
+
+    with _pinned_audio_separator_io(separator, model_name, model):
+        if model_name == _BECRUILY_CKPT_LOCAL_NAME:
+            with _patched_mask_estimator_mlp_expansion_factor():
+                separator.load_model(model_name)
+        else:
+            separator.load_model(model_name)
 
 
 def _new_staging_dir(work_dir: Path) -> Path:
@@ -359,8 +473,9 @@ def _run_separation(
 ) -> list[str]:
     """Construct a Separator, load model_name, and separate input_wav into
     work_dir, requesting the target stem be written as target_wav.stem.
-    Applies the becruily bootstrap iff model_name is the becruily guitar
-    model -- every other model pays nothing for it.
+    Applies Bunri's fixed-asset bootstrap when model_name is registered in the
+    pinned manifest. Unknown explicit models retain audio-separator's normal
+    catalog and download behavior.
 
     A failure raised as an ordinary exception and one raised as SystemExit
     (mdxc_separator.py calls sys.exit(1), not a plain raise, when a
@@ -370,12 +485,7 @@ def _run_separation(
     """
     try:
         separator = _construct_separator(separator_cls, work_dir, device)
-        if _is_becruily_model(model_name):
-            _bootstrap_becruily(separator)
-            with _patched_mask_estimator_mlp_expansion_factor():
-                separator.load_model(model_name)
-        else:
-            separator.load_model(model_name)
+        _load_model(separator, model_name)
         return separator.separate(
             str(input_wav), custom_output_names={stem_name: target_wav.stem}
         )

@@ -45,6 +45,10 @@ Phase 0(スキャフォールド + 依存関係スパイク)で得た技術的�
    参照)が新しいバージョンの依存関係でも引き続き解決可能か `uv sync` で確認する。
 5. `audio-separator[cpu]` の extra 経由で入る `onnxruntime` のバージョンが
    問題なく解決されるか確認する(下記参照)。
+6. 登録済みモデルの固定 catalog が `list_supported_model_files()` の戻り値形式に、
+   downloader guard が `download_file_if_not_exists(url, output_path)` の呼び出し規約に
+   適合するか確認する。固定 asset 以外の要求を拒否し、成功・例外・`SystemExit` の
+   すべてで一時置換が復元されることも確認する。
 
 ## スパイク結果
 
@@ -119,18 +123,20 @@ tab-maker リポジトリのコミット履歴・作業メモにのみ残って�
 (`008d401 Default to guitar-specialized Mel-Roformer separation (becruily)`)
 を参照すること。
 
-### becruily モデル採用に必要だった3つの回避策(そのまま移植済み)
+### becruily モデル採用に必要な3つの対応
 
 becruily/mel-band-roformer-guitar は audio-separator のビルトインカタログに
-無いモデルのため、採用には以下3つの「検証済みの回避策」が必要だった。
-`src/stemlab/separate.py` にコメントごと移植してある:
+無いモデルのため、以下3つの対応を `src/bunri/separate.py` に実装している:
 
 1. **HuggingFace からの自動ダウンロード**: audio-separator 自身のダウンローダは
    このモデルのファイルを知らないため、`model_file_dir` に事前に配置しておく
    必要がある(`_download_if_missing`)。
-2. **カタログへの注入**: `Separator.list_supported_model_files()` の戻り値に
+2. **固定カタログ**: `Separator.list_supported_model_files()` の戻り値に
    このモデルのエントリが無いと `load_model()` がファイル名を拒否するため、
-   インスタンス単位でこのメソッドをラップして注入する(`_inject_becruily_catalog`)。
+   `load_model()` 中だけ対象モデルの固定カタログを返す。guitar / vocals /
+   htdemucs の登録済みモデルは同じ共通処理を使い、audio-separator の可変
+   `download_checks.json` を参照しない。downloader も検証済み asset の存在だけを
+   確認する guard に一時置換する。
 3. **audio-separator 0.44.3 自身のバグの回避**: `mel_band_roformer.py:314` が
    `mlp_expansion_factor` を `MaskEstimator` のコンストラクタに渡し忘れており、
    このチェックポイント用の値(1)ではなくクラスデフォルト(4)が使われてしまう。
@@ -333,8 +339,8 @@ audio-separator 0.44.3 のカタログ(`Separator.list_supported_model_files()` 
 | 12.10 | model_bs_roformer_ep_368_sdr_12.9628.ckpt | vocals/instrumental |
 | 10.79 | htdemucs_ft.yaml | 4-stem Demucs |
 
-- カタログ組み込みモデルなので audio-separator 自身がダウンロードできる
-  (becruily のようなブートストラップは不要)
+- Bunri が固定 URL から checkpoint と YAML を事前取得し、両方の SHA-256 を
+  検証してから固定カタログ経由でロードする
 - 2-stem(vocals/other)なので backing = other stem がそのままカラオケ音源になる
 - フォールバックは htdemucs_6s.yaml(Vocals stem あり、guitar と共通)
 - 品質はユーザー試聴ゲートで確認(SDR はあくまで序列の目安)
