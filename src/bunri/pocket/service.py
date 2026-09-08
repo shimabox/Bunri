@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Literal
 
 from bunri.package_metadata import SourceIdentity
-from bunri.pocket.config import read_config
+from bunri.pocket.config import connection_fingerprint, read_config
 from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
 from bunri.pocket.local import (
     LocalPackage,
@@ -422,18 +422,24 @@ def delete_track(
     out_dir: Path,
     target: DeleteTargetIdentity,
     *,
+    expected_connection_fingerprint: str,
     lock: SyncLock | None = None,
     client: PocketHTTPClient | None = None,
 ) -> DeleteResult:
     """Delete one shelf track while holding the shared Pocket mutation lock."""
-    config = read_config(out_dir)
-    if config is None:
-        raise PocketServiceError("Pocket の接続設定がありません。", kind="not_connected")
     if not re.fullmatch(r"[0-9a-f]{12}", target.song_id):
         raise PocketServiceError("song ID が不正です。", kind="invalid_song_id")
     owned_lock = lock is None
     active_lock = lock or SyncLock(out_dir).acquire()
     try:
+        config = read_config(out_dir)
+        if config is None:
+            raise PocketServiceError("Pocket の接続設定がありません。", kind="not_connected")
+        if connection_fingerprint(config) != expected_connection_fingerprint:
+            raise PocketServiceError(
+                "接続先が変更されたため削除を中止しました。対象を選び直してください",
+                kind="connection_changed",
+            )
         if target.safe_name is not None:
             current = resolve_delete_target(out_dir, target.safe_name)
             if current.song_id != target.song_id or (
@@ -514,6 +520,7 @@ def safe_delete_error(exc: BaseException) -> str:
             "remote_invalid": "棚の library が破損しています。棚の内容は変更されていません。",
             "invalid_song_id": "song ID は小文字16進12桁で指定してください。",
             "delete_unknown": "棚からの削除を確認できませんでした。同じ song ID で再実行できます。",
+            "connection_changed": "接続先が変更されたため削除を中止しました。対象を選び直してください",
         }
         return messages.get(exc.kind, "Pocket の削除を開始できません。")
     if isinstance(exc, LocalPreflightError):

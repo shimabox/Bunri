@@ -673,6 +673,7 @@ class Job:
     pocket_song_id: Optional[str] = None
     pocket_digest: Optional[str] = None
     pocket_safe_name: Optional[str] = None
+    pocket_connection_fingerprint: Optional[str] = None
     progress: Optional[dict[str, Any]] = None
     result: Optional[dict[str, Any]] = None
 
@@ -717,6 +718,7 @@ _OPTIONAL_DATETIME_FIELDS = ("started_at", "finished_at")
 _OPTIONAL_STR_FIELDS = (
     "error", "package", "log", "upload", "kind", "pocket_song_id",
     "pocket_digest", "pocket_safe_name",
+    "pocket_connection_fingerprint",
 )
 # Every field of Job that can hold text, for checks that apply to all of them.
 _ALL_STR_FIELDS = _REQUIRED_STR_FIELDS + _OPTIONAL_DATETIME_FIELDS + _OPTIONAL_STR_FIELDS
@@ -884,6 +886,11 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
             if _safe_package_segment(data["pocket_safe_name"]) is not None:
                 return f"{kind} has an unsafe package name"
         if kind == "pocket_delete":
+            if (
+                not isinstance(data.get("pocket_connection_fingerprint"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", data["pocket_connection_fingerprint"]) is None
+            ):
+                return "pocket_delete has an invalid connection fingerprint"
             result = data.get("result")
             if not isinstance(result, dict) or any(
                 type(result.get(name)) is not bool
@@ -902,7 +909,7 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
             return "non-object field: 'progress'"
         if data.get("result") is not None and not isinstance(data["result"], dict):
             return "non-object field: 'result'"
-        for name in ("id", "status", "created_at", "error", "pocket_song_id", "pocket_digest", "pocket_safe_name"):
+        for name in ("id", "status", "created_at", "error", "pocket_song_id", "pocket_digest", "pocket_safe_name", "pocket_connection_fingerprint"):
             value = data.get(name)
             if isinstance(value, str):
                 try:
@@ -1975,6 +1982,7 @@ class JobStore:
         song_id: str,
         digest: str,
         safe_name: str,
+        connection_fingerprint: str,
         sync_lock: SyncLock,
     ) -> Job:
         """Persist a remote-first delete while its Pocket mutation lock is held."""
@@ -2001,6 +2009,7 @@ class JobStore:
                 pocket_song_id=song_id,
                 pocket_digest=digest,
                 pocket_safe_name=safe_name,
+                pocket_connection_fingerprint=connection_fingerprint,
                 result={"pocket_deleted": False, "local_deleted": False},
             )
             self._jobs[job_id] = job
@@ -2234,7 +2243,11 @@ class JobStore:
                     return
                 self._pocket_locks[job.id] = sync_lock
             if job.kind == "pocket_delete":
-                assert job.pocket_song_id is not None and job.pocket_digest is not None
+                assert (
+                    job.pocket_song_id is not None
+                    and job.pocket_digest is not None
+                    and job.pocket_connection_fingerprint is not None
+                )
                 safe_name = job.pocket_safe_name
                 remote_delete_was_confirmed = (
                     isinstance(job.result, dict)
@@ -2280,7 +2293,12 @@ class JobStore:
                     digest=job.pocket_digest,
                     safe_name=safe_name,
                 )
-                delete_track(self.out_dir, target, lock=sync_lock)
+                delete_track(
+                    self.out_dir,
+                    target,
+                    lock=sync_lock,
+                    expected_connection_fingerprint=job.pocket_connection_fingerprint,
+                )
                 job.result = {"pocket_deleted": True, "local_deleted": False}
                 with self._lock:
                     self._write_job(job)

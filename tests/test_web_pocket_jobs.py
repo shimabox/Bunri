@@ -14,11 +14,15 @@ from bunri.package_metadata import (
     TargetMetadata,
     write_package_metadata,
 )
-from bunri.pocket.config import PocketConfig, save_config
+from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.service import DeleteTargetIdentity, PocketServiceError
 from bunri.pocket.sync import SyncResult
 from bunri.web.jobs import Job, JobStore, SongNotFoundError
+
+
+TOKEN = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+CONNECTION_FINGERPRINT = connection_fingerprint(PocketConfig("https://example.invalid", TOKEN))
 
 
 def wait_for(predicate, timeout: float = 5.0) -> None:
@@ -81,6 +85,7 @@ def make_recoverable_delete(out_dir, *, pocket_deleted: bool) -> Job:
         pocket_song_id="a" * 12,
         pocket_digest="a" * 40,
         pocket_safe_name="Song",
+        pocket_connection_fingerprint=CONNECTION_FINGERPRINT,
         result={"pocket_deleted": pocket_deleted, "local_deleted": False},
     )
     write_job(out_dir, job)
@@ -131,6 +136,7 @@ def test_pocket_delete_runs_remote_before_local_and_records_complete_result(tmp_
             song_id="a" * 12,
             digest="a" * 40,
             safe_name="Song",
+            connection_fingerprint=CONNECTION_FINGERPRINT,
             sync_lock=SyncLock(tmp_path).acquire(),
         )
         wait_for(lambda: store.get_job(job.id).status == "done")
@@ -159,6 +165,7 @@ def test_pocket_delete_remote_failure_keeps_local_and_stores_safe_retry_message(
             song_id="a" * 12,
             digest="a" * 40,
             safe_name="Song",
+            connection_fingerprint=CONNECTION_FINGERPRINT,
             sync_lock=SyncLock(tmp_path).acquire(),
         )
         wait_for(lambda: store.get_job(job.id).status == "error")
@@ -185,6 +192,7 @@ def test_pocket_delete_local_failure_records_partial_success(tmp_path, monkeypat
             song_id="a" * 12,
             digest="a" * 40,
             safe_name="Song",
+            connection_fingerprint=CONNECTION_FINGERPRINT,
             sync_lock=SyncLock(tmp_path).acquire(),
         )
         wait_for(lambda: store.get_job(job.id).status == "error")
@@ -213,12 +221,89 @@ def test_pocket_delete_missing_local_song_after_remote_204_is_idempotent_success
             song_id="a" * 12,
             digest="a" * 40,
             safe_name="Song",
+            connection_fingerprint=CONNECTION_FINGERPRINT,
             sync_lock=SyncLock(tmp_path).acquire(),
         )
         wait_for(lambda: store.get_job(job.id).status == "done")
         finished = store.get_job(job.id)
         assert finished.result == {"pocket_deleted": True, "local_deleted": True}
         assert finished.error is None
+    finally:
+        store.shutdown()
+
+
+def test_pocket_delete_stops_if_connection_changes_while_job_is_queued(tmp_path, monkeypatch):
+    import bunri.pocket.service as service_module
+    import bunri.web.jobs as jobs_module
+
+    make_local_song(tmp_path)
+    save_config(tmp_path, PocketConfig("https://example.invalid", TOKEN))
+    started = threading.Event()
+    proceed = threading.Event()
+    remote_calls = []
+
+    def delayed_delete(*args, **kwargs):
+        started.set()
+        proceed.wait(timeout=5)
+        return service_module.delete_track(*args, **kwargs)
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            remote_calls.append("client-created")
+
+    monkeypatch.setattr(jobs_module, "delete_track", delayed_delete)
+    monkeypatch.setattr(service_module, "PocketHTTPClient", UnexpectedClient)
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        job = store.create_pocket_delete_job(
+            song_id="a" * 12,
+            digest="a" * 40,
+            safe_name="Song",
+            connection_fingerprint=CONNECTION_FINGERPRINT,
+            sync_lock=SyncLock(tmp_path).acquire(),
+        )
+        assert started.wait(timeout=5)
+        saved = json.loads((tmp_path / "web" / "jobs" / f"{job.id}.json").read_text())
+        assert saved["pocket_connection_fingerprint"] == CONNECTION_FINGERPRINT
+        assert "example.invalid" not in json.dumps(saved)
+        assert TOKEN not in json.dumps(saved)
+
+        save_config(tmp_path, PocketConfig("https://other.invalid", TOKEN))
+        proceed.set()
+        wait_for(lambda: store.get_job(job.id).status == "error")
+
+        failed = store.get_job(job.id)
+        assert failed.result == {"pocket_deleted": False, "local_deleted": False}
+        assert failed.error == "接続先が変更されたため削除を中止しました。対象を選び直してください"
+        assert remote_calls == []
+    finally:
+        proceed.set()
+        store.shutdown()
+
+
+def test_recovered_pocket_delete_stops_if_connection_changed(tmp_path, monkeypatch):
+    import bunri.pocket.service as service_module
+
+    local_job = make_local_song(tmp_path)
+    delete_job = make_recoverable_delete(tmp_path, pocket_deleted=False)
+    save_config(tmp_path, PocketConfig("https://other.invalid", TOKEN))
+    remote_calls = []
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            remote_calls.append("client-created")
+
+    monkeypatch.setattr(service_module, "PocketHTTPClient", UnexpectedClient)
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        wait_for(lambda: store.get_job(delete_job.id).status == "error")
+
+        failed = store.get_job(delete_job.id)
+        assert failed.result == {"pocket_deleted": False, "local_deleted": False}
+        assert failed.error == "接続先が変更されたため削除を中止しました。対象を選び直してください"
+        assert remote_calls == []
+        assert store.get_job(local_job.id) is not None
+        assert (tmp_path / "Song").is_dir()
     finally:
         store.shutdown()
 
@@ -382,6 +467,7 @@ def test_recovered_pocket_delete_waits_for_busy_lock_then_succeeds(tmp_path, mon
         "pocket_song_id": "a" * 12,
         "pocket_digest": "a" * 40,
         "pocket_safe_name": "Song",
+        "pocket_connection_fingerprint": CONNECTION_FINGERPRINT,
         "progress": None,
         "result": {"pocket_deleted": True, "local_deleted": False},
     }))

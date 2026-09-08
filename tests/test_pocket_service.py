@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata, write_package_metadata
-from bunri.pocket.config import PocketConfig, save_config
+from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
 from bunri.pocket.http import JSONDocument, PocketHTTPError
 from bunri.pocket.local import all_package_names
 from bunri.pocket.lock import SyncLock, SyncLockBusy
@@ -385,6 +385,7 @@ def test_direct_remote_only_song_id_deletes_without_local_package_and_releases_l
     result = delete_track(
         tmp_path,
         DeleteTargetIdentity("abcdef123456"),
+        expected_connection_fingerprint=connection_fingerprint(PocketConfig("https://example.invalid", TOKEN)),
         client=Client(),
     )
     assert result.song_id == "abcdef123456"
@@ -403,7 +404,12 @@ def test_safe_name_delete_revalidates_full_identity_inside_lock(tmp_path):
         def delete_track(self, song_id):
             assert song_id == "b" * 12
 
-    delete_track(tmp_path, target, client=Client())
+    delete_track(
+        tmp_path,
+        target,
+        expected_connection_fingerprint=connection_fingerprint(PocketConfig("https://example.invalid", TOKEN)),
+        client=Client(),
+    )
 
 
 def test_delete_503_is_safe_retryable_and_lock_is_released(tmp_path):
@@ -414,7 +420,12 @@ def test_delete_503_is_safe_retryable_and_lock_is_released(tmp_path):
             raise PocketHTTPError(503, "UNAVAILABLE", "https://secret.invalid/token")
 
     with pytest.raises(PocketHTTPError) as caught:
-        delete_track(tmp_path, DeleteTargetIdentity("abcdef123456"), client=Client())
+        delete_track(
+            tmp_path,
+            DeleteTargetIdentity("abcdef123456"),
+            expected_connection_fingerprint=connection_fingerprint(PocketConfig("https://example.invalid", TOKEN)),
+            client=Client(),
+        )
     message = safe_delete_error(caught.value)
     assert "同じ song ID" in message
     assert "secret" not in message

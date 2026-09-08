@@ -204,6 +204,39 @@ def test_pocket_delete_song_id_with_yes_needs_no_local_package(tmp_path, monkeyp
     assert "棚から削除しました: abcdef123456" in _plain(result.output)
 
 
+def test_pocket_delete_stops_when_connection_changes_after_confirmation(tmp_path, monkeypatch):
+    import base64
+    import bunri.pocket.cli as pocket_cli
+    import bunri.pocket.service as service_module
+    from bunri.pocket.config import PocketConfig, save_config
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(tmp_path, PocketConfig("https://shelf-a.invalid", token))
+    remote_calls = []
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            remote_calls.append("client-created")
+
+    def change_connection(*_args, **_kwargs):
+        save_config(tmp_path, PocketConfig("https://shelf-b.invalid", token))
+        return True
+
+    monkeypatch.setattr(pocket_cli, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr(pocket_cli.typer, "confirm", change_connection)
+    monkeypatch.setattr(service_module, "PocketHTTPClient", UnexpectedClient)
+
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["delete", "--song-id", "abcdef123456", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+
+    assert result.exit_code == 1
+    assert "接続先が変更されたため削除を中止しました。対象を選び直してください" in _plain(result.output)
+    assert remote_calls == []
+
+
 def test_pocket_delete_invalid_song_id_prints_one_error(tmp_path, monkeypatch):
     import bunri.pocket.cli as pocket_cli
     from bunri.pocket.config import PocketConfig

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -20,6 +21,11 @@ from bunri.safepath import is_real_file_in, verified_mkdir
 class PocketConfig:
     base_url: str
     token: str = field(repr=False)
+
+
+def connection_fingerprint(config: PocketConfig) -> str:
+    """Return a non-secret identity for the configured Pocket endpoint."""
+    return hashlib.sha256(config.base_url.encode("utf-8")).hexdigest()
 
 
 def validate_base_url(raw: str) -> str:

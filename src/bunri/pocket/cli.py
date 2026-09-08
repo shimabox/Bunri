@@ -11,7 +11,7 @@ from typing import Optional
 import typer
 from rich.console import Console
 
-from bunri.pocket.config import PocketConfig, read_config, save_config, validate_base_url, validate_capabilities, validate_token
+from bunri.pocket.config import PocketConfig, connection_fingerprint, read_config, save_config, validate_base_url, validate_capabilities, validate_token
 from bunri.pocket.http import PocketHTTPClient
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.service import (
@@ -147,6 +147,7 @@ def delete_command(
         _fail("Pocket の接続設定を確認できません。")
     if config is None:
         _fail("Pocket の接続設定がありません。")
+    expected_connection_fingerprint = connection_fingerprint(config)
 
     target: DeleteTargetIdentity
     try:
@@ -159,7 +160,12 @@ def delete_command(
         else:
             if not _stdin_is_tty():
                 _fail("対話選択には TTY が必要です。--song-id または SAFE_NAME を指定してください。")
-            tracks = list_library_tracks(output)
+            # Use the same immutable connection identity captured before the
+            # selection UI, then verify it again immediately before deletion.
+            tracks = list_library_tracks(
+                output,
+                client=PocketHTTPClient(config.base_url, config.token),
+            )
             if not tracks:
                 console.print("棚に削除できる曲はありません。")
                 return
@@ -197,7 +203,12 @@ def delete_command(
     except (OSError, SyncLockBusy) as exc:
         _fail(safe_delete_error(exc))
     try:
-        result = delete_track(output, target, lock=mutation_lock)
+        result = delete_track(
+            output,
+            target,
+            lock=mutation_lock,
+            expected_connection_fingerprint=expected_connection_fingerprint,
+        )
     except (PocketServiceError, OSError, RuntimeError, ValueError) as exc:
         _fail(safe_delete_error(exc))
     finally:

@@ -657,6 +657,7 @@ def test_delete_song_excludes_own_delete_and_ignores_unrelated_single_sync(tmp_p
         pocket_song_id="a" * 12,
         pocket_digest="a" * 40,
         pocket_safe_name="Song",
+        pocket_connection_fingerprint="f" * 64,
     )
     other = Job(
         id="j-other-pocket",
@@ -696,6 +697,7 @@ def test_delete_song_rejects_related_or_global_active_pocket_job(tmp_path, kind)
         pocket_song_id=digest[:12] if kind != "pocket_all" else None,
         pocket_digest=digest if kind != "pocket_all" else None,
         pocket_safe_name="Song" if kind != "pocket_all" else None,
+        pocket_connection_fingerprint="f" * 64 if kind == "pocket_delete" else None,
     )
     store = JobStore(tmp_path, runner=lambda *args: 1)
     try:

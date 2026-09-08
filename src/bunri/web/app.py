@@ -23,7 +23,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from bunri.registry import REGISTRY
-from bunri.pocket.config import read_config
+from bunri.pocket.config import connection_fingerprint, read_config
 from bunri.pocket.http import PocketHTTPClient
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.local import package_name_key
@@ -573,7 +573,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
     @app.delete("/api/songs/{song_id}")
     def delete_song(song_id: str, pocket: bool = False) -> Response:
         if pocket:
-            _pocket_config_or_409()
+            config = _pocket_config_or_409()
             song = next((item for item in store.list_songs() if item.id == song_id), None)
             if song is None or not song.targets:
                 raise HTTPException(status_code=404, detail="song not found")
@@ -598,6 +598,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                     song_id=package.metadata.source.cache_key,
                     digest=digest,
                     safe_name=package.directory.name,
+                    connection_fingerprint=connection_fingerprint(config),
                     sync_lock=mutation_lock,
                 )
             except SyncLockBusy as exc:

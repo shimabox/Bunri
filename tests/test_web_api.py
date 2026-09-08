@@ -795,6 +795,7 @@ def test_upload_conflicting_with_pending_delete_is_409_without_orphan(
             song_id=digest[:12],
             digest=digest,
             safe_name="Song",
+            connection_fingerprint="f" * 64,
             sync_lock=SyncLock(tmp_path).acquire(),
         )
         assert remote_started.wait(timeout=5)
@@ -832,6 +833,7 @@ def test_upload_with_another_digest_is_registered_during_pending_delete(
             song_id=deleting_digest[:12],
             digest=deleting_digest,
             safe_name="Deleting Song",
+            connection_fingerprint="f" * 64,
             sync_lock=SyncLock(tmp_path).acquire(),
         )
         assert remote_started.wait(timeout=5)
