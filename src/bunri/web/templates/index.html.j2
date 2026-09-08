@@ -573,8 +573,10 @@
   var songExpandedStates = Object.create(null);
   var downloadExpandedStates = Object.create(null);
   var deleteDialogSong = null;
+  var deleteDialogPocketFingerprint = null;
   var deleteSubmitting = false;
   var pocketConnected = false;
+  var pocketConnectionFingerprint = null;
   var pocketChecking = false;
   var pocketStatuses = Object.create(null);
   var activePocketJobId = null;
@@ -773,8 +775,10 @@
     pocketCount.textContent = pocketProgressText || pocketCountText;
   }
 
-  function setPocketConnected(connected) {
+  function setPocketConnected(connected, fingerprint) {
     pocketConnected = connected === true;
+    pocketConnectionFingerprint = pocketConnected && typeof fingerprint === "string"
+      ? fingerprint : null;
     pocketBanner.hidden = !pocketConnected;
     pocketControls.hidden = !pocketConnected;
   }
@@ -848,8 +852,12 @@
     deleteTargets.textContent = labels.length + "楽器: " + labels.join("、");
     deleteError.textContent = "";
     var pocketStatus = pocketStatuses[song.id];
+    deleteDialogPocketFingerprint = pocketStatus && pocketStatus.connection_fingerprint;
     deletePocket.checked = false;
-    deletePocketOption.hidden = !(pocketConnected && pocketStatus && pocketStatus.can_delete);
+    deletePocketOption.hidden = !(
+      pocketConnected && pocketStatus && pocketStatus.can_delete
+      && deleteDialogPocketFingerprint
+    );
     deletePocketSummary.hidden = true;
     deletePocketNote.hidden = true;
     deleteCancel.disabled = false;
@@ -862,6 +870,7 @@
     var songId = deleteDialogSong && deleteDialogSong.id;
     deleteDialog.close();
     deleteDialogSong = null;
+    deleteDialogPocketFingerprint = null;
     if (restoreFocus && songId) {
       var button = deleteButtonFor(songId);
       if (button) button.focus({ preventScroll: true });
@@ -889,7 +898,9 @@
     deleteError.textContent = "";
     var removeFromPocket = deletePocket.checked;
     var deleteUrl = API_SONGS + "/" + encodeURIComponent(song.id)
-      + (removeFromPocket ? "?pocket=true" : "");
+      + (removeFromPocket
+        ? "?pocket=true&pocket_fingerprint=" + encodeURIComponent(deleteDialogPocketFingerprint)
+        : "");
     fetch(deleteUrl, { method: "DELETE" })
       .then(function (res) {
         if (!res.ok) {
@@ -902,6 +913,7 @@
       .then(function (body) {
         deleteDialog.close();
         deleteDialogSong = null;
+        deleteDialogPocketFingerprint = null;
         if (body && body.job_id) {
           activePocketJobId = body.job_id;
           return refreshSongs();
@@ -1253,7 +1265,7 @@
       .then(function (res) { return res.json(); })
       .then(function (body) {
         if (generation !== pocketJobGeneration) return;
-        setPocketConnected(body.connected);
+        setPocketConnected(body.connected, body.connection_fingerprint);
         var job = body.job;
         renderPocketProgress(job);
         if (job && (job.status === "queued" || job.status === "running")) {
@@ -1277,10 +1289,11 @@
       .then(function (status) {
         if (generation !== pocketStatusGeneration) return;
         var preserveRemoteOnly = status.connected === true && status.state === "unknown";
-        setPocketConnected(status.connected);
+        setPocketConnected(status.connected, status.connection_fingerprint);
         pocketStatuses = Object.create(null);
         if (pocketConnected) {
           (status.songs || []).forEach(function (item) {
+            item.connection_fingerprint = pocketConnectionFingerprint;
             if (item.web_song_id) pocketStatuses[item.web_song_id] = item;
           });
         }

@@ -85,7 +85,12 @@ def _job_status(client, job_id: str) -> str:
 def test_pocket_status_is_hidden_when_not_connected(client):
     response = client.get("/api/pocket/status")
     assert response.status_code == 200
-    assert response.json() == {"connected": False, "target_count": 0, "songs": []}
+    assert response.json() == {
+        "connected": False,
+        "connection_fingerprint": None,
+        "target_count": 0,
+        "songs": [],
+    }
     assert "Bunri Pocket 連携中" in client.get("/").text
 
 
@@ -255,7 +260,7 @@ def test_pocket_job_tracking_never_waits_for_the_remote_inspection(tmp_path, mon
     import base64
     import json
 
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
 
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
     save_config(tmp_path, PocketConfig("https://example.invalid", token))
@@ -293,6 +298,9 @@ def test_pocket_job_tracking_never_waits_for_the_remote_inspection(tmp_path, mon
 
     assert response.status_code == 200
     assert response.json()["connected"] is True
+    assert response.json()["connection_fingerprint"] == connection_fingerprint(
+        PocketConfig("https://example.invalid", token)
+    )
     assert response.json()["job"]["id"] == job_id
     assert response.json()["job"]["status"] == "error"
     assert response.json()["job"]["kind"] == "pocket_all"
@@ -943,7 +951,7 @@ def test_delete_song_with_pocket_flag_returns_202_and_uses_server_side_identity(
     import base64
     import bunri.web.jobs as jobs_module
     from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata, write_package_metadata
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
 
     content = b"pocket-delete"
     digest = hashlib.sha1(content).hexdigest()
@@ -961,18 +969,73 @@ def test_delete_song_with_pocket_flag_returns_202_and_uses_server_side_identity(
     )
     (package / "Delete Pocket.original.mp3").write_bytes(content)
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
-    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    config = PocketConfig("https://example.invalid", token)
+    save_config(client.out_dir, config)
     calls = []
     monkeypatch.setattr(jobs_module, "delete_track", lambda _out, target, **kwargs: calls.append(target))
     web_song_id = client.get("/api/songs").json()[0]["id"]
 
-    response = client.delete(f"/api/songs/{web_song_id}?pocket=true")
+    fingerprint = connection_fingerprint(config)
+    response = client.delete(
+        f"/api/songs/{web_song_id}?pocket=true&pocket_fingerprint={fingerprint}"
+    )
 
     assert response.status_code == 202
     assert set(response.json()) == {"job_id"}
     _wait_until(lambda: client.get(f"/api/jobs/{response.json()['job_id']}").json()["status"] == "done")
+    assert client.app.state.job_store.get_job(
+        response.json()["job_id"]
+    ).pocket_connection_fingerprint == fingerprint
     assert calls[0].song_id == digest[:12]
     assert calls[0].digest == digest
+
+
+def test_pocket_delete_rejects_changed_connection_before_registering_job(client):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
+    from bunri.pocket.lock import SyncLock
+
+    created = _upload(client, title="Connection Changed")
+    _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+    web_song_id = client.get("/api/songs").json()[0]["id"]
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    displayed = PocketConfig("https://shelf-a.invalid", token)
+    save_config(client.out_dir, PocketConfig("https://shelf-b.invalid", token))
+    store = client.app.state.job_store
+    before_ids = {job.id for job in store.list_jobs()}
+
+    response = client.delete(
+        f"/api/songs/{web_song_id}?pocket=true&"
+        f"pocket_fingerprint={connection_fingerprint(displayed)}"
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": (
+            "Pocket の接続先が変更されたため削除を中止しました。"
+            "状態を再読込して確認し直してください。"
+        )
+    }
+    assert {job.id for job in store.list_jobs()} == before_ids
+    assert store._queue.empty()
+    reacquired = SyncLock(client.out_dir).acquire()
+    reacquired.release()
+
+
+def test_pocket_delete_rejects_request_without_connection_fingerprint(client):
+    created = _upload(client, title="Missing Fingerprint")
+    _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+    web_song_id = client.get("/api/songs").json()[0]["id"]
+    store = client.app.state.job_store
+    before_ids = {job.id for job in store.list_jobs()}
+
+    response = client.delete(f"/api/songs/{web_song_id}?pocket=true")
+
+    assert response.status_code == 409
+    assert "状態を再読込して確認し直してください" in response.json()["detail"]
+    assert {job.id for job in store.list_jobs()} == before_ids
+    assert store._queue.empty()
 
 
 def test_pocket_delete_refuses_unsaved_job_without_remote_side_effect(
@@ -987,7 +1050,7 @@ def test_pocket_delete_refuses_unsaved_job_without_remote_side_effect(
         TargetMetadata,
         write_package_metadata,
     )
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
     from bunri.pocket.lock import SyncLock
 
     content = b"pocket-delete-with-unsafe-job-directory"
@@ -1006,7 +1069,8 @@ def test_pocket_delete_refuses_unsaved_job_without_remote_side_effect(
     )
     (package / "Unsafe Pocket Delete.original.mp3").write_bytes(content)
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
-    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    config = PocketConfig("https://example.invalid", token)
+    save_config(client.out_dir, config)
 
     jobs_dir = client.out_dir / "web" / "jobs"
     saved_jobs = client.out_dir / "saved-jobs"
@@ -1024,7 +1088,10 @@ def test_pocket_delete_refuses_unsaved_job_without_remote_side_effect(
     before_ids = {job.id for job in store.list_jobs()}
     web_song_id = client.get("/api/songs").json()[0]["id"]
 
-    response = client.delete(f"/api/songs/{web_song_id}?pocket=true")
+    response = client.delete(
+        f"/api/songs/{web_song_id}?pocket=true&"
+        f"pocket_fingerprint={connection_fingerprint(config)}"
+    )
 
     assert response.status_code == 500
     assert response.json() == {"detail": "削除ジョブを安全に保存できません。"}
@@ -1038,11 +1105,12 @@ def test_pocket_delete_refuses_unsaved_job_without_remote_side_effect(
 
 def test_pocket_status_reports_validated_remote_only_tracks(client, monkeypatch):
     import base64
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
     from bunri.pocket.service import LibraryTrack
 
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
-    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    config = PocketConfig("https://example.invalid", token)
+    save_config(client.out_dir, config)
     monkeypatch.setattr(app_module, "inspect_packages", lambda *_args: ())
     monkeypatch.setattr(
         app_module,
@@ -1053,6 +1121,8 @@ def test_pocket_status_reports_validated_remote_only_tracks(client, monkeypatch)
     response = client.get("/api/pocket/status")
 
     assert response.status_code == 200
+    assert response.json()["connection_fingerprint"] == connection_fingerprint(config)
+    assert "example.invalid" not in response.text and token not in response.text
     assert response.json()["remote_only"] == [
         {"song_id": "abcdef123456", "title": "Remote <script>"}
     ]

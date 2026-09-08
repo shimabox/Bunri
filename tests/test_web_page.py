@@ -1517,6 +1517,7 @@ def test_local_only_delete_refreshes_remote_only_tracks(tmp_path):
                 content_type="application/json",
                 body=json.dumps({
                     "connected": True,
+                    "connection_fingerprint": "a" * 64,
                     "target_count": len(songs),
                     "package_count": len(songs),
                     "songs": songs,
@@ -1557,6 +1558,94 @@ def test_local_only_delete_refreshes_remote_only_tracks(tmp_path):
         assert page.locator(".sw-remote-only-item span").first.text_content() == "Shelf Song"
         assert page.locator(".sw-remote-only-id").text_content() == pocket_song_id
         assert status_state["calls"] == 3
+
+
+@_needs_browser
+def test_pocket_delete_uses_connection_fingerprint_captured_by_dialog(tmp_path):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    config = PocketConfig("https://shelf-a.invalid", token)
+    save_config(out_dir, config)
+    displayed_fingerprint = connection_fingerprint(config)
+    status_state = {
+        "calls": 0,
+        "web_song_id": None,
+        "fingerprint": displayed_fingerprint,
+    }
+
+    def mock_requests(page):
+        def status_handler(route):
+            status_state["calls"] += 1
+            web_song_id = status_state["web_song_id"]
+            songs = [] if web_song_id is None else [{
+                "web_song_id": web_song_id,
+                "song_id": "a" * 12,
+                "title": "Bound Shelf Song",
+                "safe_name": "Bound Shelf Song",
+                "state": "synced",
+                "can_sync": False,
+                "message": None,
+                "conflict": False,
+                "can_delete": True,
+            }]
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "connection_fingerprint": status_state["fingerprint"],
+                    "target_count": len(songs),
+                    "package_count": len(songs),
+                    "songs": songs,
+                    "remote_only": [],
+                }),
+            )
+
+        page.route("**/api/pocket/status", status_handler)
+        page.route(
+            "**/api/songs/*",
+            lambda route: route.fulfill(
+                status=409,
+                content_type="application/json",
+                body=json.dumps({"detail": "test rejection"}),
+            ) if route.request.method == "DELETE" else route.continue_(),
+        )
+
+    app = create_app(out_dir, runner=PageFakeRunner(delay=1.0))
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_requests
+    ) as page:
+        _upload_from_page(page, tmp_path / "Bound Shelf Song.mp3")
+        page.wait_for_function(
+            "window.__bunriWeb.getSongs()[0] && "
+            "['queued', 'running'].includes(window.__bunriWeb.getJobs()[0].status)",
+            timeout=5_000,
+        )
+        status_state["web_song_id"] = page.evaluate("window.__bunriWeb.getSongs()[0].id")
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs()[0].status === 'done' && "
+            "document.querySelector('.sw-pocket-row .sw-badge').textContent === '棚にある'",
+            timeout=10_000,
+        )
+
+        page.click("button.sw-delete-song-btn")
+        page.check("#sw-delete-pocket")
+        status_state["fingerprint"] = "b" * 64
+        with page.expect_response("**/api/pocket/status"):
+            page.evaluate("document.getElementById('sw-pocket-refresh').click()")
+
+        with page.expect_request(
+            lambda request: request.method == "DELETE" and "/api/songs/" in request.url
+        ) as request_info:
+            page.click("#sw-delete-confirm")
+
+        request_url = request_info.value.url
+        assert "pocket=true" in request_url
+        assert f"pocket_fingerprint={displayed_fingerprint}" in request_url
 
 
 @_needs_browser

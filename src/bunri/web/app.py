@@ -411,12 +411,15 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         polling -- for that whole time after every reload.
         """
         try:
-            connected = read_config(out_dir) is not None
+            config = read_config(out_dir)
         except (OSError, ValueError):
-            connected = False
+            config = None
         job = store.active_pocket_job() or store.latest_finished_pocket_all_job()
         return {
-            "connected": connected,
+            "connected": config is not None,
+            "connection_fingerprint": (
+                connection_fingerprint(config) if config is not None else None
+            ),
             "job": _serialize_job(job) if job is not None else None,
         }
 
@@ -427,13 +430,19 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         except (OSError, ValueError):
             return {
                 "connected": False,
+                "connection_fingerprint": None,
                 "state": "unknown",
                 "message": "Pocket の接続設定を確認できません。",
                 "target_count": 0,
                 "songs": [],
             }
         if config is None:
-            return {"connected": False, "target_count": 0, "songs": []}
+            return {
+                "connected": False,
+                "connection_fingerprint": None,
+                "target_count": 0,
+                "songs": [],
+            }
         client = PocketHTTPClient(config.base_url, config.token)
         packages = inspect_packages(out_dir, client)
         try:
@@ -498,6 +507,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         ]
         response = {
             "connected": True,
+            "connection_fingerprint": connection_fingerprint(config),
             "target_count": sum(item.song_id is not None for item in packages),
             "package_count": len(packages),
             "songs": songs,
@@ -571,14 +581,38 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         return JSONResponse({"job_id": job.id}, status_code=202)
 
     @app.delete("/api/songs/{song_id}")
-    def delete_song(song_id: str, pocket: bool = False) -> Response:
+    def delete_song(
+        song_id: str,
+        pocket: bool = False,
+        pocket_fingerprint: str | None = None,
+    ) -> Response:
         if pocket:
-            config = _pocket_config_or_409()
+            if pocket_fingerprint is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Pocket の接続先を確認できないため削除を中止しました。"
+                        "状態を再読込して確認し直してください。"
+                    ),
+                )
             song = next((item for item in store.list_songs() if item.id == song_id), None)
             if song is None or not song.targets:
                 raise HTTPException(status_code=404, detail="song not found")
             digest = song.targets[0].digest
             try:
+                mutation_lock = SyncLock(out_dir).acquire()
+            except (OSError, SyncLockBusy) as exc:
+                raise HTTPException(status_code=409, detail=safe_delete_error(exc))
+            try:
+                config = _pocket_config_or_409()
+                if pocket_fingerprint != connection_fingerprint(config):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Pocket の接続先が変更されたため削除を中止しました。"
+                            "状態を再読込して確認し直してください。"
+                        ),
+                    )
                 package = resolve_package(
                     out_dir,
                     digest[:12],
@@ -586,21 +620,20 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                     expected_digest=digest,
                     include_original=True,
                 )
-            except PocketServiceError as exc:
-                status = 404 if exc.kind == "not_found" else 409
-                raise HTTPException(status_code=status, detail=safe_delete_error(exc))
-            try:
-                mutation_lock = SyncLock(out_dir).acquire()
-            except (OSError, SyncLockBusy) as exc:
-                raise HTTPException(status_code=409, detail=safe_delete_error(exc))
-            try:
                 job = store.create_pocket_delete_job(
                     song_id=package.metadata.source.cache_key,
                     digest=digest,
                     safe_name=package.directory.name,
-                    connection_fingerprint=connection_fingerprint(config),
+                    connection_fingerprint=pocket_fingerprint,
                     sync_lock=mutation_lock,
                 )
+            except HTTPException:
+                mutation_lock.release()
+                raise
+            except PocketServiceError as exc:
+                mutation_lock.release()
+                status = 404 if exc.kind == "not_found" else 409
+                raise HTTPException(status_code=status, detail=safe_delete_error(exc))
             except SyncLockBusy as exc:
                 raise HTTPException(status_code=409, detail=safe_delete_error(exc))
             except OSError:
