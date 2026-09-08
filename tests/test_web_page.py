@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import re
 import socket
 import threading
 import time
@@ -240,6 +241,12 @@ def test_remote_only_tracks_survive_unknown_shelf_status(tmp_path):
         assert page.locator("#sw-remote-only-error").text_content() == (
             "棚の状態を確認できません。"
         )
+        count = page.locator("#sw-pocket-count")
+        assert re.fullmatch(
+            r"棚の状態を確認できません。 · \d{2}:\d{2}",
+            count.text_content(),
+        )
+        assert "is-error" in count.get_attribute("class").split()
         assert page.locator(".sw-remote-only-item").count() == 1
         assert page.locator(".sw-remote-only-item span").first.text_content() == "Shelf Song"
 
@@ -553,6 +560,88 @@ def test_pocket_connection_and_checking_render_before_status_responds(tmp_path):
         badge = page.locator(".sw-pocket-row .sw-badge")
         assert badge.is_visible()
         assert badge.text_content() == "確認中"
+        refresh = page.locator("#sw-pocket-refresh")
+        assert refresh.is_disabled()
+        assert refresh.get_attribute("aria-busy") == "true"
+        assert "再読込中…" in refresh.text_content()
+        assert refresh.locator(".sw-refresh-spinner").count() == 1
+        count = page.locator("#sw-pocket-count")
+        first_count = count.text_content()
+        assert re.fullmatch(r"棚の状態を確認しています… \(\d+:\d{2}\)", first_count)
+        page.wait_for_function(
+            "previous => document.getElementById('sw-pocket-count').textContent !== previous",
+            arg=first_count,
+            timeout=5_000,
+        )
+
+
+@_needs_browser
+def test_pocket_status_success_restores_refresh_button_and_shows_update_time(tmp_path):
+    def mock_status(page):
+        page.route("**/api/pocket/status", lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "connected": True,
+                "package_count": 3,
+                "target_count": 2,
+                "songs": [],
+                "remote_only": [],
+            }),
+        ))
+
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_status
+    ) as page:
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-count').textContent.startsWith("
+            "'出力先の全パッケージ 3件中、同期対象 2件 · ')"
+        )
+        refresh = page.locator("#sw-pocket-refresh")
+        assert refresh.get_attribute("aria-busy") is None
+        assert refresh.text_content() == "状態を再読込"
+        assert re.fullmatch(
+            r"出力先の全パッケージ 3件中、同期対象 2件 · \d{2}:\d{2} に更新",
+            page.locator("#sw-pocket-count").text_content(),
+        )
+
+
+@pytest.mark.parametrize("failure_kind", ["abort", "http_500"])
+@_needs_browser
+def test_pocket_status_failure_shows_error_and_restores_button(tmp_path, failure_kind):
+    def mock_status(page):
+        def handler(route):
+            if failure_kind == "abort":
+                route.abort()
+            else:
+                route.fulfill(
+                    status=500,
+                    content_type="application/json",
+                    body=json.dumps({"detail": "内部エラー"}),
+                )
+
+        page.route("**/api/pocket/status", handler)
+
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_status
+    ) as page:
+        page.wait_for_selector("#sw-remote-only-error:not([hidden])")
+        count = page.locator("#sw-pocket-count")
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-count').classList.contains('is-error')"
+        )
+        assert re.fullmatch(
+            r"棚の状態を確認できません。 · \d{2}:\d{2}",
+            count.text_content(),
+        )
+        assert "is-error" in count.get_attribute("class").split()
+        assert page.locator("#sw-remote-only-error").is_visible()
+        refresh = page.locator("#sw-pocket-refresh")
+        assert refresh.is_enabled()
+        assert refresh.get_attribute("aria-busy") is None
+        assert refresh.text_content() == "状態を再読込"
 
 
 @_needs_browser
@@ -1753,8 +1842,9 @@ def test_local_delete_ignores_older_pocket_status_response(tmp_path, monkeypatch
             assert page.locator("#sw-remote-only").is_visible()
             assert page.locator(".sw-remote-only-item").count() == 1
             assert page.locator(".sw-remote-only-id").text_content() == pocket_song_id
-            assert page.locator("#sw-pocket-count").text_content() == (
-                "出力先の全パッケージ 0件中、同期対象 0件"
+            assert re.fullmatch(
+                r"出力先の全パッケージ 0件中、同期対象 0件 · \d{2}:\d{2} に更新",
+                page.locator("#sw-pocket-count").text_content(),
             )
     finally:
         release_first.set()

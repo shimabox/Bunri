@@ -159,6 +159,27 @@
   }
   button.sw-btn:hover:not(:disabled) { background: #fff7ee; border-color: #e2674e; }
   button.sw-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.sw-btn.is-checking {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    opacity: 1;
+    color: #8a7f74;
+    cursor: progress;
+  }
+  .sw-refresh-spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: sw-spin 0.8s linear infinite;
+  }
+  .sw-pocket-note.is-error { color: #c0392b; }
+  @keyframes sw-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .sw-refresh-spinner { animation: none; }
+  }
   button.sw-btn-primary {
     background: #e2674e;
     border-color: #e2674e;
@@ -560,6 +581,7 @@
   var pocketControls = document.getElementById("sw-pocket-controls");
   var pocketAll = document.getElementById("sw-pocket-all");
   var pocketRefresh = document.getElementById("sw-pocket-refresh");
+  var pocketRefreshInitialLabel = pocketRefresh.textContent;
   var pocketCount = document.getElementById("sw-pocket-count");
   var pocketSummary = document.getElementById("sw-pocket-summary");
   var remoteOnlyError = document.getElementById("sw-remote-only-error");
@@ -582,10 +604,13 @@
   var activePocketJobId = null;
   var pocketJobGeneration = 0;
   var pocketStatusGeneration = 0;
+  var pocketStatusTimer = null;
+  var pocketStatusStartedAt = 0;
   // The package tally comes from the remote status call and the batch progress
   // from the job poll; they share one line, so each keeps its own text and the
   // progress wins whenever a batch is in flight.
   var pocketCountText = "";
+  var pocketCountIsError = false;
   var pocketProgressText = "";
 
   function stem(name) {
@@ -772,7 +797,69 @@
   }
 
   function renderPocketCount() {
-    pocketCount.textContent = pocketProgressText || pocketCountText;
+    if (pocketProgressText) {
+      pocketCount.textContent = pocketProgressText;
+      pocketCount.classList.remove("is-error");
+    } else if (pocketChecking) {
+      var elapsed = Math.floor((Date.now() - pocketStatusStartedAt) / 1000);
+      pocketCount.textContent = "棚の状態を確認しています… (" + fmtMMSS(elapsed) + ")";
+      pocketCount.classList.remove("is-error");
+    } else {
+      pocketCount.textContent = pocketCountText;
+      pocketCount.classList.toggle("is-error", pocketCountIsError);
+    }
+  }
+
+  function localHHMM() {
+    var now = new Date();
+    var hours = String(now.getHours()).padStart(2, "0");
+    var minutes = String(now.getMinutes()).padStart(2, "0");
+    return hours + ":" + minutes;
+  }
+
+  function startPocketStatusCheck(generation) {
+    if (pocketStatusTimer !== null) clearInterval(pocketStatusTimer);
+    pocketChecking = true;
+    pocketStatusStartedAt = Date.now();
+    pocketRefresh.disabled = true;
+    pocketRefresh.classList.add("is-checking");
+    pocketRefresh.setAttribute("aria-busy", "true");
+    pocketRefresh.textContent = "";
+    var spinner = document.createElement("span");
+    spinner.className = "sw-refresh-spinner";
+    spinner.setAttribute("aria-hidden", "true");
+    pocketRefresh.appendChild(spinner);
+    pocketRefresh.appendChild(document.createTextNode("再読込中…"));
+    renderPocketCount();
+    pocketStatusTimer = setInterval(function () {
+      if (generation !== pocketStatusGeneration) return;
+      renderPocketCount();
+    }, 1000);
+  }
+
+  function finishPocketStatusCheck(generation) {
+    if (generation !== pocketStatusGeneration) return;
+    if (pocketStatusTimer !== null) {
+      clearInterval(pocketStatusTimer);
+      pocketStatusTimer = null;
+    }
+    pocketChecking = false;
+    pocketRefresh.disabled = false;
+    pocketRefresh.classList.remove("is-checking");
+    pocketRefresh.removeAttribute("aria-busy");
+    pocketRefresh.textContent = pocketRefreshInitialLabel;
+    renderPocketCount();
+  }
+
+  function renderPocketStatusSuccess(status) {
+    pocketCountText = "出力先の全パッケージ " + (status.package_count || 0)
+      + "件中、同期対象 " + (status.target_count || 0) + "件 · " + localHHMM() + " に更新";
+    pocketCountIsError = false;
+  }
+
+  function renderPocketStatusFailure(message) {
+    pocketCountText = (message || "棚の状態を確認できません。") + " · " + localHHMM();
+    pocketCountIsError = true;
   }
 
   function setPocketConnected(connected, fingerprint) {
@@ -1282,10 +1369,13 @@
 
   function refreshPocketStatus() {
     var generation = ++pocketStatusGeneration;
-    pocketChecking = true;
+    startPocketStatusCheck(generation);
     if (songsCache.length) renderSongs(songsCache);
     return fetch(API_POCKET_STATUS)
-      .then(function (res) { return res.json(); })
+      .then(function (res) {
+        if (!res.ok) throw new Error("Pocket status request failed");
+        return res.json();
+      })
       .then(function (status) {
         if (generation !== pocketStatusGeneration) return;
         var preserveRemoteOnly = status.connected === true && status.state === "unknown";
@@ -1308,18 +1398,23 @@
           remoteOnlyTracks = pocketConnected ? (status.remote_only || []) : [];
         }
         renderRemoteOnly();
-        pocketCountText = "出力先の全パッケージ " + (status.package_count || 0) + "件中、同期対象 " + (status.target_count || 0) + "件";
-        renderPocketCount();
+        if (!pocketConnected) return;
+        if (status.state === "unknown") {
+          renderPocketStatusFailure(status.message);
+        } else {
+          renderPocketStatusSuccess(status);
+        }
       })
       .catch(function () {
         if (generation !== pocketStatusGeneration) return;
         remoteOnlyError.textContent = "棚の状態を確認できません。";
         remoteOnlyError.hidden = false;
         renderRemoteOnly();
+        renderPocketStatusFailure();
       })
       .finally(function () {
         if (generation !== pocketStatusGeneration) return;
-        pocketChecking = false;
+        finishPocketStatusCheck(generation);
         renderSongs(songsCache);
         schedulePoll(songsCache);
       });
