@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from bunri.registry import REGISTRY
+from bunri.pocket.http import PocketHTTPError
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.local import (
     all_package_names,
@@ -54,7 +55,10 @@ from bunri.pocket.local import (
 )
 from bunri.pocket.service import (
     BatchResult,
+    DeleteTargetIdentity,
     PocketServiceError,
+    delete_track,
+    safe_delete_error,
     safe_error,
     sync_all,
     sync_one,
@@ -665,10 +669,11 @@ class Job:
     # find the file it must feed the subprocess; relative to out_dir like the
     # other paths above.
     upload: Optional[str] = None
-    kind: str = "separate"  # separate | pocket_single | pocket_all
+    kind: str = "separate"  # separate | pocket_single | pocket_all | pocket_delete
     pocket_song_id: Optional[str] = None
     pocket_digest: Optional[str] = None
     pocket_safe_name: Optional[str] = None
+    pocket_connection_fingerprint: Optional[str] = None
     progress: Optional[dict[str, Any]] = None
     result: Optional[dict[str, Any]] = None
 
@@ -705,7 +710,7 @@ def song_id(digest: str) -> str:
 
 
 _VALID_STATUSES = {"queued", "running", "done", "error"}
-_VALID_KINDS = {"separate", "pocket_single", "pocket_all"}
+_VALID_KINDS = {"separate", "pocket_single", "pocket_all", "pocket_delete"}
 # Must exist and be a string; every other field is Optional[str] (may be
 # absent or None).
 _REQUIRED_STR_FIELDS = ("id", "digest", "title", "target", "status", "created_at")
@@ -713,6 +718,7 @@ _OPTIONAL_DATETIME_FIELDS = ("started_at", "finished_at")
 _OPTIONAL_STR_FIELDS = (
     "error", "package", "log", "upload", "kind", "pocket_song_id",
     "pocket_digest", "pocket_safe_name",
+    "pocket_connection_fingerprint",
 )
 # Every field of Job that can hold text, for checks that apply to all of them.
 _ALL_STR_FIELDS = _REQUIRED_STR_FIELDS + _OPTIONAL_DATETIME_FIELDS + _OPTIONAL_STR_FIELDS
@@ -870,13 +876,27 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
             return f"id {data['id']!r} does not match filename (expected {expected_id!r})"
         if data["status"] not in _VALID_STATUSES:
             return f"unknown status: {data['status']!r}"
-        if kind == "pocket_single":
+        if kind in ("pocket_single", "pocket_delete"):
             if not isinstance(data.get("pocket_song_id"), str) or not re.fullmatch(r"[0-9a-f]{12}", data["pocket_song_id"]):
-                return "pocket_single has an invalid song id"
+                return f"{kind} has an invalid song id"
             if not isinstance(data.get("pocket_digest"), str) or _SHA1_DIGEST.fullmatch(data["pocket_digest"]) is None:
-                return "pocket_single has an invalid source digest"
+                return f"{kind} has an invalid source digest"
             if not isinstance(data.get("pocket_safe_name"), str) or not data["pocket_safe_name"]:
-                return "pocket_single has an invalid package name"
+                return f"{kind} has an invalid package name"
+            if _safe_package_segment(data["pocket_safe_name"]) is not None:
+                return f"{kind} has an unsafe package name"
+        if kind == "pocket_delete":
+            if (
+                not isinstance(data.get("pocket_connection_fingerprint"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", data["pocket_connection_fingerprint"]) is None
+            ):
+                return "pocket_delete has an invalid connection fingerprint"
+            result = data.get("result")
+            if not isinstance(result, dict) or any(
+                type(result.get(name)) is not bool
+                for name in ("pocket_deleted", "local_deleted")
+            ):
+                return "pocket_delete has an invalid result"
         for name in _OPTIONAL_DATETIME_FIELDS:
             value = data.get(name)
             if value is not None and (not isinstance(value, str) or _datetime_problem(value, name) is not None):
@@ -889,7 +909,7 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
             return "non-object field: 'progress'"
         if data.get("result") is not None and not isinstance(data["result"], dict):
             return "non-object field: 'result'"
-        for name in ("id", "status", "created_at", "error", "pocket_song_id", "pocket_digest", "pocket_safe_name"):
+        for name in ("id", "status", "created_at", "error", "pocket_song_id", "pocket_digest", "pocket_safe_name", "pocket_connection_fingerprint"):
             value = data.get(name)
             if isinstance(value, str):
                 try:
@@ -1199,7 +1219,7 @@ class JobStore:
     def _job_path(self, job_id: str) -> Path:
         return self.jobs_dir / f"{job_id}.json"
 
-    def _write_job(self, job: Job) -> None:
+    def _write_job(self, job: Job) -> bool:
         try:
             self._verified_jobs_dir()
         except UnsafeOutputPath as exc:
@@ -1208,7 +1228,7 @@ class JobStore:
             # whatever in-memory state it has and its record on disk -- which
             # is somebody else's file -- is left exactly as it was.
             _warn(f"[bunri-web] job {job.id}: not saving its record -- {exc}")
-            return
+            return False
         path = self._job_path(job.id)
         encoded = _serialize_job_within_limit(job)
         if len(encoded.encode("utf-8", errors="backslashreplace")) > MAX_JOB_FILE_BYTES:
@@ -1237,6 +1257,7 @@ class JobStore:
             )
             tmp.write_bytes(encoded.encode("utf-8", errors="backslashreplace"))
         os.replace(tmp, path)  # atomic on the same filesystem
+        return True
 
     def _quarantine_job_file(self, path: Path, reason: str) -> None:
         """Rename an unreadable/invalid job file out of the way so it stops
@@ -1407,13 +1428,13 @@ class JobStore:
                 )
                 return
         recovered_lock: SyncLock | None = None
-        if job.kind in ("pocket_single", "pocket_all"):
+        if job.kind in ("pocket_single", "pocket_all", "pocket_delete"):
             try:
                 recovered_lock = SyncLock(self.out_dir).acquire()
             except SyncLockBusy:
                 # An external sync was already active when the server started.
-                # Keep this job queued and let the worker retry once, without
-                # blocking startup or spinning on the lock.
+                # Keep this job queued; the worker retries at a bounded cadence
+                # without blocking startup or spinning on the lock.
                 pass
             else:
                 # Match newly registered Pocket jobs: once admitted to the
@@ -1611,6 +1632,8 @@ class JobStore:
         for job in jobs:
             if job.kind == "pocket_single" and job.pocket_digest == digest:
                 candidates.append((job, job))
+            elif job.kind == "pocket_delete" and job.pocket_digest == digest:
+                candidates.append((job, job))
             elif job.kind == "pocket_all" and package_names:
                 related, song_view = self._batch_song_status(job, package_names)
                 if related:
@@ -1657,7 +1680,7 @@ class JobStore:
                 return j
         return None
 
-    def delete_song(self, requested_song_id: str) -> None:
+    def delete_song(self, requested_song_id: str, *, exclude_pocket_job_id: str | None = None) -> None:
         """Delete every loaded job and owned artifact for one song.
 
         Selection, conflict checks, filesystem changes, and the final
@@ -1665,25 +1688,26 @@ class JobStore:
         last so a failed partial deletion remains visible and retryable.
         """
         with self._lock:
-            active_pocket = [
-                job for job in self._jobs.values()
-                if job.kind != "separate" and job.status in ("queued", "running")
-            ]
-            if any(
-                job.kind == "pocket_all"
-                or (
-                    job.pocket_digest is not None
-                    and song_id(job.pocket_digest) == requested_song_id
-                )
-                for job in active_pocket
-            ):
-                raise SongDeleteConflict("Pocket sync is queued or running")
             targets = [
                 job for job in self._jobs.values()
                 if job.kind == "separate" and song_id(job.digest) == requested_song_id
             ]
             if not targets:
                 raise SongNotFoundError(requested_song_id)
+            target_digests = {job.digest for job in targets}
+            if any(
+                job.id != exclude_pocket_job_id
+                and job.status in ("queued", "running")
+                and (
+                    job.kind == "pocket_all"
+                    or (
+                        job.kind in ("pocket_single", "pocket_delete")
+                        and job.pocket_digest in target_digests
+                    )
+                )
+                for job in self._jobs.values()
+            ):
+                raise SongDeleteConflict("Pocket sync is queued or running for this song")
             if any(job.status in ("queued", "running") for job in targets):
                 raise SongDeleteConflict("song has queued or running jobs")
 
@@ -1750,6 +1774,20 @@ class JobStore:
             delete_output_targets(self.out_dir, candidates)
             for job_id in target_ids:
                 del self._jobs[job_id]
+
+    def delete_unreferenced_upload(self, upload_path: Path) -> None:
+        """Delete a newly stored upload only when no job record owns it."""
+        with self._lock:
+            try:
+                upload = Path(upload_path.relative_to(self.out_dir))
+            except ValueError:
+                raise UnsafeOutputPath("upload is outside the output directory")
+            if any(
+                job.upload is not None and Path(job.upload) == upload
+                for job in self._jobs.values()
+            ):
+                return
+            delete_output_targets(self.out_dir, [DeleteTarget(upload, "file")])
 
     # -- title / folder collision handling -------------------------------
     def _resolve_title(self, requested_title: str, digest: str) -> str:
@@ -1833,6 +1871,13 @@ class JobStore:
         # out rather than left to blow up at write time.
         requested_title = _storable(requested_title)[:MAX_TITLE_CHARS]
         with self._lock:
+            if any(
+                job.kind == "pocket_delete"
+                and job.pocket_digest == digest
+                and job.status in ("queued", "running")
+                for job in self._jobs.values()
+            ):
+                raise SongDeleteConflict("a Pocket delete is queued or running for this song")
             existing = [
                 job for job in self._jobs.values()
                 if job.kind == "separate" and job.digest == digest
@@ -1892,7 +1937,7 @@ class JobStore:
             pending = next(
                 (
                     job for job in self._jobs.values()
-                    if job.kind in ("pocket_single", "pocket_all")
+                    if job.kind in ("pocket_single", "pocket_all", "pocket_delete")
                     and job.status in ("queued", "running")
                 ),
                 None,
@@ -1929,6 +1974,57 @@ class JobStore:
             self._pocket_locks[job_id] = sync_lock
             self._write_job(job)
             self._queue.put(job_id)
+            return job
+
+    def create_pocket_delete_job(
+        self,
+        *,
+        song_id: str,
+        digest: str,
+        safe_name: str,
+        connection_fingerprint: str,
+        sync_lock: SyncLock,
+    ) -> Job:
+        """Persist a remote-first delete while its Pocket mutation lock is held."""
+        with self._lock:
+            pending = next(
+                (
+                    job for job in self._jobs.values()
+                    if job.kind != "separate" and job.status in ("queued", "running")
+                ),
+                None,
+            )
+            if pending is not None:
+                sync_lock.release()
+                raise SyncLockBusy("ほかの Pocket 操作がすでに登録されています。")
+            job_id = new_job_id()
+            job = Job(
+                id=job_id,
+                digest="",
+                title="",
+                target="",
+                status="queued",
+                created_at=_now_iso(),
+                kind="pocket_delete",
+                pocket_song_id=song_id,
+                pocket_digest=digest,
+                pocket_safe_name=safe_name,
+                pocket_connection_fingerprint=connection_fingerprint,
+                result={"pocket_deleted": False, "local_deleted": False},
+            )
+            self._jobs[job_id] = job
+            self._pocket_locks[job_id] = sync_lock
+            try:
+                if not self._write_job(job):
+                    raise UnsafeOutputPath(
+                        "Pocket delete job record could not be saved safely"
+                    )
+                self._queue.put(job_id)
+            except BaseException:
+                self._jobs.pop(job_id, None)
+                self._pocket_locks.pop(job_id, None)
+                sync_lock.release()
+                raise
             return job
 
     # -- worker -------------------------------------------------------------
@@ -2131,9 +2227,97 @@ class JobStore:
         sync_lock = self._pocket_locks.get(job.id)
         try:
             if sync_lock is None:
-                sync_lock = SyncLock(self.out_dir).acquire()
+                try:
+                    sync_lock = SyncLock(self.out_dir).acquire()
+                except SyncLockBusy:
+                    # A recovered job can reach the worker before the external
+                    # operation that held the lock at startup has finished.
+                    # Keep it recoverable and retry at a bounded cadence.
+                    with self._lock:
+                        job.status = "queued"
+                        job.started_at = None
+                        job.finished_at = None
+                        self._write_job(job)
+                    if not self._stopping.wait(0.2):
+                        self._queue.put(job.id)
+                    return
                 self._pocket_locks[job.id] = sync_lock
-            if job.kind == "pocket_single":
+            if job.kind == "pocket_delete":
+                assert (
+                    job.pocket_song_id is not None
+                    and job.pocket_digest is not None
+                    and job.pocket_connection_fingerprint is not None
+                )
+                safe_name = job.pocket_safe_name
+                remote_delete_was_confirmed = (
+                    isinstance(job.result, dict)
+                    and job.result.get("pocket_deleted") is True
+                )
+                if remote_delete_was_confirmed and safe_name is not None:
+                    package_dir = self.out_dir / safe_name
+                    sidecar = package_dir / ".bunri-package.json"
+                    if package_dir.is_symlink() or sidecar.is_symlink():
+                        raise PocketServiceError(
+                            "選択した曲の identity が変更されました。", kind="conflict"
+                        )
+                    if not package_dir.exists() or not sidecar.exists():
+                        # The remote 204 was saved before local deletion began.
+                        # A missing package or sidecar is therefore progress
+                        # from that deletion, not evidence that an unverified
+                        # target may be sent to Pocket.  Keep reissuing the
+                        # idempotent DELETE, then let delete_song remove the
+                        # remaining job records and artifacts.
+                        safe_name = None
+                    else:
+                        try:
+                            metadata = read_package_metadata_for_directory(sidecar, safe_name)
+                        except (OSError, ValueError) as exc:
+                            raise PocketServiceError(
+                                "選択した曲の identity が変更されました。", kind="conflict"
+                            ) from exc
+                        source = metadata.source
+                        if (
+                            source.digest != job.pocket_digest
+                            or source.cache_key != job.pocket_song_id
+                        ):
+                            raise PocketServiceError(
+                                "選択した曲の identity が変更されました。", kind="conflict"
+                            )
+                        # Once the saved 204 and sidecar identity agree, asset
+                        # completeness is no longer a precondition: missing
+                        # audio can itself be progress from interrupted local
+                        # cleanup. The idempotent remote DELETE is still sent.
+                        safe_name = None
+                target = DeleteTargetIdentity(
+                    song_id=job.pocket_song_id,
+                    digest=job.pocket_digest,
+                    safe_name=safe_name,
+                )
+                delete_track(
+                    self.out_dir,
+                    target,
+                    lock=sync_lock,
+                    expected_connection_fingerprint=job.pocket_connection_fingerprint,
+                )
+                job.result = {"pocket_deleted": True, "local_deleted": False}
+                with self._lock:
+                    self._write_job(job)
+                try:
+                    self.delete_song(song_id(job.pocket_digest), exclude_pocket_job_id=job.id)
+                except SongNotFoundError:
+                    # A crash after local deletion but before the completed
+                    # result was saved is an idempotent success on recovery.
+                    pass
+                except Exception:
+                    with self._lock:
+                        job.status = "error"
+                        job.error = "棚からは削除済みですが、ローカルデータを削除できませんでした。ローカル削除を再実行してください。"
+                        job.finished_at = _now_iso()
+                        self._write_job(job)
+                    return
+                job.result = {"pocket_deleted": True, "local_deleted": True}
+                failed = False
+            elif job.kind == "pocket_single":
                 assert job.pocket_song_id is not None and job.pocket_digest is not None
                 result = sync_one(
                     self.out_dir,
@@ -2198,7 +2382,22 @@ class JobStore:
                     job.started_at = None
                 else:
                     job.status = "error"
-                    job.error = safe_error(exc)
+                    if job.kind == "pocket_delete":
+                        uncertain = (
+                            isinstance(exc, PocketHTTPError) and exc.status == 503
+                        ) or (
+                            isinstance(exc, PocketServiceError)
+                            and exc.kind == "delete_unknown"
+                        )
+                        if uncertain:
+                            job.error = (
+                                "棚からの削除を確認できませんでした。ローカルデータは削除していません。"
+                                "同じ操作を再実行できます。"
+                            )
+                        else:
+                            job.error = safe_delete_error(exc)
+                    else:
+                        job.error = safe_error(exc)
                     job.finished_at = _now_iso()
                 self._write_job(job)
         finally:

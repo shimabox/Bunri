@@ -10,16 +10,22 @@ from pathlib import Path
 import pytest
 
 from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata, write_package_metadata
-from bunri.pocket.config import PocketConfig, save_config
+from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
 from bunri.pocket.http import JSONDocument, PocketHTTPError
 from bunri.pocket.local import all_package_names
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.service import (
+    DeleteTargetIdentity,
     PocketServiceError,
+    delete_track,
     inspect_packages,
     inspect_remote,
     inventory,
+    list_library_tracks,
     resolve_package,
+    resolve_delete_target,
+    safe_delete_error,
+    safe_error,
     sync_all,
 )
 
@@ -330,3 +336,110 @@ def test_batch_stops_after_first_remote_failure_and_marks_rest_pending(tmp_path)
     assert result.completed == 0 and result.failed == 1 and result.pending == 1
     assert len(client.calls) == 1
     assert "secret.invalid" not in (result.items[0].error or "")
+
+
+def _library_document(*songs):
+    return JSONDocument(
+        {
+            "schema_version": "1.0",
+            "updated_at": "2026-09-07T00:00:00Z",
+            "songs": [
+                {
+                    "song_id": song_id,
+                    "title": title,
+                    "manifest": f"tracks/{song_id}/manifest.json",
+                    "has_original": True,
+                    "instruments": [],
+                    "updated_at": "2026-09-07T00:00:00Z",
+                }
+                for song_id, title in songs
+            ],
+        },
+        '"library"',
+    )
+
+
+def test_library_selection_preserves_validated_remote_order(tmp_path):
+    save_config(tmp_path, PocketConfig("https://example.invalid", TOKEN))
+
+    class Client:
+        def get_json(self, path):
+            assert path == "library"
+            return _library_document(("b" * 12, "Same"), ("a" * 12, "Same"))
+
+    tracks = list_library_tracks(tmp_path, client=Client())
+    assert [(item.song_id, item.title) for item in tracks] == [
+        ("b" * 12, "Same"),
+        ("a" * 12, "Same"),
+    ]
+
+
+def test_direct_remote_only_song_id_deletes_without_local_package_and_releases_lock(tmp_path):
+    save_config(tmp_path, PocketConfig("https://example.invalid", TOKEN))
+    calls = []
+
+    class Client:
+        def delete_track(self, song_id):
+            calls.append(song_id)
+
+    result = delete_track(
+        tmp_path,
+        DeleteTargetIdentity("abcdef123456"),
+        expected_connection_fingerprint=connection_fingerprint(PocketConfig("https://example.invalid", TOKEN)),
+        client=Client(),
+    )
+    assert result.song_id == "abcdef123456"
+    assert calls == ["abcdef123456"]
+    SyncLock(tmp_path).acquire().release()
+
+
+def test_safe_name_delete_revalidates_full_identity_inside_lock(tmp_path):
+    save_config(tmp_path, PocketConfig("https://example.invalid", TOKEN))
+    make_package(tmp_path, "aaaaaaaaaaaa", "b" * 40)
+    make_package(tmp_path, "Actual", "a" * 40)
+    target = resolve_delete_target(tmp_path, "aaaaaaaaaaaa")
+    assert (target.song_id, target.digest) == ("b" * 12, "b" * 40)
+
+    class Client:
+        def delete_track(self, song_id):
+            assert song_id == "b" * 12
+
+    delete_track(
+        tmp_path,
+        target,
+        expected_connection_fingerprint=connection_fingerprint(PocketConfig("https://example.invalid", TOKEN)),
+        client=Client(),
+    )
+
+
+def test_delete_503_is_safe_retryable_and_lock_is_released(tmp_path):
+    save_config(tmp_path, PocketConfig("https://example.invalid", TOKEN))
+
+    class Client:
+        def delete_track(self, song_id):
+            raise PocketHTTPError(503, "UNAVAILABLE", "https://secret.invalid/token")
+
+    with pytest.raises(PocketHTTPError) as caught:
+        delete_track(
+            tmp_path,
+            DeleteTargetIdentity("abcdef123456"),
+            expected_connection_fingerprint=connection_fingerprint(PocketConfig("https://example.invalid", TOKEN)),
+            client=Client(),
+        )
+    message = safe_delete_error(caught.value)
+    assert "同じ song ID" in message
+    assert "secret" not in message
+    SyncLock(tmp_path).acquire().release()
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (503, "Pocket を利用できません。後で再実行してください。"),
+        (422, "Pocket との通信に失敗しました。後で再実行してください。"),
+    ],
+)
+def test_sync_safe_error_keeps_existing_http_wording(status, expected):
+    error = PocketHTTPError(status, "PRIVATE", "https://secret.invalid/token")
+
+    assert safe_error(error) == expected

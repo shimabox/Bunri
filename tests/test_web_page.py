@@ -12,6 +12,7 @@ _chromium_available skip pattern tests/test_player_html.py uses.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import socket
 import threading
@@ -160,6 +161,237 @@ def _write_pocket_all_record(
         "progress": progress,
         "result": None,
     }), encoding="utf-8")
+
+
+@_needs_browser
+def test_remote_only_tracks_render_as_read_only_text(tmp_path):
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url:
+        def mock_status(page):
+            page.route("**/api/pocket/status", lambda route: route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "package_count": 0,
+                    "target_count": 0,
+                    "songs": [],
+                    "remote_only": [{"song_id": "abcdef123456", "title": "<b>Remote</b>"}],
+                }),
+            ))
+
+        with _open_page(base_url, before_goto=mock_status) as page:
+            page.wait_for_selector("#sw-remote-only:not([hidden])")
+            item = page.locator(".sw-remote-only-item")
+            assert item.locator("span").first.text_content() == "<b>Remote</b>"
+            assert item.locator(".sw-badge").text_content() == "棚のみ"
+            assert item.locator("button").count() == 0
+            assert item.locator("b").count() == 0
+
+
+@_needs_browser
+def test_remote_only_tracks_survive_unknown_shelf_status(tmp_path):
+    responses = [
+        {
+            "connected": True,
+            "package_count": 0,
+            "target_count": 0,
+            "songs": [],
+            "remote_only": [{"song_id": "abcdef123456", "title": "Shelf Song"}],
+        },
+        {
+            "connected": True,
+            "state": "unknown",
+            "message": "棚の状態を確認できません。",
+            "package_count": 0,
+            "target_count": 0,
+            "songs": [],
+            "remote_only": [],
+        },
+    ]
+
+    def mock_status(page):
+        page.route("**/api/pocket/job", lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"connected": True, "job": None}),
+        ))
+
+        def handler(route):
+            body = responses.pop(0) if len(responses) > 1 else responses[0]
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(body),
+            )
+
+        page.route("**/api/pocket/status", handler)
+
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_status
+    ) as page:
+        page.wait_for_selector("#sw-remote-only:not([hidden])")
+        assert page.locator(".sw-remote-only-item").count() == 1
+
+        page.click("#sw-pocket-refresh")
+        page.wait_for_selector("#sw-remote-only-error:not([hidden])")
+
+        assert page.locator("#sw-remote-only-error").text_content() == (
+            "棚の状態を確認できません。"
+        )
+        assert page.locator(".sw-remote-only-item").count() == 1
+        assert page.locator(".sw-remote-only-item span").first.text_content() == "Shelf Song"
+
+
+@_needs_browser
+def test_disconnected_unknown_status_clears_pocket_ui(tmp_path):
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    digest = "a" * 40
+    web_song_id = hashlib.sha256(digest.encode()).hexdigest()
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": digest,
+        "title": "Local Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": None,
+        "package": None,
+        "log": None,
+        "upload": None,
+    }), encoding="utf-8")
+    connected_status = {
+        "connected": True,
+        "package_count": 1,
+        "target_count": 1,
+        "songs": [{
+            "web_song_id": web_song_id,
+            "song_id": digest[:12],
+            "title": "Local Song",
+            "state": "synced",
+            "can_sync": False,
+        }],
+        "remote_only": [{"song_id": "abcdef123456", "title": "Shelf Song"}],
+    }
+    disconnected_status = {
+        "connected": False,
+        "state": "unknown",
+        "message": "Pocket の接続設定を読み込めません。",
+        "package_count": 0,
+        "target_count": 0,
+        "songs": connected_status["songs"],
+        "remote_only": connected_status["remote_only"],
+    }
+    responses = [connected_status, disconnected_status]
+
+    def mock_pocket(page):
+        page.route("**/api/pocket/job", lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"connected": True, "job": None}),
+        ))
+
+        def status_handler(route):
+            body = responses.pop(0) if len(responses) > 1 else responses[0]
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(body),
+            )
+
+        page.route("**/api/pocket/status", status_handler)
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_pocket
+    ) as page:
+        page.wait_for_selector("#sw-pocket-banner:not([hidden])")
+        page.wait_for_selector("#sw-pocket-controls:not([hidden])")
+        page.wait_for_selector(".sw-pocket-row", state="attached")
+        page.wait_for_selector("#sw-remote-only:not([hidden])")
+
+        page.click("#sw-pocket-refresh")
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-banner').hidden && "
+            "document.getElementById('sw-pocket-controls').hidden && "
+            "document.querySelector('.sw-pocket-row') === null"
+        )
+
+        assert page.locator("#sw-remote-only").is_hidden()
+        assert page.locator(".sw-remote-only-item").count() == 0
+
+
+@_needs_browser
+def test_separation_upload_stays_enabled_during_an_unrelated_pocket_job(tmp_path):
+    active_digest = "a" * 40
+
+    def mock_active_pocket_job(page):
+        page.route("**/api/pocket/job", lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "connected": True,
+                "job": {
+                    "id": "j-pocket-delete",
+                    "kind": "pocket_delete",
+                    "status": "running",
+                    "pocket_digest": active_digest,
+                    "elapsed_seconds": 1,
+                },
+            }),
+        ))
+
+    app = create_app(tmp_path / "out", runner=PageFakeRunner(delay=1.0))
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_active_pocket_job
+    ) as page:
+        audio_path = tmp_path / "unrelated.mp3"
+        audio_path.write_bytes(b"different-audio")
+        assert hashlib.sha1(audio_path.read_bytes()).hexdigest() != active_digest
+        page.set_input_files("#sw-file-input", str(audio_path))
+        page.wait_for_selector("#sw-confirm:not([hidden])")
+
+        assert page.locator("#sw-upload-btn").is_enabled()
+        page.click("#sw-upload-btn")
+        page.wait_for_function("window.__bunriWeb.getJobs().length === 1")
+
+
+@_needs_browser
+def test_separation_upload_shows_safe_message_for_pending_delete_409(tmp_path):
+    def reject_upload(page):
+        def handler(route):
+            if route.request.method == "POST":
+                route.fulfill(
+                    status=409,
+                    content_type="application/json",
+                    body=json.dumps({"detail": "internal conflict detail"}),
+                )
+            else:
+                route.continue_()
+
+        page.route("**/api/jobs", handler)
+
+    app = create_app(tmp_path / "out", runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=reject_upload
+    ) as page:
+        audio_path = tmp_path / "deleting.mp3"
+        audio_path.write_bytes(b"same-audio")
+        page.set_input_files("#sw-file-input", str(audio_path))
+        page.wait_for_selector("#sw-confirm:not([hidden])")
+        page.click("#sw-upload-btn")
+        page.wait_for_function(
+            "document.getElementById('sw-upload-error').textContent.length > 0"
+        )
+
+        assert page.locator("#sw-upload-error").text_content() == (
+            "この曲は棚から削除中です。完了後に再度お試しください。"
+        )
 
 
 @_needs_browser
@@ -1246,3 +1478,283 @@ def test_successful_delete_closes_dialog_updates_empty_state_and_focus(tmp_path)
         assert page.locator("#sw-songs-heading").evaluate(
             "heading => document.activeElement === heading"
         )
+
+
+@_needs_browser
+def test_local_only_delete_refreshes_remote_only_tracks(tmp_path):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    status_state = {"calls": 0, "web_song_id": None}
+    pocket_song_id = "a" * 12
+
+    def serve_pocket_status(page):
+        def handler(route):
+            status_state["calls"] += 1
+            web_song_id = status_state["web_song_id"]
+            deleted = status_state["calls"] >= 3
+            songs = [] if web_song_id is None or deleted else [{
+                "web_song_id": web_song_id,
+                "song_id": pocket_song_id,
+                "title": "Shelf Song",
+                "safe_name": "Shelf Song",
+                "state": "synced",
+                "can_sync": False,
+                "message": None,
+                "conflict": False,
+                "can_delete": True,
+            }]
+            remote_only = (
+                [{"song_id": pocket_song_id, "title": "Shelf Song"}]
+                if deleted else []
+            )
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "connection_fingerprint": "a" * 64,
+                    "target_count": len(songs),
+                    "package_count": len(songs),
+                    "songs": songs,
+                    "remote_only": remote_only,
+                }),
+            )
+
+        page.route("**/api/pocket/status", handler)
+
+    app = create_app(out_dir, runner=PageFakeRunner(delay=1.0))
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=serve_pocket_status
+    ) as page:
+        page.wait_for_function("document.getElementById('sw-pocket-controls').hidden === false")
+        assert status_state["calls"] == 1
+
+        _upload_from_page(page, tmp_path / "Shelf Song.mp3")
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs()[0] && "
+            "['queued', 'running'].includes(window.__bunriWeb.getJobs()[0].status)",
+            timeout=5_000,
+        )
+        status_state["web_song_id"] = page.evaluate("window.__bunriWeb.getSongs()[0].id")
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs()[0].status === 'done' && "
+            "document.querySelector('.sw-pocket-row .sw-badge').textContent === '棚にある'",
+            timeout=10_000,
+        )
+        assert status_state["calls"] == 2
+
+        page.click("button.sw-delete-song-btn")
+        assert page.locator("#sw-delete-pocket-option").is_visible()
+        assert not page.locator("#sw-delete-pocket").is_checked()
+        page.click("#sw-delete-confirm")
+
+        page.wait_for_selector("#sw-remote-only:not([hidden])", timeout=10_000)
+        assert page.locator(".sw-remote-only-item").count() == 1
+        assert page.locator(".sw-remote-only-item span").first.text_content() == "Shelf Song"
+        assert page.locator(".sw-remote-only-id").text_content() == pocket_song_id
+        assert status_state["calls"] == 3
+
+
+@_needs_browser
+def test_pocket_delete_uses_connection_fingerprint_captured_by_dialog(tmp_path):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    config = PocketConfig("https://shelf-a.invalid", token)
+    save_config(out_dir, config)
+    displayed_fingerprint = connection_fingerprint(config)
+    status_state = {
+        "calls": 0,
+        "web_song_id": None,
+        "fingerprint": displayed_fingerprint,
+    }
+
+    def mock_requests(page):
+        def status_handler(route):
+            status_state["calls"] += 1
+            web_song_id = status_state["web_song_id"]
+            songs = [] if web_song_id is None else [{
+                "web_song_id": web_song_id,
+                "song_id": "a" * 12,
+                "title": "Bound Shelf Song",
+                "safe_name": "Bound Shelf Song",
+                "state": "synced",
+                "can_sync": False,
+                "message": None,
+                "conflict": False,
+                "can_delete": True,
+            }]
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "connection_fingerprint": status_state["fingerprint"],
+                    "target_count": len(songs),
+                    "package_count": len(songs),
+                    "songs": songs,
+                    "remote_only": [],
+                }),
+            )
+
+        page.route("**/api/pocket/status", status_handler)
+        page.route(
+            "**/api/songs/*",
+            lambda route: route.fulfill(
+                status=409,
+                content_type="application/json",
+                body=json.dumps({"detail": "test rejection"}),
+            ) if route.request.method == "DELETE" else route.continue_(),
+        )
+
+    app = create_app(out_dir, runner=PageFakeRunner(delay=1.0))
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_requests
+    ) as page:
+        _upload_from_page(page, tmp_path / "Bound Shelf Song.mp3")
+        page.wait_for_function(
+            "window.__bunriWeb.getSongs()[0] && "
+            "['queued', 'running'].includes(window.__bunriWeb.getJobs()[0].status)",
+            timeout=5_000,
+        )
+        status_state["web_song_id"] = page.evaluate("window.__bunriWeb.getSongs()[0].id")
+        page.wait_for_function(
+            "window.__bunriWeb.getJobs()[0].status === 'done' && "
+            "document.querySelector('.sw-pocket-row .sw-badge').textContent === '棚にある'",
+            timeout=10_000,
+        )
+
+        page.click("button.sw-delete-song-btn")
+        page.check("#sw-delete-pocket")
+        status_state["fingerprint"] = "b" * 64
+        with page.expect_response("**/api/pocket/status"):
+            page.evaluate("document.getElementById('sw-pocket-refresh').click()")
+
+        with page.expect_request(
+            lambda request: request.method == "DELETE" and "/api/songs/" in request.url
+        ) as request_info:
+            page.click("#sw-delete-confirm")
+
+        request_url = request_info.value.url
+        assert "pocket=true" in request_url
+        assert f"pocket_fingerprint={displayed_fingerprint}" in request_url
+
+
+@_needs_browser
+def test_local_delete_ignores_older_pocket_status_response(tmp_path, monkeypatch):
+    import base64
+
+    import bunri.web.app as app_module
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import LibraryTrack, PackageStatus, RemoteStatus
+
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    digest = "a" * 40
+    pocket_song_id = digest[:12]
+    package = out_dir / "Shelf Song"
+    package.mkdir()
+    (package / "Shelf Song.guitar.player.html").write_text(
+        "<html><body>player ok</body></html>", encoding="utf-8"
+    )
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": digest,
+        "title": "Shelf Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-08T00:00:00+00:00",
+        "started_at": "2026-09-08T00:00:01+00:00",
+        "finished_at": "2026-09-08T00:00:02+00:00",
+        "error": None,
+        "package": "Shelf Song/Shelf Song.guitar.player.html",
+        "log": None,
+        "upload": None,
+    }), encoding="utf-8")
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    status_calls = 0
+
+    def inspect_with_delayed_first_response(*_args, **_kwargs):
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls == 1:
+            first_started.set()
+            release_first.wait(timeout=30)
+            return (PackageStatus(
+                "Shelf Song",
+                "Shelf Song",
+                pocket_song_id,
+                digest,
+                RemoteStatus("synced", False),
+            ),)
+        return ()
+
+    monkeypatch.setattr(app_module, "inspect_packages", inspect_with_delayed_first_response)
+    monkeypatch.setattr(
+        app_module,
+        "list_library_tracks",
+        lambda *_args, **_kwargs: (LibraryTrack(pocket_song_id, "Shelf Song"),),
+    )
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    try:
+        with _running_server(app) as base_url, _open_page(base_url) as page:
+            assert first_started.wait(timeout=5)
+            page.wait_for_selector("#sw-pocket-controls:not([hidden])")
+
+            fresh_status_calls = 0
+
+            def serve_fresh_status(route):
+                nonlocal fresh_status_calls
+                fresh_status_calls += 1
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "connected": True,
+                        "target_count": 0,
+                        "package_count": 0,
+                        "songs": [],
+                        "remote_only": [{
+                            "song_id": pocket_song_id,
+                            "title": "Shelf Song",
+                        }],
+                    }),
+                )
+
+            page.route("**/api/pocket/status", serve_fresh_status)
+            page.click("button.sw-job-toggle")
+            page.click("button.sw-delete-song-btn")
+            page.click("#sw-delete-confirm")
+
+            page.wait_for_function("window.__bunriWeb.getSongs().length === 0", timeout=10_000)
+            page.click("#sw-pocket-refresh")
+            page.wait_for_selector("#sw-remote-only:not([hidden])", timeout=10_000)
+            assert fresh_status_calls >= 1
+            assert page.locator(".sw-remote-only-item").count() == 1
+
+            with page.expect_response("**/api/pocket/status") as old_response:
+                release_first.set()
+            old_response.value.finished()
+
+            assert page.locator("#sw-remote-only").is_visible()
+            assert page.locator(".sw-remote-only-item").count() == 1
+            assert page.locator(".sw-remote-only-id").text_content() == pocket_song_id
+            assert page.locator("#sw-pocket-count").text_content() == (
+                "出力先の全パッケージ 0件中、同期対象 0件"
+            )
+    finally:
+        release_first.set()

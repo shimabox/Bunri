@@ -1,7 +1,8 @@
-"""Commands for connecting and synchronizing a Bunri Pocket shelf."""
+"""Commands for connecting and managing a Bunri Pocket shelf."""
 
 from __future__ import annotations
 
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -10,10 +11,20 @@ from typing import Optional
 import typer
 from rich.console import Console
 
-from bunri.pocket.config import PocketConfig, read_config, save_config, validate_base_url, validate_capabilities, validate_token
+from bunri.pocket.config import PocketConfig, connection_fingerprint, read_config, save_config, validate_base_url, validate_capabilities, validate_token
 from bunri.pocket.http import PocketHTTPClient
 from bunri.pocket.lock import SyncLock, SyncLockBusy
-from bunri.pocket.service import PocketServiceError, safe_error, sync_all, sync_one
+from bunri.pocket.service import (
+    DeleteTargetIdentity,
+    PocketServiceError,
+    delete_track,
+    list_library_tracks,
+    resolve_delete_target,
+    safe_delete_error,
+    safe_error,
+    sync_all,
+    sync_one,
+)
 
 app = typer.Typer(add_completion=False, rich_markup_mode="rich")
 console = Console()
@@ -93,6 +104,8 @@ def sync(
             include_original=original,
             lock=lock,
         )
+    except typer.Exit:
+        raise
     except PocketServiceError as exc:
         if all_packages and exc.legacy:
             for name in exc.legacy:
@@ -109,3 +122,95 @@ def sync(
     console.print(f"media: uploaded={result.media_uploaded} skipped={result.media_skipped}")
     console.print(f"manifest: updated={result.manifest_updated} skipped={result.manifest_skipped}")
     console.print(f"library: updated={result.library_updated} skipped={result.library_skipped}")
+
+
+def _stdin_is_tty() -> bool:
+    return bool(getattr(sys.stdin, "isatty", lambda: False)())
+
+
+@app.command("delete")
+def delete_command(
+    safe_name: Optional[str] = typer.Argument(None, metavar="SAFE_NAME"),
+    song_id: Optional[str] = typer.Option(None, "--song-id", help="Delete this Pocket song ID"),
+    select: bool = typer.Option(False, "--select", help="Select from the Pocket library"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the final confirmation"),
+    output: Path = typer.Option(Path("out"), "--output", "-o", help="Output directory"),
+) -> None:
+    """Delete one track from the Bunri Pocket shelf."""
+    if sum((safe_name is not None, song_id is not None, select)) != 1:
+        _fail("SAFE_NAME、--song-id、--select のいずれか1つだけを指定してください。")
+    if yes and select:
+        _fail("--yes と --select は同時に指定できません。自動化では SAFE_NAME または --song-id を指定してください。")
+    try:
+        config = read_config(output)
+    except (OSError, ValueError):
+        _fail("Pocket の接続設定を確認できません。")
+    if config is None:
+        _fail("Pocket の接続設定がありません。")
+    expected_connection_fingerprint = connection_fingerprint(config)
+
+    target: DeleteTargetIdentity
+    try:
+        if safe_name is not None:
+            target = resolve_delete_target(output, safe_name)
+        elif song_id is not None:
+            if re.fullmatch(r"[0-9a-f]{12}", song_id) is None:
+                _fail("song ID は小文字16進12桁で指定してください。")
+            target = DeleteTargetIdentity(song_id=song_id)
+        else:
+            if not _stdin_is_tty():
+                _fail("対話選択には TTY が必要です。--song-id または SAFE_NAME を指定してください。")
+            # Use the same immutable connection identity captured before the
+            # selection UI, then verify it again immediately before deletion.
+            tracks = list_library_tracks(
+                output,
+                client=PocketHTTPClient(config.base_url, config.token),
+            )
+            if not tracks:
+                console.print("棚に削除できる曲はありません。")
+                return
+            console.print("Bunri Pocket の棚から削除する曲を選択してください。")
+            for index, track in enumerate(tracks, 1):
+                console.print(f"  {index}. {track.title} — {track.song_id}")
+            choice = typer.prompt("番号", type=int)
+            if choice < 1 or choice > len(tracks):
+                _fail("選択した番号が範囲外です。")
+            selected = tracks[choice - 1]
+            target = DeleteTargetIdentity(song_id=selected.song_id, title=selected.title)
+    except typer.Exit:
+        raise
+    except (PocketServiceError, OSError, RuntimeError, ValueError) as exc:
+        message = safe_delete_error(exc)
+        if safe_name is not None:
+            message += " --song-id または --select で対象を指定できます。"
+        _fail(message)
+
+    console.print("Bunri Pocket の棚から次の曲を削除します。")
+    if target.title:
+        console.print(f"  曲名: {target.title}")
+    if target.safe_name:
+        console.print(f"  safe name: {target.safe_name}")
+    console.print(f"  song ID: {target.song_id}")
+    if not yes:
+        if not _stdin_is_tty():
+            _fail("確認入力には TTY が必要です。自動化では --yes を指定してください。")
+        if not typer.confirm("この操作を続けますか？", default=False):
+            console.print("削除を取り消しました。")
+            return
+
+    try:
+        mutation_lock = SyncLock(output).acquire()
+    except (OSError, SyncLockBusy) as exc:
+        _fail(safe_delete_error(exc))
+    try:
+        result = delete_track(
+            output,
+            target,
+            lock=mutation_lock,
+            expected_connection_fingerprint=expected_connection_fingerprint,
+        )
+    except (PocketServiceError, OSError, RuntimeError, ValueError) as exc:
+        _fail(safe_delete_error(exc))
+    finally:
+        mutation_lock.release()
+    console.print(f"棚から削除しました: {result.song_id}")

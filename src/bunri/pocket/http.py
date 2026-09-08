@@ -32,7 +32,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class PocketHTTPError(RuntimeError):
     def __init__(self, status: int, code: str | None, url: str, *, retry_after: str | None = None, supported_major: Any = None) -> None:
         self.status, self.code, self.url = status, code, url
-        self.retry_after, self.supported_major = retry_after, supported_major
+        self.retry_after = retry_after if isinstance(retry_after, str) and re.fullmatch(r"\d{1,9}", retry_after) else None
+        self.supported_major = supported_major
         super().__init__(self.user_message())
 
     def user_message(self) -> str:
@@ -46,7 +47,7 @@ class PocketHTTPError(RuntimeError):
         }
         if self.status == 429:
             return "Pocket が要求を制限しました。" + (f" Retry-After: {self.retry_after}" if self.retry_after else "")
-        return messages.get(self.status, f"Pocket HTTP error: status={self.status} code={self.code or 'unknown'} url={self.url}")
+        return messages.get(self.status, f"Pocket HTTP error: status={self.status} code={self.code or 'unknown'}")
 
 
 @dataclass(frozen=True)
@@ -61,9 +62,19 @@ class PocketHTTPClient:
         self._opener = opener or urllib.request.build_opener(_NoRedirect())
         self.metadata_timeout, self.media_timeout = metadata_timeout, media_timeout
 
-    def _url(self, path: str) -> str: return self.base_url + "/api/v1/upload/" + path.lstrip("/")
-    def _request(self, method: str, path: str, *, data: Any = None, headers: dict[str, str] | None = None, timeout: float | None = None, limit: int = JSON_LIMIT_BYTES) -> tuple[int, Any, bytes]:
-        url = self._url(path); request_headers = {"Authorization": f"Bearer {self._token}", "User-Agent": USER_AGENT, **(headers or {})}
+    def _upload_url(self, path: str) -> str:
+        return self.base_url + "/api/v1/upload/" + path.lstrip("/")
+
+    def _api_url(self, path: str) -> str:
+        return self.base_url + "/api/v1/" + path.lstrip("/")
+
+    # Kept as the upload-route helper for compatibility with callers and tests.
+    def _url(self, path: str) -> str:
+        return self._upload_url(path)
+
+    def _request(self, method: str, path: str, *, data: Any = None, headers: dict[str, str] | None = None, timeout: float | None = None, limit: int = JSON_LIMIT_BYTES, upload_route: bool = True) -> tuple[int, Any, bytes]:
+        url = self._upload_url(path) if upload_route else self._api_url(path)
+        request_headers = {"Authorization": f"Bearer {self._token}", "User-Agent": USER_AGENT, **(headers or {})}
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         try: response = self._opener.open(request, timeout=timeout or self.metadata_timeout)
         except urllib.error.HTTPError as exc:
@@ -71,7 +82,8 @@ class PocketHTTPClient:
             try:
                 envelope = json.loads(body[:limit]); error = envelope.get("error", {}); code = error.get("code"); supported = error.get("supported_schema_major")
             except Exception: pass
-            raise PocketHTTPError(exc.code, code, url, retry_after=exc.headers.get("Retry-After"), supported_major=supported) from None
+            retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+            raise PocketHTTPError(exc.code, code, url, retry_after=retry_after, supported_major=supported) from None
         with response:
             body = response.read(limit + 1)
             if len(body) > limit: raise PocketHTTPError(413, "RESPONSE_TOO_LARGE", url)
@@ -130,3 +142,14 @@ class PocketHTTPClient:
             status, headers, _ = self._request("PUT", remote, data=stream, headers={"Content-Type": "audio/mpeg", "Content-Length": str(size), "X-Bunri-Content-SHA256": checksum}, timeout=self.media_timeout, limit=0)
         if status not in (200, 201): raise PocketHTTPError(status, "UNEXPECTED_STATUS", self._url(remote))
         return headers.get("X-Bunri-Content-SHA256")
+
+    def delete_track(self, song_id: str) -> None:
+        if re.fullmatch(r"[0-9a-f]{12}", song_id) is None:
+            raise ValueError("song ID must be 12 lowercase hexadecimal characters")
+        path = f"tracks/{song_id}"
+        status, _, body = self._request(
+            "DELETE", path, timeout=METADATA_TIMEOUT_SECONDS, limit=JSON_LIMIT_BYTES,
+            upload_route=False,
+        )
+        if status != 204 or body:
+            raise PocketHTTPError(status, "UNEXPECTED_RESPONSE", self._api_url(path))

@@ -642,6 +642,73 @@ def test_delete_song_rejects_final_and_fixed_parent_symlinks(tmp_path):
     assert (saved_jobs / "j-delete.json").exists()
 
 
+def test_delete_song_excludes_own_delete_and_ignores_unrelated_single_sync(tmp_path):
+    from bunri.web.jobs import Job, JobStore, SongNotFoundError
+
+    store = JobStore(tmp_path, runner=lambda *args: 1)
+    own = Job(
+        id="j-own-delete",
+        digest="",
+        title="",
+        target="",
+        status="running",
+        created_at="2026-09-07T00:00:00+00:00",
+        kind="pocket_delete",
+        pocket_song_id="a" * 12,
+        pocket_digest="a" * 40,
+        pocket_safe_name="Song",
+        pocket_connection_fingerprint="f" * 64,
+    )
+    other = Job(
+        id="j-other-pocket",
+        digest="",
+        title="",
+        target="",
+        status="running",
+        created_at="2026-09-07T00:00:01+00:00",
+        kind="pocket_single",
+        pocket_song_id="b" * 12,
+        pocket_digest="b" * 40,
+        pocket_safe_name="Other",
+    )
+    try:
+        store._jobs[own.id] = own
+        with pytest.raises(SongNotFoundError):
+            store.delete_song(song_id("a" * 40), exclude_pocket_job_id=own.id)
+        store._jobs[other.id] = other
+        with pytest.raises(SongNotFoundError):
+            store.delete_song(song_id("a" * 40), exclude_pocket_job_id=own.id)
+    finally:
+        store.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["pocket_single", "pocket_delete", "pocket_all"])
+def test_delete_song_rejects_related_or_global_active_pocket_job(tmp_path, kind):
+    digest = "a" * 40
+    _write_terminal_job(tmp_path, "j-local", digest, "Song")
+    pocket = Job(
+        id="j-active-pocket",
+        digest="",
+        title="",
+        target="",
+        status="running",
+        created_at="2026-09-07T00:00:00+00:00",
+        kind=kind,
+        pocket_song_id=digest[:12] if kind != "pocket_all" else None,
+        pocket_digest=digest if kind != "pocket_all" else None,
+        pocket_safe_name="Song" if kind != "pocket_all" else None,
+        pocket_connection_fingerprint="f" * 64 if kind == "pocket_delete" else None,
+    )
+    store = JobStore(tmp_path, runner=lambda *args: 1)
+    try:
+        store._jobs[pocket.id] = pocket
+        with pytest.raises(SongDeleteConflict):
+            store.delete_song(song_id(digest))
+        assert store.get_job("j-local") is not None
+    finally:
+        store.shutdown()
+
+
 def test_delete_song_rejects_non_regular_candidate_before_any_deletion(tmp_path):
     digest = "9" * 40
     _write_terminal_job(tmp_path, "j-fifo", digest, "Song")
@@ -2336,6 +2403,29 @@ def test_a_relocated_jobs_directory_is_neither_read_nor_written(tmp_path):
             "a file outside the output tree was renamed (quarantined)"
         )
         assert store.list_jobs() == [], "nothing may be loaded from a relocated jobs directory"
+    finally:
+        store.shutdown(join_timeout=5.0)
+
+
+def test_separation_job_still_runs_when_its_record_cannot_be_saved(tmp_path):
+    """Separation keeps its existing best-effort persistence semantics."""
+    upload = _make_upload(tmp_path)
+    runner = FakeRunner()
+    store = JobStore(tmp_path, runner=runner)
+    jobs_dir = tmp_path / "web" / "jobs"
+    saved_jobs = tmp_path / "saved-jobs"
+    jobs_dir.rename(saved_jobs)
+    outside = tmp_path / "outside-jobs"
+    outside.mkdir()
+    jobs_dir.symlink_to(outside, target_is_directory=True)
+
+    try:
+        job, created = store.create_job(upload, digest="d1", requested_title="Song")
+
+        assert created is True
+        _wait_until(lambda: store.get_job(job.id).status == "done")
+        assert len(runner.calls) == 1
+        assert list(outside.iterdir()) == []
     finally:
         store.shutdown(join_timeout=5.0)
 

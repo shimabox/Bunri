@@ -151,6 +151,153 @@ def test_pocket_sync_all_reports_every_legacy_package_on_local_validation_error(
     assert "再生成が必要: Old Two" in output
     assert "ローカル検証に失敗しました。" in output
 
+
+def test_pocket_sync_all_failure_does_not_recapture_exit(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    monkeypatch.setattr(
+        pocket_cli,
+        "read_config",
+        lambda _out: PocketConfig("https://example.invalid", "unused-token"),
+    )
+    monkeypatch.setattr(
+        pocket_cli,
+        "sync_all",
+        lambda *_args, **_kwargs: BatchResult(
+            total=1,
+            items=[BatchItem("Song", "error", error="個別の同期エラー")],
+        ),
+    )
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["sync", "--all", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+
+    output = _plain(result.output)
+    assert result.exit_code == 1
+    assert "失敗: Song: 個別の同期エラー" in output
+    assert "Pocket の同期に失敗しました。後で再実行してください。" not in output
+
+
+def test_pocket_delete_song_id_with_yes_needs_no_local_package(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+    from bunri.pocket.service import DeleteResult
+
+    calls = []
+    monkeypatch.setattr(pocket_cli, "read_config", lambda _out: PocketConfig("https://example.invalid", "unused"))
+    monkeypatch.setattr(
+        pocket_cli,
+        "delete_track",
+        lambda _out, target, **kwargs: calls.append(target) or DeleteResult(target.song_id),
+    )
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["delete", "--song-id", "abcdef123456", "--yes", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0].song_id == "abcdef123456" and calls[0].safe_name is None
+    assert "棚から削除しました: abcdef123456" in _plain(result.output)
+
+
+def test_pocket_delete_stops_when_connection_changes_after_confirmation(tmp_path, monkeypatch):
+    import base64
+    import bunri.pocket.cli as pocket_cli
+    import bunri.pocket.service as service_module
+    from bunri.pocket.config import PocketConfig, save_config
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(tmp_path, PocketConfig("https://shelf-a.invalid", token))
+    remote_calls = []
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            remote_calls.append("client-created")
+
+    def change_connection(*_args, **_kwargs):
+        save_config(tmp_path, PocketConfig("https://shelf-b.invalid", token))
+        return True
+
+    monkeypatch.setattr(pocket_cli, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr(pocket_cli.typer, "confirm", change_connection)
+    monkeypatch.setattr(service_module, "PocketHTTPClient", UnexpectedClient)
+
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["delete", "--song-id", "abcdef123456", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+
+    assert result.exit_code == 1
+    assert "接続先が変更されたため削除を中止しました。対象を選び直してください" in _plain(result.output)
+    assert remote_calls == []
+
+
+def test_pocket_delete_invalid_song_id_prints_one_error(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+
+    monkeypatch.setattr(
+        pocket_cli,
+        "read_config",
+        lambda _out: PocketConfig("https://example.invalid", "unused"),
+    )
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["delete", "--song-id", "INVALID", "--yes", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+
+    output = _plain(result.output)
+    assert result.exit_code == 1
+    assert output.count("error:") == 1
+    assert "song ID は小文字16進12桁" in output
+    assert "Pocket の削除に失敗しました" not in output
+
+
+@pytest.mark.parametrize("arguments", [[], ["Song", "--song-id", "abcdef123456"], ["--select", "--song-id", "abcdef123456"]])
+def test_pocket_delete_requires_exactly_one_selector(arguments):
+    from bunri.pocket.cli import app as pocket_app
+
+    result = CliRunner().invoke(pocket_app, ["delete", *arguments], env=_STABLE_TERMINAL)
+    assert result.exit_code == 1
+    assert "いずれか1つだけ" in _plain(result.output)
+
+
+def test_pocket_delete_treats_twelve_hex_safe_name_only_as_safe_name(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+    from bunri.pocket.service import DeleteResult, DeleteTargetIdentity
+
+    resolved = DeleteTargetIdentity("b" * 12, "b" * 40, "aaaaaaaaaaaa", "Song")
+    monkeypatch.setattr(pocket_cli, "read_config", lambda _out: PocketConfig("https://example.invalid", "unused"))
+    monkeypatch.setattr(pocket_cli, "resolve_delete_target", lambda _out, name: resolved if name == "aaaaaaaaaaaa" else None)
+    calls = []
+    monkeypatch.setattr(pocket_cli, "delete_track", lambda _out, target, **kwargs: calls.append(target) or DeleteResult(target.song_id))
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["delete", "aaaaaaaaaaaa", "--yes", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [resolved]
+
+
+def test_pocket_delete_select_rejects_non_tty_and_yes_without_side_effect(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+
+    monkeypatch.setattr(pocket_cli, "read_config", lambda _out: PocketConfig("https://example.invalid", "unused"))
+    monkeypatch.setattr(pocket_cli, "list_library_tracks", lambda *_args, **_kwargs: pytest.fail("library fetched"))
+    result = CliRunner().invoke(pocket_cli.app, ["delete", "--select", "-o", str(tmp_path)], env=_STABLE_TERMINAL)
+    assert result.exit_code == 1 and "TTY" in _plain(result.output)
+    result = CliRunner().invoke(pocket_cli.app, ["delete", "--select", "--yes", "-o", str(tmp_path)], env=_STABLE_TERMINAL)
+    assert result.exit_code == 1 and "同時に指定できません" in _plain(result.output)
+
 runner = CliRunner()
 
 # Typer renders help and errors through rich, which adapts to whatever

@@ -1,13 +1,14 @@
-"""CLI/Web shared orchestration for Bunri Pocket synchronization."""
+"""CLI/Web shared orchestration for Bunri Pocket synchronization and deletion."""
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Literal
 
 from bunri.package_metadata import SourceIdentity
-from bunri.pocket.config import read_config
+from bunri.pocket.config import connection_fingerprint, read_config
 from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
 from bunri.pocket.local import (
     LocalPackage,
@@ -55,6 +56,25 @@ class PackageStatus:
     song_id: str | None
     digest: str | None
     remote: RemoteStatus
+
+
+@dataclass(frozen=True)
+class LibraryTrack:
+    song_id: str
+    title: str
+
+
+@dataclass(frozen=True)
+class DeleteTargetIdentity:
+    song_id: str
+    digest: str | None = None
+    safe_name: str | None = None
+    title: str | None = None
+
+
+@dataclass(frozen=True)
+class DeleteResult:
+    song_id: str
 
 
 @dataclass(frozen=True)
@@ -365,6 +385,83 @@ def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageSt
     return tuple(sorted(statuses, key=lambda item: (item.safe_name.casefold(), item.safe_name)))
 
 
+def list_library_tracks(
+    out_dir: Path,
+    *,
+    client: PocketHTTPClient | None = None,
+) -> tuple[LibraryTrack, ...]:
+    """Return the validated shelf library in its current display order."""
+    config = read_config(out_dir)
+    if config is None:
+        raise PocketServiceError("Pocket の接続設定がありません。", kind="not_connected")
+    remote = client or PocketHTTPClient(config.base_url, config.token)
+    try:
+        document = _library(remote)
+    except ProtocolError as exc:
+        raise PocketServiceError("棚の library が破損しています。", kind="remote_invalid") from exc
+    if document is None:
+        return ()
+    return tuple(
+        LibraryTrack(song_id=item["song_id"], title=item["title"])
+        for item in document.value["songs"]
+    )
+
+
+def resolve_delete_target(out_dir: Path, safe_name: str) -> DeleteTargetIdentity:
+    package = resolve_package(out_dir, safe_name, resolution="safe_name", include_original=True)
+    source = package.metadata.source
+    return DeleteTargetIdentity(
+        song_id=source.cache_key,
+        digest=source.digest,
+        safe_name=package.directory.name,
+        title=package.metadata.title,
+    )
+
+
+def delete_track(
+    out_dir: Path,
+    target: DeleteTargetIdentity,
+    *,
+    expected_connection_fingerprint: str,
+    lock: SyncLock | None = None,
+    client: PocketHTTPClient | None = None,
+) -> DeleteResult:
+    """Delete one shelf track while holding the shared Pocket mutation lock."""
+    if not re.fullmatch(r"[0-9a-f]{12}", target.song_id):
+        raise PocketServiceError("song ID が不正です。", kind="invalid_song_id")
+    owned_lock = lock is None
+    active_lock = lock or SyncLock(out_dir).acquire()
+    try:
+        config = read_config(out_dir)
+        if config is None:
+            raise PocketServiceError("Pocket の接続設定がありません。", kind="not_connected")
+        if connection_fingerprint(config) != expected_connection_fingerprint:
+            raise PocketServiceError(
+                "接続先が変更されたため削除を中止しました。対象を選び直してください",
+                kind="connection_changed",
+            )
+        if target.safe_name is not None:
+            current = resolve_delete_target(out_dir, target.safe_name)
+            if current.song_id != target.song_id or (
+                target.digest is not None and current.digest != target.digest
+            ):
+                raise PocketServiceError("選択した曲の identity が変更されました。", kind="conflict")
+        remote = client or PocketHTTPClient(config.base_url, config.token)
+        try:
+            remote.delete_track(target.song_id)
+        except PocketHTTPError:
+            raise
+        except (TimeoutError, OSError) as exc:
+            raise PocketServiceError(
+                "棚からの削除を確認できませんでした。",
+                kind="delete_unknown",
+            ) from exc
+        return DeleteResult(target.song_id)
+    finally:
+        if owned_lock:
+            active_lock.release()
+
+
 def safe_error(exc: BaseException) -> str:
     if isinstance(exc, SyncLockBusy):
         return "別の Pocket 同期が実行中です。完了後に再実行してください。"
@@ -393,6 +490,42 @@ def safe_error(exc: BaseException) -> str:
     if isinstance(exc, LocalPreflightError):
         return "ローカルパッケージを安全に同期できません。"
     return "Pocket の同期に失敗しました。後で再実行してください。"
+
+
+def safe_delete_error(exc: BaseException) -> str:
+    """Return a secret-free error message for a shelf deletion."""
+    if isinstance(exc, SyncLockBusy):
+        return "別の Pocket 操作が実行中です。完了後に再実行してください。"
+    if isinstance(exc, PocketHTTPError):
+        messages = {
+            401: "Pocket の認証に失敗しました。接続設定を更新してください。",
+            409: "Pocket と Bunri のデータ形式に互換性がありません。",
+            413: "送信するデータが Pocket の上限を超えています。",
+            422: "棚の library が破損しています。棚の内容は変更されていません。",
+            404: "Pocket の接続先または protocol を確認してください。",
+            503: "棚からの削除を確認できませんでした。同じ song ID で再実行できます。",
+        }
+        if exc.status == 429:
+            return "Pocket が要求を制限しました。後で再実行してください。" + (
+                f" Retry-After: {exc.retry_after}" if exc.retry_after else ""
+            )
+        return messages.get(exc.status, "Pocket との通信に失敗しました。後で再実行してください。")
+    if isinstance(exc, PocketServiceError):
+        messages = {
+            "not_connected": "Pocket の接続設定がありません。",
+            "legacy": "このパッケージは再生成が必要です。",
+            "not_found": "削除する曲が見つかりません。",
+            "conflict": "曲の identity が競合しているため削除できません。",
+            "local": "ローカルパッケージを安全に確認できません。",
+            "remote_invalid": "棚の library が破損しています。棚の内容は変更されていません。",
+            "invalid_song_id": "song ID は小文字16進12桁で指定してください。",
+            "delete_unknown": "棚からの削除を確認できませんでした。同じ song ID で再実行できます。",
+            "connection_changed": "接続先が変更されたため削除を中止しました。対象を選び直してください",
+        }
+        return messages.get(exc.kind, "Pocket の削除を開始できません。")
+    if isinstance(exc, LocalPreflightError):
+        return "ローカルパッケージを安全に確認できません。"
+    return "Pocket の削除に失敗しました。後で再実行してください。"
 
 
 def sync_one(
