@@ -1469,6 +1469,90 @@ def test_cli_song_keeps_identity_until_cache_deletion_can_be_retried(
     assert not cache.exists()
 
 
+def test_cli_song_keeps_identity_when_package_file_deletion_fails(
+    tmp_path, monkeypatch
+):
+    digest = "d" * 40
+    package = _write_cli_package(tmp_path, "Retry Package Delete", digest)
+    sidecar = package / ".bunri-package.json"
+    audio = package / "Retry Package Delete.guitar.wav"
+    audio.write_bytes(b"audio")
+    cache = tmp_path / ".cache" / digest[:12]
+    cache.mkdir(parents=True)
+    (cache / "stem.wav").write_bytes(b"cached stem")
+    real_unlink = Path.unlink
+
+    def fail_audio(path, *args, **kwargs):
+        if path == audio.resolve():
+            raise OSError("simulated audio delete failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_audio)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        listed = client.get("/api/songs").json()
+        song_id = listed[0]["id"]
+
+        failed = client.delete(f"/api/songs/{song_id}")
+
+        assert failed.status_code == 500
+        assert sidecar.is_file()
+        assert audio.is_file()
+        assert client.get("/api/songs").json()[0]["id"] == song_id
+
+        monkeypatch.setattr(Path, "unlink", real_unlink)
+        retried = client.delete(f"/api/songs/{song_id}")
+
+        assert retried.status_code == 204
+        assert client.get("/api/songs").json() == []
+
+    assert not package.exists()
+    assert not cache.exists()
+
+
+def test_delete_package_unlinks_external_symlink_without_touching_target(tmp_path):
+    digest = "e" * 40
+    package = _write_cli_package(tmp_path, "Linked Package", digest)
+    external = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    external.write_bytes(b"keep")
+    link = package / "external-link"
+    link.symlink_to(external)
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song_id = client.get("/api/songs").json()[0]["id"]
+        deleted = client.delete(f"/api/songs/{song_id}")
+
+        assert deleted.status_code == 204
+
+    assert not package.exists()
+    assert not link.exists()
+    assert external.read_bytes() == b"keep"
+
+
+def test_delete_song_reports_failure_when_package_rmdir_fails(tmp_path, monkeypatch):
+    digest = "1" * 40
+    package = _write_cli_package(tmp_path, "Rmdir Failure", digest)
+    sidecar = package / ".bunri-package.json"
+    real_rmdir = Path.rmdir
+
+    def fail_package(path, *args, **kwargs):
+        if path == package.resolve():
+            raise OSError("simulated package rmdir failure")
+        return real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "rmdir", fail_package)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song_id = client.get("/api/songs").json()[0]["id"]
+        failed = client.delete(f"/api/songs/{song_id}")
+
+        assert failed.status_code == 500
+
+    assert package.is_dir()
+    assert not sidecar.exists()
+
+
 def test_delete_song_returns_204_while_unrelated_pocket_single_is_active(client):
     from bunri.web.jobs import Job
 

@@ -42,6 +42,7 @@ class DeleteTarget:
 
     relative: Path
     kind: Literal["file", "directory"]
+    keep_last: Path | None = None
 
 
 def _literal_delete_path(base: Path, target: DeleteTarget) -> Path:
@@ -50,6 +51,15 @@ def _literal_delete_path(base: Path, target: DeleteTarget) -> Path:
         raise UnsafeOutputPath(f"unsafe deletion path: {relative}")
     if any(part in ("", ".") for part in relative.parts):
         raise UnsafeOutputPath(f"unsafe deletion path: {relative}")
+    if target.keep_last is not None:
+        keep_last = target.keep_last
+        if (
+            target.kind != "directory"
+            or keep_last.is_absolute()
+            or len(keep_last.parts) != 1
+            or keep_last.parts[0] in ("", ".", "..")
+        ):
+            raise UnsafeOutputPath(f"unsafe keep-last path: {keep_last}")
     return base.resolve().joinpath(*relative.parts)
 
 
@@ -105,27 +115,63 @@ def _validate_delete_target(base: Path, target: DeleteTarget) -> tuple[Path, boo
     return path, True
 
 
-def delete_output_targets(base: Path, targets: list[DeleteTarget]) -> None:
-    """Delete verified output paths in order, never following symlinks.
-
-    Every target is inspected before anything changes. Each target is then
-    inspected again immediately before removal so a changed final component
-    or parent is refused. Missing paths are successful no-ops.
-    """
+def validate_output_targets(base: Path, targets: list[DeleteTarget]) -> None:
+    """Inspect every deletion target before any caller-visible mutation."""
     resolved_base = base.resolve()
     if not resolved_base.is_dir():
         raise UnsafeOutputPath(f"{base} is not a directory")
     for target in targets:
         _validate_delete_target(base, target)
+
+
+def _delete_directory_entry(path: Path) -> None:
+    mode = path.lstat().st_mode
+    if stat.S_ISLNK(mode) or stat.S_ISREG(mode):
+        path.unlink()
+    elif stat.S_ISDIR(mode):
+        # rmtree uses its fd-based, symlink-attack-resistant walker on
+        # macOS and Linux. A path changed into a symlink is refused rather
+        # than followed.
+        shutil.rmtree(path)
+    else:
+        raise UnsafeOutputPath(f"{path} is not a regular file or directory")
+
+
+def _delete_directory_keep_last(path: Path, keep_last: Path) -> None:
+    delayed: Path | None = None
+    with os.scandir(path) as entries:
+        for entry in entries:
+            child = Path(entry.path)
+            if entry.name == keep_last.name:
+                delayed = child
+            else:
+                _delete_directory_entry(child)
+    if delayed is not None:
+        delayed.unlink()
+    path.rmdir()
+
+
+def delete_output_targets(base: Path, targets: list[DeleteTarget]) -> None:
+    """Delete verified output paths in order, never following symlinks.
+
+    Every target is inspected before anything changes. Each target is then
+    inspected again immediately before removal so a changed final component
+    or parent is refused. Missing paths are successful no-ops. A directory's
+    optional ``keep_last`` file is unlinked only after every other entry.
+    """
+    validate_output_targets(base, targets)
     for target in targets:
         path, exists = _validate_delete_target(base, target)
         if not exists:
             continue
         if target.kind == "directory":
-            # rmtree uses its fd-based, symlink-attack-resistant walker on
-            # macOS and Linux. It unlinks internal links without traversing
-            # them and independently refuses a link at `path` itself.
-            shutil.rmtree(path)
+            if target.keep_last is None:
+                # rmtree uses its fd-based, symlink-attack-resistant walker
+                # on macOS and Linux. It unlinks internal links without
+                # traversing them and independently refuses a link at `path`.
+                shutil.rmtree(path)
+            else:
+                _delete_directory_keep_last(path, target.keep_last)
         else:
             path.unlink()
 

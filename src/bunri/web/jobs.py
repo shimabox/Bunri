@@ -78,6 +78,7 @@ from bunri.safepath import (
     is_really as _is_really,
     real_subdir as _real_subdir,
     replace_into as _replace_into,
+    validate_output_targets,
     verified_mkdir as _verified_mkdir,
 )
 
@@ -2021,7 +2022,8 @@ class JobStore:
                 cache_dirs.add(Path(".cache") / prefix)
 
             package_candidates = [
-                DeleteTarget(path, "directory") for path in sorted(package_dirs)
+                DeleteTarget(path, "directory", Path(".bunri-package.json"))
+                for path in sorted(package_dirs)
             ]
             auxiliary_candidates: list[DeleteTarget] = []
             for job in sorted(targets, key=lambda item: item.id):
@@ -2050,24 +2052,29 @@ class JobStore:
                 + record_candidates
             )
 
+            validate_output_targets(self.out_dir, candidates)
             try:
-                delete_output_targets(self.out_dir, candidates)
+                delete_output_targets(
+                    self.out_dir, cache_candidates + auxiliary_candidates
+                )
             except UnsafeOutputPath:
-                # Validation failures happen before any deletion and must
-                # keep that all-or-nothing safety property.
                 raise
             except OSError:
                 if targets:
-                    # Existing Web deletion behavior permits a package to be
-                    # part of the partial deletion after an I/O failure. Its
-                    # job record still carries the digest, so this cannot
-                    # strand the remaining artifacts and the next request can
-                    # safely resume. CLI-only songs deliberately skip this.
+                    # Existing Web deletion behavior permits the package to
+                    # be removed after an earlier artifact fails. Its job
+                    # record still carries the digest, so a retry remains
+                    # possible.
                     try:
                         delete_output_targets(self.out_dir, package_candidates)
                     except OSError:
                         pass
                 raise
+            # Do not immediately retry a partially removed package: a
+            # transient failure before its sidecar is unlinked must leave the
+            # identity available to resolve the next deletion request.
+            delete_output_targets(self.out_dir, package_candidates)
+            delete_output_targets(self.out_dir, record_candidates)
             for job_id in target_ids:
                 del self._jobs[job_id]
 
