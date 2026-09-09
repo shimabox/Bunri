@@ -617,6 +617,7 @@
   var activePocketJobId = null;
   var pocketJobGeneration = 0;
   var pocketStatusGeneration = 0;
+  var pocketStatusRefreshPending = false;
   var pocketStatusTimer = null;
   var pocketStatusStartedAt = 0;
   // The package tally comes from the remote status call and the batch progress
@@ -834,7 +835,7 @@
     return hours + ":" + minutes;
   }
 
-  function startPocketStatusCheck(generation) {
+  function startPocketStatusCheck() {
     if (pocketStatusTimer !== null) clearInterval(pocketStatusTimer);
     pocketChecking = true;
     pocketStatusStartedAt = Date.now();
@@ -849,13 +850,11 @@
     pocketRefresh.appendChild(document.createTextNode("再読込中…"));
     renderPocketCount();
     pocketStatusTimer = setInterval(function () {
-      if (generation !== pocketStatusGeneration) return;
       renderPocketCount();
     }, 1000);
   }
 
-  function finishPocketStatusCheck(generation) {
-    if (generation !== pocketStatusGeneration) return;
+  function finishPocketStatusCheck() {
     if (pocketStatusTimer !== null) {
       clearInterval(pocketStatusTimer);
       pocketStatusTimer = null;
@@ -1392,6 +1391,7 @@
   // running batch back up.
   function refreshPocketJob() {
     var generation = ++pocketJobGeneration;
+    var trackedJobId = activePocketJobId;
     return fetch(API_POCKET_JOB)
       .then(function (res) { return res.json(); })
       .then(function (body) {
@@ -1404,6 +1404,9 @@
         } else if (job && (job.status === "done" || job.status === "error")) {
           activePocketJobId = null;
           renderPocketSummary(job);
+          if (trackedJobId !== null && job.id === trackedJobId) {
+            refreshPocketStatus();
+          }
         }
         renderSongs(songsCache);
         schedulePoll(songsCache);
@@ -1412,8 +1415,13 @@
   }
 
   function refreshPocketStatus() {
+    if (pocketChecking) {
+      pocketStatusRefreshPending = true;
+      ++pocketStatusGeneration;
+      return Promise.resolve();
+    }
     var generation = ++pocketStatusGeneration;
-    startPocketStatusCheck(generation);
+    startPocketStatusCheck();
     if (songsCache.length) renderSongs(songsCache);
     return fetch(API_POCKET_STATUS)
       .then(function (res) {
@@ -1457,10 +1465,13 @@
         renderPocketStatusFailure();
       })
       .finally(function () {
-        if (generation !== pocketStatusGeneration) return;
-        finishPocketStatusCheck(generation);
+        finishPocketStatusCheck();
         renderSongs(songsCache);
         schedulePoll(songsCache);
+        if (pocketStatusRefreshPending) {
+          pocketStatusRefreshPending = false;
+          return refreshPocketStatus();
+        }
       });
   }
 
@@ -1502,7 +1513,6 @@
     if (document.visibilityState === "visible") {
       refreshSongs();
       refreshPocketJob();
-      refreshPocketStatus();
     }
   });
 
