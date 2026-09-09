@@ -75,7 +75,9 @@ def preflight(
     identity = identity_result.identity
     metadata = identity_result.metadata
     target_values = identity_result.targets
-    if identity_result.state == "invalid" and not target_values:
+    if identity_result.state == "invalid" and identity_result.targets_is_array is None:
+        raise LocalPreflightError(issues, identity=identity)
+    if "package metadata targets must be an array" in identity_result.issues:
         raise LocalPreflightError(issues, identity=identity)
     requested: list[tuple[str, str | None, str | None]] = []
     if include_original: requested.append((f"{safe_name}.original.mp3", None, None))

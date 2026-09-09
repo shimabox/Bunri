@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ from bunri.package_metadata import (
     TargetMetadata,
     write_package_metadata,
 )
-from bunri.pocket.local import preflight
+from bunri.pocket.local import LocalPreflightError, preflight
 
 
 @pytest.mark.parametrize(
@@ -77,3 +78,61 @@ def test_preflight_reads_only_requested_mp3_assets(
     read_asset_names = {name for name, _ in reads if name in asset_names}
     assert read_asset_names == hashed_names
     assert {asset.path.name for asset in package.assets} == hashed_names
+
+
+def test_preflight_aggregates_invalid_array_target_and_missing_original(tmp_path):
+    out_dir = tmp_path / "out"
+    package_dir = out_dir / "Song"
+    package_dir.mkdir(parents=True)
+    (package_dir / ".bunri-package.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "title": "Song",
+                "safe_name": "Song",
+                "source": {
+                    "algorithm": "sha1",
+                    "digest": "a" * 40,
+                    "cache_key": "a" * 12,
+                },
+                "targets": [{}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LocalPreflightError) as exc_info:
+        preflight(out_dir, "Song", include_original=True)
+
+    assert "invalid or duplicate package target: None" in exc_info.value.issues
+    assert any(
+        issue.startswith("original:") and "通常ファイルではありません" in issue
+        for issue in exc_info.value.issues
+    )
+
+
+def test_preflight_stops_before_assets_when_targets_is_not_an_array(tmp_path):
+    out_dir = tmp_path / "out"
+    package_dir = out_dir / "Song"
+    package_dir.mkdir(parents=True)
+    (package_dir / ".bunri-package.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "title": "Song",
+                "safe_name": "Song",
+                "source": {
+                    "algorithm": "sha1",
+                    "digest": "a" * 40,
+                    "cache_key": "a" * 12,
+                },
+                "targets": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LocalPreflightError) as exc_info:
+        preflight(out_dir, "Song", include_original=True)
+
+    assert exc_info.value.issues == ["package metadata targets must be an array"]

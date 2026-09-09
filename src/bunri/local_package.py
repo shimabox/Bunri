@@ -26,6 +26,7 @@ class PackageIdentityInspection:
     metadata: PackageMetadata | None = None
     identity: SourceIdentity | None = None
     targets: tuple[tuple[str, tuple[object, ...]], ...] = ()
+    targets_is_array: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -184,9 +185,14 @@ def _source_identity(value: object) -> tuple[SourceIdentity | None, list[str]]:
 
 def _metadata_issues(
     value: object, directory_name: str
-) -> tuple[list[str], SourceIdentity | None, tuple[tuple[str, tuple[object, ...]], ...]]:
+) -> tuple[
+    list[str],
+    SourceIdentity | None,
+    tuple[tuple[str, tuple[object, ...]], ...],
+    bool | None,
+]:
     if not isinstance(value, dict):
-        return ["package metadata must be an object"], None, ()
+        return ["package metadata must be an object"], None, (), None
     issues: list[str] = []
     version = value.get("schema_version")
     if isinstance(version, bool) or version != 1:
@@ -230,7 +236,7 @@ def _metadata_issues(
                 or len(set(formats)) != len(formats)
             ):
                 issues.append(f"invalid formats for package target {target}")
-    return issues, identity, tuple(enumerable)
+    return issues, identity, tuple(enumerable), isinstance(raw_targets, list)
 
 
 def inspect_package_identity(out_dir: Path, name: str) -> PackageIdentityInspection:
@@ -266,10 +272,16 @@ def inspect_package_identity(out_dir: Path, name: str) -> PackageIdentityInspect
         return PackageIdentityInspection(
             name, directory, "invalid", (f"invalid package metadata: {sidecar}",)
         )
-    issues, identity, targets = _metadata_issues(raw, name)
+    issues, identity, targets, targets_is_array = _metadata_issues(raw, name)
     if issues:
         return PackageIdentityInspection(
-            name, directory, "invalid", tuple(issues), identity=identity, targets=targets
+            name,
+            directory,
+            "invalid",
+            tuple(issues),
+            identity=identity,
+            targets=targets,
+            targets_is_array=targets_is_array,
         )
     assert isinstance(raw, dict) and isinstance(raw.get("safe_name"), str)
     metadata = read_package_metadata(
@@ -283,6 +295,7 @@ def inspect_package_identity(out_dir: Path, name: str) -> PackageIdentityInspect
         metadata=metadata,
         identity=metadata.source,
         targets=tuple((item.target, tuple(item.formats)) for item in metadata.targets),
+        targets_is_array=True,
     )
 
 
