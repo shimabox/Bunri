@@ -1684,7 +1684,7 @@ class JobStore:
                 artifacts = artifact_by_target.get(target)
                 if job is not None and job.status in ("queued", "running", "error"):
                     status = job.status
-                elif digest in scan.conflicts and metadata is not None:
+                elif digest in scan.conflicts:
                     # Pending and failed work stays actionable above, but a
                     # completed job must not make either conflicting package
                     # look safe to play or download.

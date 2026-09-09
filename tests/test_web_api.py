@@ -311,6 +311,44 @@ def test_completed_web_job_hides_links_when_its_package_identity_conflicts(tmp_p
     assert target["downloads"] == []
 
 
+def test_completed_web_job_conflicts_when_only_renamed_package_copies_remain(tmp_path):
+    import shutil
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    content = b"web source moved and copied under other names"
+    digest = hashlib.sha1(content).hexdigest()
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        created = _upload(client, content=content, title="Web Song")
+        _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+        package = tmp_path / "Web Song"
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                "Web Song",
+                "Web Song",
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3", "wav")),),
+            ),
+        )
+        moved = package.rename(tmp_path / "Moved Web Song")
+        shutil.copytree(moved, tmp_path / "Copied Web Song")
+
+        song = client.get("/api/songs").json()[0]
+
+    assert song["conflict"] is True
+    assert song["conflict_packages"] == ["Copied Web Song", "Moved Web Song"]
+    assert song["targets"]
+    assert all(target["status"] == "conflict" for target in song["targets"])
+    assert all(target["package_url"] is None for target in song["targets"])
+    assert all(target["downloads"] == [] for target in song["targets"])
+
+
 def test_job_state_overrides_completed_package_artifacts(tmp_path):
     digest = "c" * 40
     package = _write_cli_package(tmp_path, "Song", digest, formats=("mp3",))
