@@ -76,6 +76,11 @@
   .sw-remote-only-list { list-style: none; margin: 10px 0 0; padding: 0; }
   .sw-remote-only-item { display: flex; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #f1e8da; }
   .sw-remote-only-id { color: #8a7f74; font-family: ui-monospace, monospace; font-size: 0.78rem; }
+  .sw-package-warning { margin-top: 18px; padding: 12px 14px; border-radius: 10px; background: #fff3e8; color: #8a552f; }
+  .sw-package-warning[hidden] { display: none; }
+  .sw-package-warning h3 { margin: 0 0 6px; font-size: 0.85rem; }
+  .sw-package-warning p { margin: 0; font-size: 0.78rem; }
+  .sw-package-warning ul { margin: 7px 0 0; padding-left: 1.25rem; font-size: 0.8rem; }
 
   .sw-dropzone {
     border: 2px dashed #e6d9c4;
@@ -505,6 +510,11 @@
     </div>
     <p id="sw-empty" class="sw-empty">まだ曲はありません。</p>
     <ul id="sw-job-list" class="sw-job-list"></ul>
+    <section id="sw-legacy-packages" class="sw-package-warning" hidden>
+      <h3>再生成が必要なパッケージ</h3>
+      <p>現在の Web 一覧へ安全に取り込むには、元の音源から再生成してください。</p>
+      <ul id="sw-legacy-package-list"></ul>
+    </section>
     <p id="sw-remote-only-error" class="sw-upload-error" role="status" aria-live="polite" hidden></p>
     <section id="sw-remote-only" class="sw-remote-only" aria-labelledby="sw-remote-only-title" hidden>
       <h3 id="sw-remote-only-title">棚にのみある曲</h3>
@@ -548,6 +558,7 @@
 
   var API_JOBS = "/api/jobs";
   var API_SONGS = "/api/songs";
+  var API_SONGS_LEGACY = "/api/songs-legacy";
   var API_POCKET_STATUS = "/api/pocket/status";
   var API_POCKET_JOB = "/api/pocket/job";
   var API_POCKET_SYNC = "/api/pocket/sync";
@@ -588,6 +599,8 @@
   var remoteOnlySection = document.getElementById("sw-remote-only");
   var remoteOnlyList = document.getElementById("sw-remote-only-list");
   var remoteOnlyTracks = [];
+  var legacyPackagesSection = document.getElementById("sw-legacy-packages");
+  var legacyPackagesList = document.getElementById("sw-legacy-package-list");
 
   var pendingFile = null;
   var pollTimer = null;
@@ -731,6 +744,10 @@
         return { text: "完了", cls: "sw-badge-done" };
       case "error":
         return { text: "失敗", cls: "sw-badge-error" };
+      case "missing":
+        return { text: "ファイル欠損", cls: "sw-badge-error" };
+      case "conflict":
+        return { text: "競合中", cls: "sw-badge-queued" };
       default:
         return { text: job.status, cls: "" };
     }
@@ -1023,7 +1040,7 @@
 
   function renderSongs(songs) {
     var focusedSongId = null;
-    var focusedDownloadJobId = null;
+    var focusedDownloadKey = null;
     var activeElement = document.activeElement;
     if (activeElement && activeElement.matches("button.sw-job-toggle")) {
       var focusedCard = activeElement.closest("li.sw-job");
@@ -1032,7 +1049,7 @@
       }
     } else if (activeElement && activeElement.matches("button.sw-download-toggle")) {
       if (jobListEl.contains(activeElement)) {
-        focusedDownloadJobId = activeElement.dataset.jobId;
+        focusedDownloadKey = activeElement.dataset.downloadKey;
       }
     }
 
@@ -1088,6 +1105,15 @@
       content.id = contentId;
       content.hidden = !expanded;
 
+      if (song.conflict) {
+        var conflict = document.createElement("p");
+        conflict.className = "sw-pocket-message";
+        conflict.setAttribute("role", "alert");
+        conflict.textContent = "同じ音源のパッケージが複数あります: "
+          + (song.conflict_packages || []).join(", ");
+        content.appendChild(conflict);
+      }
+
       if (pocketConnected) {
         var pocketStatus = pocketStatuses[song.id];
         var pocketRow = document.createElement("div");
@@ -1108,7 +1134,8 @@
         pocketButton.className = "sw-btn";
         pocketButton.textContent = "⬆ アップロード";
         pocketButton.disabled = pocketChecking || activePocketJobId !== null
-          || hasActivePocketJobs(songs) || !pocketStatus || !pocketStatus.can_sync;
+          || hasActivePocketJobs(songs) || song.conflict
+          || !pocketStatus || !pocketStatus.can_sync;
         if (pocketStatus && pocketStatus.song_id) {
           pocketButton.addEventListener("click", function () {
             pocketButton.disabled = true;
@@ -1175,12 +1202,14 @@
           row.appendChild(link);
         }
         if (job.status === "done" && Array.isArray(job.downloads) && job.downloads.length) {
-          var downloadsExpanded = downloadExpandedStates[job.id] === true;
-          var downloadsId = "sw-downloads-" + job.id;
+          var downloadKey = song.id + ":" + job.target;
+          var downloadsExpanded = downloadExpandedStates[downloadKey] === true;
+          var downloadsId = "sw-downloads-" + song.id + "-" + job.target;
           var downloadToggle = document.createElement("button");
           downloadToggle.type = "button";
           downloadToggle.className = "sw-download-toggle";
-          downloadToggle.dataset.jobId = job.id;
+          downloadToggle.dataset.downloadKey = downloadKey;
+          if (job.id) downloadToggle.dataset.jobId = job.id;
           downloadToggle.setAttribute("aria-expanded", String(downloadsExpanded));
           downloadToggle.setAttribute("aria-controls", downloadsId);
           var downloadIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -1225,7 +1254,7 @@
           });
           downloadToggle.addEventListener("click", function () {
             var nextExpanded = downloadToggle.getAttribute("aria-expanded") !== "true";
-            downloadExpandedStates[job.id] = nextExpanded;
+            downloadExpandedStates[downloadKey] = nextExpanded;
             downloadToggle.setAttribute("aria-expanded", String(nextExpanded));
             downloads.hidden = !nextExpanded;
           });
@@ -1254,7 +1283,7 @@
       deleteButton.className = "sw-btn sw-delete-song-btn";
       deleteButton.textContent = "この曲を削除";
       deleteButton.disabled = activePocketJobId !== null
-        || songHasActiveJobs(song) || hasActivePocketJobs(songs);
+        || song.conflict || songHasActiveJobs(song) || hasActivePocketJobs(songs);
       if (deleteButton.disabled) {
         deleteButton.title = "待機中または処理中のジョブがある曲は削除できません";
       }
@@ -1267,10 +1296,10 @@
       jobListEl.appendChild(li);
     });
 
-    if (focusedDownloadJobId !== null) {
+    if (focusedDownloadKey !== null) {
       var replacementDownloadToggle = Array.prototype.find.call(
         jobListEl.querySelectorAll("button.sw-download-toggle"),
-        function (button) { return button.dataset.jobId === focusedDownloadJobId; }
+        function (button) { return button.dataset.downloadKey === focusedDownloadKey; }
       );
       if (replacementDownloadToggle) {
         replacementDownloadToggle.focus({ preventScroll: true });
@@ -1284,6 +1313,17 @@
         replacementCard.querySelector("button.sw-job-toggle").focus({ preventScroll: true });
       }
     }
+  }
+
+  function renderLegacyPackages(packages) {
+    var names = Array.isArray(packages) ? packages : [];
+    legacyPackagesList.innerHTML = "";
+    names.forEach(function (name) {
+      var item = document.createElement("li");
+      item.textContent = name;
+      legacyPackagesList.appendChild(item);
+    });
+    legacyPackagesSection.hidden = names.length === 0;
   }
 
   function hasActiveJobs(songs) {
@@ -1305,9 +1345,13 @@
   function refreshSongs() {
     var hadActivePocket = hasActivePocketJobs(songsCache);
     var hadActiveSeparation = hasActiveSeparationJobs(songsCache);
-    return fetch(API_SONGS)
-      .then(function (res) { return res.json(); })
-      .then(function (songs) {
+    return Promise.all([
+      fetch(API_SONGS).then(function (res) { return res.json(); }),
+      fetch(API_SONGS_LEGACY).then(function (res) { return res.json(); })
+    ])
+      .then(function (responses) {
+        var songs = responses[0];
+        renderLegacyPackages(responses[1].packages);
         renderSongs(songs);
         schedulePoll(songs);
         if (activePocketJobId !== null) refreshActivePocketJob();

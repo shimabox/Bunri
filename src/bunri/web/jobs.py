@@ -45,14 +45,21 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from bunri.local_package import (
+    PackageArtifactInspection,
+    PackageIdentityInspection,
+    TargetArtifactInspection,
+    inspect_package_artifacts,
+    inspect_package_identity,
+    package_name_key,
+    package_names_equal,
+    package_entry_names,
+    read_package_metadata_for_directory,
+    safe_package_name_issue,
+)
 from bunri.registry import REGISTRY
 from bunri.pocket.http import PocketHTTPError
 from bunri.pocket.lock import SyncLock, SyncLockBusy
-from bunri.pocket.local import (
-    all_package_names,
-    package_name_key,
-    read_package_metadata_for_directory,
-)
 from bunri.pocket.service import (
     BatchResult,
     DeleteTargetIdentity,
@@ -71,6 +78,7 @@ from bunri.safepath import (
     is_really as _is_really,
     real_subdir as _real_subdir,
     replace_into as _replace_into,
+    validate_output_targets,
     verified_mkdir as _verified_mkdir,
 )
 
@@ -697,16 +705,108 @@ class Job:
 
 @dataclass(frozen=True)
 class Song:
-    """A response-time view of jobs sharing one source digest."""
+    """A response-time view of jobs and a validated package for one source."""
 
     id: str
+    digest: str
     title: str
     created_at: str
-    targets: tuple[Job, ...]
+    package_name: str | None
+    targets: tuple["SongTarget", ...]
+    conflicts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SongTarget:
+    target: str
+    status: str
+    job: Job | None = None
+    artifacts: TargetArtifactInspection | None = None
+
+    @property
+    def id(self) -> str | None:
+        return self.job.id if self.job is not None else None
+
+    @property
+    def digest(self) -> str:
+        return self.job.digest if self.job is not None else ""
+
+    @property
+    def title(self) -> str:
+        return self.job.title if self.job is not None else ""
+
+    @property
+    def created_at(self) -> str:
+        return self.job.created_at if self.job is not None else ""
+
+
+@dataclass(frozen=True)
+class LocalPackageScan:
+    entries: tuple[PackageIdentityInspection, ...]
+    artifacts: dict[str, PackageArtifactInspection]
+    conflicts: dict[str, tuple[str, ...]]
+    legacy: tuple[str, ...]
 
 
 def song_id(digest: str) -> str:
     return hashlib.sha256(digest.encode("utf-8")).hexdigest()
+
+
+def scan_local_packages(
+    out_dir: Path, *, inspect_artifacts: bool = True
+) -> LocalPackageScan:
+    """Inspect package identities and, when requested, their artifacts once."""
+    entries = tuple(
+        inspect_package_identity(out_dir, name) for name in package_entry_names(out_dir)
+    )
+    digest_groups: dict[str, list[PackageIdentityInspection]] = {}
+    name_groups: dict[str, list[PackageIdentityInspection]] = {}
+    for entry in entries:
+        name_groups.setdefault(package_name_key(entry.name), []).append(entry)
+        if entry.identity is not None:
+            digest_groups.setdefault(entry.identity.digest, []).append(entry)
+
+    conflict_names: dict[str, set[str]] = {}
+    for group in (*digest_groups.values(), *name_groups.values()):
+        if len(group) < 2:
+            continue
+        names = {entry.name for entry in group}
+        for entry in group:
+            if entry.identity is not None:
+                conflict_names.setdefault(entry.identity.digest, set()).update(names)
+
+    artifacts = (
+        {
+            entry.identity.digest: inspect_package_artifacts(entry)
+            for entry in entries
+            if entry.state == "ready" and entry.identity is not None
+            and entry.identity.digest not in conflict_names
+        }
+        if inspect_artifacts
+        else {}
+    )
+    legacy = tuple(
+        entry.name for entry in entries if entry.state in ("legacy", "invalid")
+    )
+    return LocalPackageScan(
+        entries,
+        artifacts,
+        {digest: tuple(sorted(names)) for digest, names in conflict_names.items()},
+        legacy,
+    )
+
+
+def _ready_package_for_digest(
+    scan: LocalPackageScan, digest: str
+) -> PackageIdentityInspection | None:
+    matches = [
+        entry
+        for entry in scan.entries
+        if entry.state == "ready"
+        and entry.identity is not None
+        and entry.identity.digest == digest
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 _VALID_STATUSES = {"queued", "running", "done", "error"}
@@ -1316,11 +1416,12 @@ class JobStore:
             return None, reason
 
         job = Job.from_dict(data)
-        # `log` is filled in for real -- it is derived, and the first run
-        # would assign it anyway -- then the size check runs against the
-        # job's *fully grown* form; see `_fully_grown` for why measuring the
-        # record as it arrives is not enough.
-        job.log = _log_relpath(job.id)
+        # Pending work needs its derived log path when recovery re-queues it.
+        # A terminal record may intentionally have no log at all, as with a
+        # completed CLI package adopted by the Web UI, so do not invent a
+        # link to a file that was never created.
+        if job.status in ("queued", "running"):
+            job.log = _log_relpath(job.id)
         # The package this job would *produce* has to be usable too, not just
         # the one it stores. `safe_filename` sanitizes the title, but `target`
         # goes in raw, so a ".." there yields an escaping package the moment
@@ -1528,7 +1629,7 @@ class JobStore:
             return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
 
     def list_songs(self) -> list[Song]:
-        """Group jobs by digest without introducing a persisted song record."""
+        """Merge persisted jobs with validated packages by full source digest."""
         with self._lock:
             groups: dict[str, list[Job]] = {}
             for job in self._jobs.values():
@@ -1536,30 +1637,96 @@ class JobStore:
                     continue
                 groups.setdefault(job.digest, []).append(job)
 
+        scan = scan_local_packages(self.out_dir)
+        for entry in scan.entries:
+            if entry.state == "ready" and entry.identity is not None:
+                groups.setdefault(entry.identity.digest, [])
+
         registry_order = {target: index for index, target in enumerate(REGISTRY)}
         songs: list[Song] = []
         for digest, jobs in groups.items():
-            latest = max(jobs, key=lambda job: (job.created_at, job.id))
+            package = _ready_package_for_digest(scan, digest)
+            matching_entries = [
+                entry for entry in scan.entries
+                if entry.state == "ready"
+                and entry.identity is not None
+                and entry.identity.digest == digest
+            ]
+            display_package = package or (matching_entries[0] if matching_entries else None)
+            metadata = display_package.metadata if display_package is not None else None
+            artifact_package = scan.artifacts.get(digest)
+            if jobs:
+                latest = max(jobs, key=lambda job: (job.created_at, job.id))
+                title = latest.title
+                created_at = latest.created_at
+            elif metadata is not None:
+                title = metadata.title
+                try:
+                    modified = display_package.directory.stat().st_mtime
+                except OSError:
+                    modified = 0
+                created_at = datetime.fromtimestamp(modified, timezone.utc).isoformat()
+            else:
+                continue
             latest_by_target: dict[str, Job] = {}
             for job in jobs:
                 current = latest_by_target.get(job.target)
                 if current is None or (job.created_at, job.id) > (current.created_at, current.id):
                     latest_by_target[job.target] = job
+            artifact_by_target = {
+                item.target: item
+                for item in (artifact_package.targets if artifact_package is not None else ())
+            }
+            target_names = set(latest_by_target) | set(artifact_by_target)
+            if metadata is not None:
+                target_names.update(item.target for item in metadata.targets)
+            target_views = []
+            for target in target_names:
+                job = latest_by_target.get(target)
+                artifacts = artifact_by_target.get(target)
+                if job is not None and job.status in ("queued", "running", "error"):
+                    status = job.status
+                elif digest in scan.conflicts:
+                    # Pending and failed work stays actionable above, but a
+                    # completed job must not make either conflicting package
+                    # look safe to play or download.
+                    status = "conflict"
+                elif job is not None and artifact_package is None:
+                    # Legacy Web packages have no identity file and therefore
+                    # no artifact inspection to supersede the saved job state.
+                    status = job.status
+                elif job is not None:
+                    status = (
+                        "done"
+                        if artifacts is not None and artifacts.complete_formats
+                        else "missing"
+                    )
+                elif artifacts is not None and artifacts.complete_formats:
+                    status = "done"
+                else:
+                    status = "missing"
+                target_views.append(SongTarget(target, status, job, artifacts))
             targets = tuple(sorted(
-                latest_by_target.values(),
-                key=lambda job: (
-                    0 if job.target in registry_order else 1,
-                    registry_order.get(job.target, 0),
-                    job.target if job.target not in registry_order else "",
+                target_views,
+                key=lambda item: (
+                    0 if item.target in registry_order else 1,
+                    registry_order.get(item.target, 0),
+                    item.target if item.target not in registry_order else "",
                 ),
             ))
             songs.append(Song(
                 id=song_id(digest),
-                title=latest.title,
-                created_at=latest.created_at,
+                digest=digest,
+                title=title,
+                created_at=created_at,
+                package_name=package.name if package is not None else None,
                 targets=targets,
+                conflicts=scan.conflicts.get(digest, ()),
             ))
         return sorted(songs, key=lambda song: (song.created_at, song.id), reverse=True)
+
+    def legacy_package_names(self) -> tuple[str, ...]:
+        return scan_local_packages(self.out_dir, inspect_artifacts=False).legacy
 
     def get_job(self, job_id: str) -> Optional[Job]:
         with self._lock:
@@ -1573,34 +1740,16 @@ class JobStore:
         lookup suitable for the lightweight song poll and avoids treating
         display download URLs as synchronization identity.
         """
-        names: set[str] = set()
-        name_groups: dict[str, set[str]] = {}
-        for package_name in all_package_names(self.out_dir):
-            name_groups.setdefault(package_name_key(package_name), set()).add(package_name)
-        out_dir = self.out_dir.resolve()
-        for job in jobs:
-            if job.kind != "separate" or job.digest != digest or job.package is None:
-                continue
-            package_name = Path(job.package).parts[0]
-            package_dir = self.out_dir / package_name
-            try:
-                if (
-                    package_dir.is_symlink()
-                    or not package_dir.is_dir()
-                    or package_dir.resolve().parent != out_dir
-                ):
-                    continue
-                metadata = read_package_metadata_for_directory(
-                    package_dir / ".bunri-package.json",
-                    package_name,
-                    allow_unknown_targets=True,
-                )
-            except (OSError, ValueError):
-                continue
-            key = package_name_key(package_name)
-            if metadata.source.digest == digest and len(name_groups.get(key, ())) == 1:
-                names.add(key)
-        return names
+        scan = scan_local_packages(self.out_dir, inspect_artifacts=False)
+        if digest in scan.conflicts:
+            return set()
+        return {
+            package_name_key(entry.name)
+            for entry in scan.entries
+            if entry.state == "ready"
+            and entry.identity is not None
+            and entry.identity.digest == digest
+        }
 
     @staticmethod
     def _batch_song_status(job: Job, package_names: set[str]) -> tuple[bool, Job | None]:
@@ -1658,11 +1807,24 @@ class JobStore:
             ]
         return min(candidates, key=lambda job: (job.created_at, job.id), default=None)
 
-    def find_reusable(self, digest: str, target: str) -> Optional[Job]:
-        """Dedup lookup: a finished job for this digest+target wins outright
-        (no re-run needed); otherwise an already queued/running one wins (so
-        a second upload of the same file while the first is still working
-        doesn't queue a duplicate). Returns None if neither exists."""
+    def find_reusable(
+        self,
+        digest: str,
+        target: str,
+        *,
+        title: str | None = None,
+        upload: str | None = None,
+    ) -> Optional[Job]:
+        """Find or record completed work that can satisfy one target.
+
+        A finished job wins outright; otherwise an already queued/running
+        one wins so a duplicate upload cannot start competing work.  When
+        ``title`` and ``upload`` are supplied by :meth:`create_jobs`, a
+        conflict-free package produced by the CLI can also be adopted if its
+        metadata names this target and at least one format has both target
+        and backing artifacts.  Adoption persists a terminal job so the API
+        keeps a stable job id and restart recovery never queues separation.
+        """
         with self._lock:
             candidates = sorted(
                 (
@@ -1678,9 +1840,62 @@ class JobStore:
         for j in candidates:
             if j.status in ("queued", "running"):
                 return j
-        return None
+        if title is None or upload is None:
+            return None
 
-    def delete_song(self, requested_song_id: str, *, exclude_pocket_job_id: str | None = None) -> None:
+        scan = scan_local_packages(self.out_dir)
+        if digest in scan.conflicts:
+            return None
+        package = _ready_package_for_digest(scan, digest)
+        artifact_package = scan.artifacts.get(digest)
+        if package is None or artifact_package is None:
+            return None
+        artifacts = next(
+            (item for item in artifact_package.targets if item.target == target),
+            None,
+        )
+        if artifacts is None or not artifacts.complete_formats:
+            return None
+
+        timestamp = _now_iso()
+        job_id = new_job_id()
+        job = Job(
+            id=job_id,
+            digest=digest,
+            title=title,
+            target=target,
+            status="done",
+            created_at=timestamp,
+            started_at=timestamp,
+            finished_at=timestamp,
+            package=_derived_package(title, target),
+            log=None,
+            upload=upload,
+        )
+        problem = _validate_job_record(job.to_dict(), job.id)
+        if problem is not None:
+            raise UnsafeOutputPath(
+                f"completed package job {job.id} is unsafe to save: {problem}"
+            )
+        self._jobs[job.id] = job
+        try:
+            if not self._write_job(job):
+                raise UnsafeOutputPath(
+                    f"completed package job {job.id} could not be saved safely"
+                )
+        except BaseException:
+            self._jobs.pop(job.id, None)
+            raise
+        return job
+
+    def delete_song(
+        self,
+        requested_song_id: str,
+        *,
+        exclude_pocket_job_id: str | None = None,
+        saved_digest: str | None = None,
+        saved_package_name: str | None = None,
+    ) -> None:
         """Delete every loaded job and owned artifact for one song.
 
         Selection, conflict checks, filesystem changes, and the final
@@ -1688,13 +1903,34 @@ class JobStore:
         last so a failed partial deletion remains visible and retryable.
         """
         with self._lock:
+            scan = scan_local_packages(self.out_dir, inspect_artifacts=False)
             targets = [
                 job for job in self._jobs.values()
                 if job.kind == "separate" and song_id(job.digest) == requested_song_id
             ]
-            if not targets:
+            package_entry = next(
+                (
+                    entry for entry in scan.entries
+                    if entry.state == "ready"
+                    and entry.identity is not None
+                    and song_id(entry.identity.digest) == requested_song_id
+                ),
+                None,
+            )
+            target_digest = (
+                targets[0].digest if targets
+                else package_entry.identity.digest
+                if package_entry is not None and package_entry.identity is not None
+                else saved_digest
+                if saved_digest is not None and song_id(saved_digest) == requested_song_id
+                else None
+            )
+            if target_digest is None:
                 raise SongNotFoundError(requested_song_id)
-            target_digests = {job.digest for job in targets}
+            if target_digest in scan.conflicts:
+                names = ", ".join(scan.conflicts[target_digest])
+                raise SongDeleteConflict(f"同じ音源のパッケージが複数あります: {names}")
+            target_digests = {target_digest}
             if any(
                 job.id != exclude_pocket_job_id
                 and job.status in ("queued", "running")
@@ -1726,11 +1962,31 @@ class JobStore:
                     return Path(job.package).parent
                 return Path(safe_filename(job.title))
 
-            package_dirs = {
+            package_dirs: set[Path] = {
                 Path(job.package).parent
                 for job in targets
                 if job.package is not None
             }
+            if package_entry is not None:
+                package_dirs.add(Path(package_entry.name))
+            elif saved_package_name is not None:
+                issue = safe_package_name_issue(saved_package_name)
+                saved_directory = self.out_dir / saved_package_name
+                try:
+                    safe_directory = (
+                        issue is None
+                        and not saved_directory.is_symlink()
+                        and saved_directory.is_dir()
+                        and saved_directory.resolve().parent == self.out_dir.resolve()
+                    )
+                except OSError:
+                    safe_directory = False
+                if saved_directory.exists() or saved_directory.is_symlink():
+                    if not safe_directory:
+                        raise SongDeleteConflict(
+                            "saved package directory cannot be resolved safely"
+                        )
+                    package_dirs.add(Path(saved_package_name))
             remaining_package_keys = {
                 referenced_package_dir(job).name.casefold() for job in remaining
             }
@@ -1746,7 +2002,7 @@ class JobStore:
             }
 
             cache_dirs: set[Path] = set()
-            for digest in {job.digest for job in targets}:
+            for digest in target_digests:
                 if _SHA1_DIGEST.fullmatch(digest) is None:
                     continue
                 prefix = digest[:12]
@@ -1756,22 +2012,69 @@ class JobStore:
                     for job in remaining
                 ):
                     continue
+                if any(
+                    entry.identity is not None
+                    and entry.identity.digest != digest
+                    and entry.identity.cache_key == prefix
+                    for entry in scan.entries
+                ):
+                    continue
                 cache_dirs.add(Path(".cache") / prefix)
 
-            candidates: list[DeleteTarget] = []
-            candidates.extend(DeleteTarget(path, "directory") for path in sorted(package_dirs))
+            package_candidates = [
+                DeleteTarget(path, "directory", Path(".bunri-package.json"))
+                for path in sorted(package_dirs)
+            ]
+            auxiliary_candidates: list[DeleteTarget] = []
             for job in sorted(targets, key=lambda item: item.id):
                 log = Path(_log_relpath(job.id))
-                candidates.append(DeleteTarget(log, "file"))
-                candidates.append(DeleteTarget(log.with_suffix(".pid"), "file"))
-            candidates.extend(DeleteTarget(path, "file") for path in sorted(uploads))
-            candidates.extend(DeleteTarget(path, "directory") for path in sorted(cache_dirs))
-            candidates.extend(
+                auxiliary_candidates.append(DeleteTarget(log, "file"))
+                auxiliary_candidates.append(DeleteTarget(log.with_suffix(".pid"), "file"))
+            auxiliary_candidates.extend(
+                DeleteTarget(path, "file") for path in sorted(uploads)
+            )
+            cache_candidates = [
+                DeleteTarget(path, "directory") for path in sorted(cache_dirs)
+            ]
+            record_candidates = [
                 DeleteTarget(Path("web") / "jobs" / f"{job.id}.json", "file")
                 for job in sorted(targets, key=lambda item: item.id)
+            ]
+
+            # Unidentifying artifacts go first, followed by the package and
+            # finally its job records.  In particular, a CLI-only song has no
+            # job record to identify it after its package sidecar is gone, so
+            # a cache failure must leave that package intact for a retry.
+            candidates = (
+                cache_candidates
+                + auxiliary_candidates
+                + package_candidates
+                + record_candidates
             )
 
-            delete_output_targets(self.out_dir, candidates)
+            validate_output_targets(self.out_dir, candidates)
+            try:
+                delete_output_targets(
+                    self.out_dir, cache_candidates + auxiliary_candidates
+                )
+            except UnsafeOutputPath:
+                raise
+            except OSError:
+                if targets:
+                    # Existing Web deletion behavior permits the package to
+                    # be removed after an earlier artifact fails. Its job
+                    # record still carries the digest, so a retry remains
+                    # possible.
+                    try:
+                        delete_output_targets(self.out_dir, package_candidates)
+                    except OSError:
+                        pass
+                raise
+            # Do not immediately retry a partially removed package: a
+            # transient failure before its sidecar is unlinked must leave the
+            # identity available to resolve the next deletion request.
+            delete_output_targets(self.out_dir, package_candidates)
+            delete_output_targets(self.out_dir, record_candidates)
             for job_id in target_ids:
                 del self._jobs[job_id]
 
@@ -1833,6 +2136,72 @@ class JobStore:
             candidate_title = requested_title[: max(0, MAX_TITLE_CHARS - len(suffix))] + suffix
             n += 1
 
+    def _package_title_for_upload(
+        self, digest: str, requested_title: str, existing: list[Job]
+    ) -> str | None:
+        """Return the title of an identity-matching package, or reject ambiguity."""
+        scan = scan_local_packages(self.out_dir, inspect_artifacts=False)
+        if digest in scan.conflicts:
+            names = ", ".join(scan.conflicts[digest])
+            raise SongDeleteConflict(f"同じ音源のパッケージが複数あります: {names}")
+        requested_key = package_name_key(safe_filename(requested_title))
+        same_requested_name = [
+            entry for entry in scan.entries if package_name_key(entry.name) == requested_key
+        ]
+        if len(same_requested_name) > 1:
+            names = ", ".join(sorted(entry.name for entry in same_requested_name))
+            raise SongDeleteConflict(f"同じ音源のパッケージが複数あります: {names}")
+        identity_matches = [
+            entry
+            for entry in scan.entries
+            if entry.identity is not None and entry.identity.digest == digest
+        ]
+        if not identity_matches:
+            return None
+        if len(identity_matches) != 1 or identity_matches[0].state != "ready":
+            raise SongDeleteConflict("同じ音源のパッケージの身元を安全に確認できません。")
+        package = identity_matches[0]
+        assert package.metadata is not None
+        package_title = package.metadata.title
+        if len(package_title) > MAX_TITLE_CHARS or _storable(package_title) != package_title:
+            raise SongDeleteConflict(
+                "パッケージの曲名をジョブ記録に安全に保存できないため再利用できません。"
+            )
+        if not package_names_equal(safe_filename(package_title), package.name):
+            raise SongDeleteConflict(
+                "パッケージ名とメタデータの曲名が一致しないため再利用できません。"
+            )
+        metadata_directory = self.out_dir / safe_filename(package_title)
+        try:
+            metadata_matches_directory = (
+                metadata_directory.is_dir()
+                and os.path.samefile(metadata_directory, package.directory)
+            )
+        except OSError:
+            metadata_matches_directory = False
+        if not metadata_matches_directory:
+            raise SongDeleteConflict(
+                "メタデータの曲名から同じパッケージフォルダを特定できないため再利用できません。"
+            )
+        for job in existing:
+            if not package_names_equal(safe_filename(job.title), package.name):
+                raise SongDeleteConflict(
+                    "既存ジョブとパッケージの曲名が一致しないため再利用できません。"
+                )
+            job_directory = self.out_dir / safe_filename(job.title)
+            try:
+                job_matches_directory = (
+                    job_directory.is_dir()
+                    and os.path.samefile(job_directory, package.directory)
+                )
+            except OSError:
+                job_matches_directory = False
+            if not job_matches_directory:
+                raise SongDeleteConflict(
+                    "既存ジョブの曲名から同じパッケージフォルダを特定できないため再利用できません。"
+                )
+        return package_title
+
     # -- mutation ---------------------------------------------------------
     def create_job(
         self, upload_path: Path, digest: str, requested_title: str, target: str = "guitar"
@@ -1882,8 +2251,13 @@ class JobStore:
                 job for job in self._jobs.values()
                 if job.kind == "separate" and job.digest == digest
             ]
+            package_title = self._package_title_for_upload(
+                digest, requested_title, existing
+            )
             title = (
-                max(existing, key=lambda job: (job.created_at, job.id)).title
+                package_title
+                if package_title is not None
+                else max(existing, key=lambda job: (job.created_at, job.id)).title
                 if existing
                 else self._resolve_title(requested_title, digest)
             )
@@ -1895,7 +2269,12 @@ class JobStore:
             results: list[tuple[Job, bool]] = []
             created_ids: list[str] = []
             for target in ordered_targets:
-                reusable = self.find_reusable(digest, target)
+                reusable = self.find_reusable(
+                    digest,
+                    target,
+                    title=title,
+                    upload=upload_rel,
+                )
                 if reusable is not None:
                     results.append((reusable, False))
                     continue
@@ -2303,7 +2682,12 @@ class JobStore:
                 with self._lock:
                     self._write_job(job)
                 try:
-                    self.delete_song(song_id(job.pocket_digest), exclude_pocket_job_id=job.id)
+                    self.delete_song(
+                        song_id(job.pocket_digest),
+                        exclude_pocket_job_id=job.id,
+                        saved_digest=job.pocket_digest,
+                        saved_package_name=job.pocket_safe_name,
+                    )
                 except SongNotFoundError:
                     # A crash after local deletion but before the completed
                     # result was saved is an idempotent success on recovery.

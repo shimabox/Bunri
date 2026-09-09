@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import json
 import threading
 import time
 import unicodedata
@@ -80,6 +81,420 @@ def _upload(client, *, name="song.mp3", content=b"fake-audio-bytes", title=None,
 
 def _job_status(client, job_id: str) -> str:
     return client.get(f"/api/jobs/{job_id}").json()["status"]
+
+
+def _write_cli_package(out_dir: Path, name: str, digest: str, *, formats=("wav",)) -> Path:
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    package = out_dir / name
+    package.mkdir(parents=True)
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            name,
+            name,
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", formats),),
+        ),
+    )
+    return package
+
+
+def test_cli_wav_package_is_listed_with_only_existing_downloads_and_can_be_deleted(tmp_path):
+    digest = "a" * 40
+    package = _write_cli_package(tmp_path, "CLI Song", digest)
+    for suffix in ("guitar.wav", "guitar.backing.wav", "guitar.player.html"):
+        (package / f"CLI Song.{suffix}").write_bytes(b"artifact")
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song = client.get("/api/songs").json()[0]
+        target = song["targets"][0]
+        assert song["digest"] == digest
+        assert song["package_name"] == "CLI Song"
+        assert target["id"] is None
+        assert target["status"] == "done"
+        assert target["package_url"].endswith("CLI%20Song.guitar.player.html")
+        assert {
+            file["format"]
+            for group in target["downloads"]
+            for file in group["files"]
+        } == {"wav"}
+        assert client.delete(f"/api/songs/{song['id']}").status_code == 204
+    assert not package.exists()
+
+
+def test_missing_cli_artifacts_are_reported_but_do_not_block_local_delete(tmp_path):
+    package = _write_cli_package(tmp_path, "Broken Song", "b" * 40, formats=("mp3",))
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song = client.get("/api/songs").json()[0]
+        target = song["targets"][0]
+        assert target["status"] == "missing"
+        assert target["missing_files"] is True
+        assert target["package_url"] is None
+        assert target["downloads"] == []
+        assert client.delete(f"/api/songs/{song['id']}").status_code == 204
+    assert not package.exists()
+
+
+@pytest.mark.parametrize("damage", ["deleted", "empty"])
+def test_done_web_job_becomes_missing_when_backing_is_unusable(tmp_path, damage):
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    content = b"web source"
+    digest = hashlib.sha1(content).hexdigest()
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        created = _upload(client, content=content, title="Web Song")
+        _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+        package = tmp_path / "Web Song"
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                "Web Song",
+                "Web Song",
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",)),),
+            ),
+        )
+        backing = package / "Web Song.guitar.backing.mp3"
+        if damage == "deleted":
+            backing.unlink()
+        else:
+            backing.write_bytes(b"")
+
+        target = client.get("/api/songs").json()[0]["targets"][0]
+
+    assert target["status"] == "missing"
+    assert target["missing_files"] is True
+    assert target["package_url"] is None
+    assert target["downloads"] == []
+
+
+def test_song_list_inspects_each_package_artifacts_only_once(tmp_path, monkeypatch):
+    import bunri.web.jobs as jobs_module
+
+    _write_cli_package(tmp_path, "First", "a" * 40)
+    _write_cli_package(tmp_path, "Second", "b" * 40)
+    actual_inspect = jobs_module.inspect_package_artifacts
+    inspected = []
+
+    def count_inspection(package):
+        inspected.append(package.name)
+        return actual_inspect(package)
+
+    monkeypatch.setattr(jobs_module, "inspect_package_artifacts", count_inspection)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        assert client.get("/api/songs").status_code == 200
+
+    assert sorted(inspected) == ["First", "Second"]
+
+
+def test_legacy_and_invalid_packages_are_named_without_exposing_diagnostics(tmp_path):
+    (tmp_path / "Legacy Song").mkdir()
+    invalid = tmp_path / "Invalid Song"
+    invalid.mkdir()
+    (invalid / ".bunri-package.json").write_text("not json")
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        assert client.get("/api/songs").json() == []
+        response = client.get("/api/songs-legacy").json()
+    assert response == {"packages": ["Invalid Song", "Legacy Song"]}
+    assert "json" not in str(response).lower()
+
+
+def test_duplicate_identity_is_visible_and_blocks_delete_and_reupload(tmp_path):
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    first = _write_cli_package(tmp_path, "First", digest)
+    second = _write_cli_package(tmp_path, "Second", digest)
+    for package, name in ((first, "First"), (second, "Second")):
+        for suffix in ("guitar.wav", "guitar.backing.wav"):
+            (package / f"{name}.{suffix}").write_bytes(b"artifact")
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song = client.get("/api/songs").json()[0]
+        assert song["conflict"] is True
+        assert song["conflict_packages"] == ["First", "Second"]
+        assert song["targets"][0]["status"] == "conflict"
+        assert song["targets"][0]["package_url"] is None
+        assert song["targets"][0]["downloads"] == []
+        assert client.delete(f"/api/songs/{song['id']}").status_code == 409
+        response = _upload(client, content=content, title="First", targets=["bass"])
+        assert response.status_code == 409
+    assert first.exists() and second.exists()
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
+def test_reupload_reuses_identity_matching_cli_package_title(tmp_path):
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    _write_cli_package(tmp_path, "CLI Song", digest)
+    runner = ApiFakeRunner()
+    app = create_app(tmp_path, runner=runner)
+    with TestClient(app) as client:
+        response = _upload(
+            client, content=content, title="Different request", targets=["bass"]
+        )
+        assert response.status_code == 202
+        job_id = response.json()["job_id"]
+        _wait_until(lambda: _job_status(client, job_id) == "done")
+        assert client.get(f"/api/jobs/{job_id}").json()["title"] == "CLI Song"
+    assert runner.calls[0]["title"] == "CLI Song"
+    assert not (tmp_path / "Different request").exists()
+    assert not (tmp_path / "CLI Song-2").exists()
+
+
+def test_reupload_rejects_cli_package_title_too_long_for_a_job_record(tmp_path):
+    from bunri.web.jobs import MAX_TITLE_CHARS
+
+    content = b"same source with a long package title"
+    digest = hashlib.sha1(content).hexdigest()
+    title = "T" * (MAX_TITLE_CHARS + 1)
+    _write_cli_package(tmp_path, title, digest)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+
+    with TestClient(app) as client:
+        response = _upload(client, content=content, title="Short", targets=["bass"])
+        jobs = client.get("/api/jobs").json()
+
+    assert response.status_code == 409
+    assert jobs == []
+    assert not list((tmp_path / "web" / "jobs").glob("*.json"))
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
+def test_completed_web_job_hides_links_when_its_package_identity_conflicts(tmp_path):
+    import shutil
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    content = b"web source copied under another name"
+    digest = hashlib.sha1(content).hexdigest()
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        created = _upload(client, content=content, title="Web Song")
+        _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+        package = tmp_path / "Web Song"
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                "Web Song",
+                "Web Song",
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3", "wav")),),
+            ),
+        )
+        shutil.copytree(package, tmp_path / "Copied Web Song")
+
+        song = client.get("/api/songs").json()[0]
+
+    assert song["conflict"] is True
+    target = song["targets"][0]
+    assert target["status"] == "conflict"
+    assert target["package_url"] is None
+    assert target["downloads"] == []
+
+
+def test_completed_web_job_conflicts_when_only_renamed_package_copies_remain(tmp_path):
+    import shutil
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    content = b"web source moved and copied under other names"
+    digest = hashlib.sha1(content).hexdigest()
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        created = _upload(client, content=content, title="Web Song")
+        _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+        package = tmp_path / "Web Song"
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                "Web Song",
+                "Web Song",
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3", "wav")),),
+            ),
+        )
+        moved = package.rename(tmp_path / "Moved Web Song")
+        shutil.copytree(moved, tmp_path / "Copied Web Song")
+
+        song = client.get("/api/songs").json()[0]
+
+    assert song["conflict"] is True
+    assert song["conflict_packages"] == ["Copied Web Song", "Moved Web Song"]
+    assert song["targets"]
+    assert all(target["status"] == "conflict" for target in song["targets"])
+    assert all(target["package_url"] is None for target in song["targets"])
+    assert all(target["downloads"] == [] for target in song["targets"])
+
+
+def test_job_state_overrides_completed_package_artifacts(tmp_path):
+    digest = "c" * 40
+    package = _write_cli_package(tmp_path, "Song", digest, formats=("mp3",))
+    for suffix in ("guitar.mp3", "guitar.backing.mp3", "guitar.player.html"):
+        (package / f"Song.{suffix}").write_bytes(b"artifact")
+    _write_job_file(
+        tmp_path,
+        "j-failed-package",
+        digest=digest,
+        title="Song",
+        status="error",
+        error="separation failed",
+    )
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        target = client.get("/api/songs").json()[0]["targets"][0]
+
+    assert target["status"] == "error"
+    assert target["package_url"] is None
+    assert target["downloads"] == []
+
+
+def test_canonically_equal_package_names_conflict_even_with_different_digests(tmp_path):
+    nfc = "ざらめのゆき"
+    nfd = unicodedata.normalize("NFD", nfc)
+    _write_cli_package(tmp_path, nfc, "d" * 40)
+    try:
+        _write_cli_package(tmp_path, nfd, "e" * 40)
+    except FileExistsError:
+        pytest.skip("filesystem does not distinguish NFC and NFD filenames")
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        songs = client.get("/api/songs").json()
+        assert len(songs) == 2
+        assert all(song["conflict"] for song in songs)
+        assert all(set(song["conflict_packages"]) == {nfc, nfd} for song in songs)
+        assert all(
+            client.delete(f"/api/songs/{song['id']}").status_code == 409
+            for song in songs
+        )
+
+
+def test_reupload_rejects_package_whose_title_does_not_derive_its_folder(tmp_path):
+    from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata, write_package_metadata
+
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    package = tmp_path / "Folder"
+    package.mkdir()
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Different Title",
+            "Folder",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("wav",)),),
+        ),
+    )
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        response = _upload(client, content=content, title="Folder", targets=["bass"])
+    assert response.status_code == 409
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
+def test_reupload_rejects_existing_job_named_differently_from_matching_package(tmp_path):
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    _write_cli_package(tmp_path, "Package Name", digest)
+    _write_job_file(
+        tmp_path,
+        "j-other-name",
+        digest=digest,
+        title="Job Name",
+        status="error",
+    )
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        response = _upload(client, content=content, title="Package Name", targets=["bass"])
+    assert response.status_code == 409
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
+def test_reupload_rejects_canonically_equal_metadata_title_for_another_directory(
+    tmp_path,
+):
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    nfc = "ざらめのゆき"
+    nfd = unicodedata.normalize("NFD", nfc)
+    package = tmp_path / nfd
+    package.mkdir()
+    if (tmp_path / nfc).exists():
+        pytest.skip("filesystem does not distinguish NFC and NFD filenames")
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            nfc,
+            nfd,
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("wav",)),),
+        ),
+    )
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        response = _upload(client, content=content, title=nfc, targets=["bass"])
+
+    assert response.status_code == 409
+    assert not (tmp_path / nfc).exists()
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
+def test_reupload_rejects_canonically_equal_job_title_for_another_directory(tmp_path):
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    nfc = "ざらめのゆき"
+    nfd = unicodedata.normalize("NFD", nfc)
+    _write_cli_package(tmp_path, nfd, digest)
+    if (tmp_path / nfc).exists():
+        pytest.skip("filesystem does not distinguish NFC and NFD filenames")
+    _write_job_file(
+        tmp_path,
+        "j-canonical-title",
+        digest=digest,
+        title=nfc,
+        status="error",
+        error="separation failed",
+    )
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        response = _upload(client, content=content, title=nfd, targets=["bass"])
+
+    assert response.status_code == 409
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
 
 
 def test_pocket_status_is_hidden_when_not_connected(client):
@@ -742,6 +1157,100 @@ def test_reuploading_identical_content_dedups_once_done(client):
     assert len(client.fake_runner.calls) == 1
 
 
+def test_reupload_adopts_completed_cli_target_without_changing_artifacts(tmp_path):
+    content = b"completed by cli"
+    digest = hashlib.sha1(content).hexdigest()
+    package = _write_cli_package(tmp_path, "CLI Song", digest)
+    for suffix in ("guitar.wav", "guitar.backing.wav", "guitar.player.html"):
+        (package / f"CLI Song.{suffix}").write_bytes(f"cli-{suffix}".encode())
+    before = {
+        path.name: path.read_bytes()
+        for path in package.iterdir()
+        if path.is_file()
+    }
+
+    runner = ApiFakeRunner()
+    app = create_app(tmp_path, runner=runner)
+    with TestClient(app) as client:
+        response = _upload(
+            client,
+            content=content,
+            title="A different upload title",
+            targets=["guitar"],
+        )
+        body = response.json()
+        job_id = body["job_id"]
+
+        assert response.status_code == 200
+        assert body == {
+            "job_id": job_id,
+            "dedup": True,
+            "jobs": [{"id": job_id, "target": "guitar", "dedup": True}],
+        }
+        assert client.get(f"/api/jobs/{job_id}").json()["status"] == "done"
+        song = client.get("/api/songs").json()[0]
+        assert song["title"] == "CLI Song"
+        assert song["targets"][0]["id"] == job_id
+        assert song["targets"][0]["status"] == "done"
+        assert runner.calls == []
+
+    assert {
+        path.name: path.read_bytes()
+        for path in package.iterdir()
+        if path.is_file()
+    } == before
+    record = json.loads((tmp_path / f"web/jobs/{job_id}.json").read_text())
+    assert record["log"] is None
+    assert record["upload"] == f"web/uploads/{digest}.mp3"
+    assert record["created_at"] == record["started_at"] == record["finished_at"]
+
+    restarted_runner = ApiFakeRunner()
+    restarted = create_app(tmp_path, runner=restarted_runner)
+    with TestClient(restarted) as client:
+        assert client.get(f"/api/jobs/{job_id}").json()["status"] == "done"
+    assert restarted_runner.calls == []
+
+
+def test_reupload_adopts_completed_cli_target_and_runs_only_missing_target(tmp_path):
+    content = b"cli guitar plus web bass"
+    digest = hashlib.sha1(content).hexdigest()
+    package = _write_cli_package(tmp_path, "CLI Band", digest)
+    for suffix in ("guitar.wav", "guitar.backing.wav", "guitar.player.html"):
+        (package / f"CLI Band.{suffix}").write_bytes(f"cli-{suffix}".encode())
+    guitar_before = {
+        path.name: path.read_bytes()
+        for path in package.glob("CLI Band.guitar.*")
+    }
+
+    runner = ApiFakeRunner()
+    app = create_app(tmp_path, runner=runner)
+    with TestClient(app) as client:
+        response = _upload(
+            client,
+            content=content,
+            title="Ignored title",
+            targets=["bass", "guitar"],
+        )
+        jobs = response.json()["jobs"]
+
+        assert response.status_code == 202
+        assert jobs[0]["target"] == "guitar"
+        assert jobs[0]["dedup"] is True
+        assert jobs[1]["target"] == "bass"
+        assert jobs[1]["dedup"] is False
+        _wait_until(lambda: _job_status(client, jobs[1]["id"]) == "done")
+        assert runner.calls == [{"title": "CLI Band", "target": "bass"}]
+        song = client.get("/api/songs").json()[0]
+        guitar = next(item for item in song["targets"] if item["target"] == "guitar")
+        assert guitar["id"] == jobs[0]["id"]
+        assert guitar["status"] == "done"
+
+    assert {
+        path.name: path.read_bytes()
+        for path in package.glob("CLI Band.guitar.*")
+    } == guitar_before
+
+
 def test_multiple_targets_are_normalized_and_returned_per_target(client):
     res = _upload(client, title="Band", targets=["piano", "guitar", "vocals", "bass"])
     assert res.status_code == 202
@@ -917,6 +1426,177 @@ def test_delete_song_returns_204_and_removes_it_from_both_lists(client):
     assert client.get("/api/songs").json() == []
     assert client.get("/api/jobs").json() == []
     assert client.delete(f"/api/songs/{song_id}").status_code == 404
+
+
+def test_cli_song_keeps_identity_until_cache_deletion_can_be_retried(
+    tmp_path, monkeypatch
+):
+    import bunri.safepath as safepath_module
+
+    digest = "c" * 40
+    package = _write_cli_package(tmp_path, "Retry CLI Delete", digest)
+    sidecar = package / ".bunri-package.json"
+    cache = tmp_path / ".cache" / digest[:12]
+    cache.mkdir(parents=True)
+    (cache / "stem.wav").write_bytes(b"cached stem")
+    real_rmtree = safepath_module.shutil.rmtree
+
+    def fail_cache(path, *args, **kwargs):
+        if path == cache.resolve():
+            raise OSError("simulated cache delete failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(safepath_module.shutil, "rmtree", fail_cache)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song_id = client.get("/api/songs").json()[0]["id"]
+
+        failed = client.delete(f"/api/songs/{song_id}")
+
+        assert failed.status_code == 500
+        assert package.is_dir()
+        assert sidecar.is_file()
+        assert cache.is_dir()
+        assert client.get("/api/songs").json()[0]["id"] == song_id
+
+        monkeypatch.setattr(safepath_module.shutil, "rmtree", real_rmtree)
+        retried = client.delete(f"/api/songs/{song_id}")
+
+        assert retried.status_code == 204
+        assert client.get("/api/songs").json() == []
+
+    assert not package.exists()
+    assert not cache.exists()
+
+
+def test_cli_song_keeps_identity_when_package_file_deletion_fails(
+    tmp_path, monkeypatch
+):
+    import bunri.safepath as safepath_module
+
+    digest = "d" * 40
+    package = _write_cli_package(tmp_path, "Retry Package Delete", digest)
+    sidecar = package / ".bunri-package.json"
+    audio = package / "Retry Package Delete.guitar.wav"
+    audio.write_bytes(b"audio")
+    cache = tmp_path / ".cache" / digest[:12]
+    cache.mkdir(parents=True)
+    (cache / "stem.wav").write_bytes(b"cached stem")
+    real_unlink = safepath_module.os.unlink
+
+    def fail_audio(path, *args, **kwargs):
+        if path == audio.name and kwargs.get("dir_fd") is not None:
+            raise OSError("simulated audio delete failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(safepath_module.os, "unlink", fail_audio)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        listed = client.get("/api/songs").json()
+        song_id = listed[0]["id"]
+
+        failed = client.delete(f"/api/songs/{song_id}")
+
+        assert failed.status_code == 500
+        assert sidecar.is_file()
+        assert audio.is_file()
+        assert client.get("/api/songs").json()[0]["id"] == song_id
+
+        monkeypatch.setattr(safepath_module.os, "unlink", real_unlink)
+        retried = client.delete(f"/api/songs/{song_id}")
+
+        assert retried.status_code == 204
+        assert client.get("/api/songs").json() == []
+
+    assert not package.exists()
+    assert not cache.exists()
+
+
+def test_delete_package_unlinks_external_symlink_without_touching_target(tmp_path):
+    digest = "e" * 40
+    package = _write_cli_package(tmp_path, "Linked Package", digest)
+    external = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    external.write_bytes(b"keep")
+    link = package / "external-link"
+    link.symlink_to(external)
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song_id = client.get("/api/songs").json()[0]["id"]
+        deleted = client.delete(f"/api/songs/{song_id}")
+
+        assert deleted.status_code == 204
+
+    assert not package.exists()
+    assert not link.exists()
+    assert external.read_bytes() == b"keep"
+
+
+def test_delete_package_does_not_follow_replacement_parent_symlink(
+    tmp_path, monkeypatch
+):
+    import bunri.safepath as safepath_module
+
+    digest = "0" * 40
+    package = _write_cli_package(tmp_path, "Swapped Package", digest)
+    audio_name = "Swapped Package.guitar.wav"
+    (package / audio_name).write_bytes(b"package audio")
+    moved_package = tmp_path / "moved-package"
+    external = tmp_path / "external-package"
+    external.mkdir()
+    external_audio = external / audio_name
+    external_identity = external / ".bunri-package.json"
+    external_audio.write_bytes(b"external audio")
+    external_identity.write_bytes(b"external identity")
+    real_scandir = safepath_module.os.scandir
+    swapped = False
+
+    def swap_package(scandir_path):
+        nonlocal swapped
+        if isinstance(scandir_path, int) and not swapped:
+            swapped = True
+            package.rename(moved_package)
+            package.symlink_to(external, target_is_directory=True)
+        return real_scandir(scandir_path)
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song_id = client.get("/api/songs").json()[0]["id"]
+        monkeypatch.setattr(safepath_module.os, "scandir", swap_package)
+
+        failed = client.delete(f"/api/songs/{song_id}")
+
+        assert failed.status_code == 500
+
+    assert swapped
+    assert package.is_symlink()
+    assert external_audio.read_bytes() == b"external audio"
+    assert external_identity.read_bytes() == b"external identity"
+
+
+def test_delete_song_reports_failure_when_package_rmdir_fails(tmp_path, monkeypatch):
+    import bunri.safepath as safepath_module
+
+    digest = "1" * 40
+    package = _write_cli_package(tmp_path, "Rmdir Failure", digest)
+    sidecar = package / ".bunri-package.json"
+    real_rmdir = safepath_module.os.rmdir
+
+    def fail_package(path, *args, **kwargs):
+        if path == package.name and kwargs.get("dir_fd") is not None:
+            raise OSError("simulated package rmdir failure")
+        return real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(safepath_module.os, "rmdir", fail_package)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song_id = client.get("/api/songs").json()[0]["id"]
+        failed = client.delete(f"/api/songs/{song_id}")
+
+        assert failed.status_code == 500
+
+    assert package.is_dir()
+    assert not sidecar.exists()
 
 
 def test_delete_song_returns_204_while_unrelated_pocket_single_is_active(client):
