@@ -191,6 +191,56 @@ def test_remote_only_tracks_render_as_read_only_text(tmp_path):
 
 
 @_needs_browser
+def test_cli_package_and_regeneration_guidance_render_without_job_ids(tmp_path):
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    out_dir = tmp_path / "out"
+    package = out_dir / "CLI Song"
+    package.mkdir(parents=True)
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "CLI Song",
+            "CLI Song",
+            SourceIdentity("sha1", "a" * 40, "a" * 12),
+            (TargetMetadata("guitar", ("wav",)),),
+        ),
+    )
+    for suffix in ("guitar.wav", "guitar.backing.wav", "guitar.player.html"):
+        (package / f"CLI Song.{suffix}").write_bytes(b"artifact")
+    (out_dir / "Legacy Song").mkdir()
+    invalid = out_dir / "Invalid Song"
+    invalid.mkdir()
+    (invalid / ".bunri-package.json").write_text("not json")
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        page.wait_for_function("window.__bunriWeb.getSongs().length === 1")
+        assert page.evaluate("window.__bunriWeb.getJobs()[0].id") is None
+        page.locator("button.sw-job-toggle").click()
+        target = page.locator('.sw-target-block[data-target="guitar"]')
+        assert target.locator(".sw-badge").text_content() == "完了"
+        assert target.locator("a.sw-open-link").count() == 1
+        toggle = target.locator("button.sw-download-toggle")
+        toggle.click()
+        assert target.locator("a.sw-download-link").all_text_contents() == ["wav", "wav"]
+        page.evaluate("window.__bunriWeb.refresh()")
+        page.wait_for_function(
+            "document.querySelector('button.sw-download-toggle').getAttribute('aria-expanded') === 'true'"
+        )
+        page.wait_for_selector("#sw-legacy-packages:not([hidden])")
+        assert page.locator("#sw-legacy-package-list li").all_text_contents() == [
+            "Invalid Song",
+            "Legacy Song",
+        ]
+
+
+@_needs_browser
 def test_remote_only_tracks_survive_unknown_shelf_status(tmp_path):
     responses = [
         {
