@@ -142,6 +142,65 @@ def test_missing_cli_artifacts_are_reported_but_do_not_block_local_delete(tmp_pa
     assert not package.exists()
 
 
+@pytest.mark.parametrize("damage", ["deleted", "empty"])
+def test_done_web_job_becomes_missing_when_backing_is_unusable(tmp_path, damage):
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    content = b"web source"
+    digest = hashlib.sha1(content).hexdigest()
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        created = _upload(client, content=content, title="Web Song")
+        _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+        package = tmp_path / "Web Song"
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                "Web Song",
+                "Web Song",
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",)),),
+            ),
+        )
+        backing = package / "Web Song.guitar.backing.mp3"
+        if damage == "deleted":
+            backing.unlink()
+        else:
+            backing.write_bytes(b"")
+
+        target = client.get("/api/songs").json()[0]["targets"][0]
+
+    assert target["status"] == "missing"
+    assert target["missing_files"] is True
+    assert target["package_url"] is None
+    assert target["downloads"] == []
+
+
+def test_song_list_inspects_each_package_artifacts_only_once(tmp_path, monkeypatch):
+    import bunri.web.jobs as jobs_module
+
+    _write_cli_package(tmp_path, "First", "a" * 40)
+    _write_cli_package(tmp_path, "Second", "b" * 40)
+    actual_inspect = jobs_module.inspect_package_artifacts
+    inspected = []
+
+    def count_inspection(package):
+        inspected.append(package.name)
+        return actual_inspect(package)
+
+    monkeypatch.setattr(jobs_module, "inspect_package_artifacts", count_inspection)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        assert client.get("/api/songs").status_code == 200
+
+    assert sorted(inspected) == ["First", "Second"]
+
+
 def test_legacy_and_invalid_packages_are_named_without_exposing_diagnostics(tmp_path):
     (tmp_path / "Legacy Song").mkdir()
     invalid = tmp_path / "Invalid Song"
@@ -168,6 +227,9 @@ def test_duplicate_identity_is_visible_and_blocks_delete_and_reupload(tmp_path):
         song = client.get("/api/songs").json()[0]
         assert song["conflict"] is True
         assert song["conflict_packages"] == ["First", "Second"]
+        assert song["targets"][0]["status"] == "conflict"
+        assert song["targets"][0]["package_url"] is None
+        assert song["targets"][0]["downloads"] == []
         assert client.delete(f"/api/songs/{song['id']}").status_code == 409
         response = _upload(client, content=content, title="First", targets=["bass"])
         assert response.status_code == 409
@@ -275,6 +337,68 @@ def test_reupload_rejects_existing_job_named_differently_from_matching_package(t
     app = create_app(tmp_path, runner=ApiFakeRunner())
     with TestClient(app) as client:
         response = _upload(client, content=content, title="Package Name", targets=["bass"])
+    assert response.status_code == 409
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
+def test_reupload_rejects_canonically_equal_metadata_title_for_another_directory(
+    tmp_path,
+):
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    nfc = "ざらめのゆき"
+    nfd = unicodedata.normalize("NFD", nfc)
+    package = tmp_path / nfd
+    package.mkdir()
+    if (tmp_path / nfc).exists():
+        pytest.skip("filesystem does not distinguish NFC and NFD filenames")
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            nfc,
+            nfd,
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("wav",)),),
+        ),
+    )
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        response = _upload(client, content=content, title=nfc, targets=["bass"])
+
+    assert response.status_code == 409
+    assert not (tmp_path / nfc).exists()
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
+def test_reupload_rejects_canonically_equal_job_title_for_another_directory(tmp_path):
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    nfc = "ざらめのゆき"
+    nfd = unicodedata.normalize("NFD", nfc)
+    _write_cli_package(tmp_path, nfd, digest)
+    if (tmp_path / nfc).exists():
+        pytest.skip("filesystem does not distinguish NFC and NFD filenames")
+    _write_job_file(
+        tmp_path,
+        "j-canonical-title",
+        digest=digest,
+        title=nfc,
+        status="error",
+        error="separation failed",
+    )
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        response = _upload(client, content=content, title=nfd, targets=["bass"])
+
     assert response.status_code == 409
     assert not list((tmp_path / "web" / "uploads").glob("*"))
 

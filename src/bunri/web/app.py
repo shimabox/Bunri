@@ -151,9 +151,9 @@ def _serialize_song(song: Song, pocket_job: Job | None = None) -> dict:
                 "downloads": [],
                 "error": None,
             }
+        serialized["status"] = target.status
         artifacts = target.artifacts
         if artifacts is not None:
-            serialized["status"] = target.status
             serialized["missing_files"] = not bool(artifacts.complete_formats)
             if target.status == "done" and artifacts.complete_formats and song.package_name:
                 package_name = song.package_name
@@ -186,7 +186,10 @@ def _serialize_song(song: Song, pocket_job: Job | None = None) -> dict:
                 serialized["package_url"] = None
                 serialized["downloads"] = []
         else:
-            serialized["missing_files"] = False
+            serialized["missing_files"] = target.status == "missing"
+            if target.status in ("missing", "conflict"):
+                serialized["package_url"] = None
+                serialized["downloads"] = []
         serialized["target_label"] = _target_label(target.target)
         targets.append(serialized)
     result = {

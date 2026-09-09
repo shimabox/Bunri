@@ -751,8 +751,10 @@ def song_id(digest: str) -> str:
     return hashlib.sha256(digest.encode("utf-8")).hexdigest()
 
 
-def scan_local_packages(out_dir: Path) -> LocalPackageScan:
-    """Inspect every package once and describe ambiguities without choosing."""
+def scan_local_packages(
+    out_dir: Path, *, inspect_artifacts: bool = True
+) -> LocalPackageScan:
+    """Inspect package identities and, when requested, their artifacts once."""
     entries = tuple(
         inspect_package_identity(out_dir, name) for name in package_entry_names(out_dir)
     )
@@ -772,12 +774,16 @@ def scan_local_packages(out_dir: Path) -> LocalPackageScan:
             if entry.identity is not None:
                 conflict_names.setdefault(entry.identity.digest, set()).update(names)
 
-    artifacts = {
-        entry.identity.digest: inspect_package_artifacts(entry)
-        for entry in entries
-        if entry.state == "ready" and entry.identity is not None
-        and entry.identity.digest not in conflict_names
-    }
+    artifacts = (
+        {
+            entry.identity.digest: inspect_package_artifacts(entry)
+            for entry in entries
+            if entry.state == "ready" and entry.identity is not None
+            and entry.identity.digest not in conflict_names
+        }
+        if inspect_artifacts
+        else {}
+    )
     legacy = tuple(
         entry.name for entry in entries if entry.state in ("legacy", "invalid")
     )
@@ -1676,10 +1682,22 @@ class JobStore:
             for target in target_names:
                 job = latest_by_target.get(target)
                 artifacts = artifact_by_target.get(target)
-                if job is not None:
+                if job is not None and job.status in ("queued", "running", "error"):
                     status = job.status
+                elif job is not None and artifact_package is None:
+                    # Legacy Web packages and conflicting identities have no
+                    # trustworthy artifact inspection to supersede the job.
+                    status = job.status
+                elif job is not None:
+                    status = (
+                        "done"
+                        if artifacts is not None and artifacts.complete_formats
+                        else "missing"
+                    )
                 elif artifacts is not None and artifacts.complete_formats:
                     status = "done"
+                elif digest in scan.conflicts and metadata is not None:
+                    status = "conflict"
                 else:
                     status = "missing"
                 target_views.append(SongTarget(target, status, job, artifacts))
@@ -1703,7 +1721,7 @@ class JobStore:
         return sorted(songs, key=lambda song: (song.created_at, song.id), reverse=True)
 
     def legacy_package_names(self) -> tuple[str, ...]:
-        return scan_local_packages(self.out_dir).legacy
+        return scan_local_packages(self.out_dir, inspect_artifacts=False).legacy
 
     def get_job(self, job_id: str) -> Optional[Job]:
         with self._lock:
@@ -1717,7 +1735,7 @@ class JobStore:
         lookup suitable for the lightweight song poll and avoids treating
         display download URLs as synchronization identity.
         """
-        scan = scan_local_packages(self.out_dir)
+        scan = scan_local_packages(self.out_dir, inspect_artifacts=False)
         if digest in scan.conflicts:
             return set()
         return {
@@ -1821,7 +1839,7 @@ class JobStore:
         last so a failed partial deletion remains visible and retryable.
         """
         with self._lock:
-            scan = scan_local_packages(self.out_dir)
+            scan = scan_local_packages(self.out_dir, inspect_artifacts=False)
             targets = [
                 job for job in self._jobs.values()
                 if job.kind == "separate" and song_id(job.digest) == requested_song_id
@@ -2018,7 +2036,7 @@ class JobStore:
         self, digest: str, requested_title: str, existing: list[Job]
     ) -> str | None:
         """Return the title of an identity-matching package, or reject ambiguity."""
-        scan = scan_local_packages(self.out_dir)
+        scan = scan_local_packages(self.out_dir, inspect_artifacts=False)
         if digest in scan.conflicts:
             names = ", ".join(scan.conflicts[digest])
             raise SongDeleteConflict(f"同じ音源のパッケージが複数あります: {names}")
@@ -2044,10 +2062,34 @@ class JobStore:
             raise SongDeleteConflict(
                 "パッケージ名とメタデータの曲名が一致しないため再利用できません。"
             )
+        metadata_directory = self.out_dir / safe_filename(package.metadata.title)
+        try:
+            metadata_matches_directory = (
+                metadata_directory.is_dir()
+                and os.path.samefile(metadata_directory, package.directory)
+            )
+        except OSError:
+            metadata_matches_directory = False
+        if not metadata_matches_directory:
+            raise SongDeleteConflict(
+                "メタデータの曲名から同じパッケージフォルダを特定できないため再利用できません。"
+            )
         for job in existing:
             if not package_names_equal(safe_filename(job.title), package.name):
                 raise SongDeleteConflict(
                     "既存ジョブとパッケージの曲名が一致しないため再利用できません。"
+                )
+            job_directory = self.out_dir / safe_filename(job.title)
+            try:
+                job_matches_directory = (
+                    job_directory.is_dir()
+                    and os.path.samefile(job_directory, package.directory)
+                )
+            except OSError:
+                job_matches_directory = False
+            if not job_matches_directory:
+                raise SongDeleteConflict(
+                    "既存ジョブの曲名から同じパッケージフォルダを特定できないため再利用できません。"
                 )
         return package.metadata.title
 

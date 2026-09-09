@@ -1377,6 +1377,42 @@ def test_dragover_highlights_dropzone(tmp_path):
 
 
 @_needs_browser
+def test_conflicting_package_target_uses_a_neutral_conflict_badge(tmp_path):
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    digest = "a" * 40
+    for name in ("First", "Second"):
+        package = out_dir / name
+        package.mkdir()
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                name,
+                name,
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",)),),
+            ),
+        )
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        page.wait_for_selector("button.sw-job-toggle")
+        page.click("button.sw-job-toggle")
+        page.wait_for_selector(".sw-target-row .sw-badge")
+        badge = page.locator(".sw-target-row .sw-badge")
+        assert badge.text_content() == "競合中"
+        assert badge.get_attribute("class").endswith("sw-badge-queued")
+        assert page.locator("a.sw-open-link, a.sw-download-link").count() == 0
+
+
+@_needs_browser
 def test_failed_job_shows_collapsible_log_tail(tmp_path):
     runner = PageFakeRunner(write_player=False, returncode=1)
     app = create_app(tmp_path / "out", runner=runner)

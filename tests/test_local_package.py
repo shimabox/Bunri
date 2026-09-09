@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 
-from bunri.local_package import inspect_package_artifacts, inspect_package_identity
+from bunri.local_package import (
+    inspect_artifact,
+    inspect_package_artifacts,
+    inspect_package_identity,
+)
 from bunri.package_metadata import (
     PackageMetadata,
     SourceIdentity,
@@ -60,6 +64,39 @@ def test_artifacts_report_complete_formats_and_missing_files(tmp_path):
     assert target.player.sha256 is not None
     assert dict(target.target_files)["mp3"].issue.endswith("空です")
     assert dict(target.backing_files)["mp3"].present is False
+
+
+def test_artifact_without_hash_reads_only_a_small_prefix(tmp_path, monkeypatch):
+    artifact = tmp_path / "artifact.mp3"
+    artifact.write_bytes(b"a" * 1024)
+    original_open = type(artifact).open
+    read_sizes = []
+
+    class CountingReader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            return self.stream.read(size)
+
+    def counting_open(path, *args, **kwargs):
+        return CountingReader(original_open(path, *args, **kwargs))
+
+    monkeypatch.setattr(type(artifact), "open", counting_open)
+
+    result = inspect_artifact(artifact, tmp_path)
+
+    assert result.present is True
+    assert result.size == 1024
+    assert result.sha256 is None
+    assert read_sizes == [16]
 
 
 def test_identity_rejects_a_directory_symlink(tmp_path):

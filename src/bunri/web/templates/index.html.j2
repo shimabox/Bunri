@@ -746,6 +746,8 @@
         return { text: "失敗", cls: "sw-badge-error" };
       case "missing":
         return { text: "ファイル欠損", cls: "sw-badge-error" };
+      case "conflict":
+        return { text: "競合中", cls: "sw-badge-queued" };
       default:
         return { text: job.status, cls: "" };
     }

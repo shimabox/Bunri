@@ -290,19 +290,27 @@ def inspect_artifact(path: Path, directory: Path, *, hash_file: bool = False) ->
     if not is_real_file_in(path, directory.resolve()):
         return ArtifactInspection(path, False, issue=f"{path}: 通常ファイルではありません")
     try:
-        digest = hashlib.sha256() if hash_file else None
+        if not hash_file:
+            size = path.stat().st_size
+            if size <= 0:
+                return ArtifactInspection(path, False, size=0, issue=f"{path}: 空です")
+            with path.open("rb") as stream:
+                if not stream.read(16):
+                    return ArtifactInspection(path, False, size=0, issue=f"{path}: 空です")
+            return ArtifactInspection(path, True, size=size)
+
+        digest = hashlib.sha256()
         size = 0
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1 << 20), b""):
                 size += len(chunk)
-                if digest is not None:
-                    digest.update(chunk)
+                digest.update(chunk)
     except OSError as exc:
         return ArtifactInspection(path, False, issue=f"{path}: 読み取れません ({exc})")
     if size <= 0:
         return ArtifactInspection(path, False, size=0, issue=f"{path}: 空です")
     return ArtifactInspection(
-        path, True, size=size, sha256=digest.hexdigest() if digest is not None else None
+        path, True, size=size, sha256=digest.hexdigest()
     )
 
 
