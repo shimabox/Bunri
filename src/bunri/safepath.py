@@ -124,31 +124,103 @@ def validate_output_targets(base: Path, targets: list[DeleteTarget]) -> None:
         _validate_delete_target(base, target)
 
 
-def _delete_directory_entry(path: Path) -> None:
-    mode = path.lstat().st_mode
-    if stat.S_ISLNK(mode) or stat.S_ISREG(mode):
-        path.unlink()
-    elif stat.S_ISDIR(mode):
-        # rmtree uses its fd-based, symlink-attack-resistant walker on
-        # macOS and Linux. A path changed into a symlink is refused rather
-        # than followed.
-        shutil.rmtree(path)
-    else:
-        raise UnsafeOutputPath(f"{path} is not a regular file or directory")
+def _supports_fd_directory_deletion() -> bool:
+    """Whether this platform has the primitives needed for a safe walk.
+
+    CPython does not include ``lstat`` in ``supports_dir_fd`` even though its
+    documented ``dir_fd`` parameter is implemented through ``stat``. Check
+    ``stat`` as that capability marker, alongside every other operation used
+    below. macOS and Linux provide this complete set.
+    """
+    required_dir_fd = (os.open, os.stat, os.unlink, os.rmdir)
+    return (
+        all(function in os.supports_dir_fd for function in required_dir_fd)
+        and os.scandir in os.supports_fd
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+    )
 
 
-def _delete_directory_keep_last(path: Path, keep_last: Path) -> None:
-    delayed: Path | None = None
-    with os.scandir(path) as entries:
+_FD_DIRECTORY_DELETION_SUPPORTED = _supports_fd_directory_deletion()
+
+
+def _delete_directory_contents_fd(
+    directory_fd: int, *, keep_last: str | None = None
+) -> None:
+    delayed = False
+    with os.scandir(directory_fd) as entries:
         for entry in entries:
-            child = Path(entry.path)
-            if entry.name == keep_last.name:
-                delayed = child
+            name = entry.name
+            if name == keep_last:
+                delayed = True
+                continue
+
+            mode = os.lstat(name, dir_fd=directory_fd).st_mode
+            if stat.S_ISLNK(mode) or stat.S_ISREG(mode):
+                os.unlink(name, dir_fd=directory_fd)
+            elif stat.S_ISDIR(mode):
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    _delete_directory_contents_fd(child_fd)
+                finally:
+                    os.close(child_fd)
+                os.rmdir(name, dir_fd=directory_fd)
             else:
-                _delete_directory_entry(child)
-    if delayed is not None:
-        delayed.unlink()
-    path.rmdir()
+                raise UnsafeOutputPath(
+                    f"directory entry {name!r} is not a regular file or directory"
+                )
+
+    if delayed:
+        os.unlink(keep_last, dir_fd=directory_fd)
+
+
+def _delete_directory_keep_last(
+    base: Path, relative: Path, keep_last: Path
+) -> None:
+    """Delete a directory through held fds, with its identity file last."""
+    path = base.resolve().joinpath(*relative.parts)
+    if not _FD_DIRECTORY_DELETION_SUPPORTED:
+        raise UnsafeOutputPath(
+            f"cannot safely delete {path}: fd-relative deletion is unsupported"
+        )
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    base_fd = -1
+    parent_fd = -1
+    directory_fd = -1
+    try:
+        base_fd = os.open(base.resolve(), flags)
+        parent_fd = base_fd
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, flags, dir_fd=parent_fd)
+            if parent_fd != base_fd:
+                os.close(parent_fd)
+            parent_fd = next_fd
+
+        name = relative.parts[-1]
+        directory_fd = os.open(name, flags, dir_fd=parent_fd)
+        opened_identity = os.fstat(directory_fd)
+        _delete_directory_contents_fd(directory_fd, keep_last=keep_last.name)
+
+        current_identity = os.lstat(name, dir_fd=parent_fd)
+        if (
+            not stat.S_ISDIR(current_identity.st_mode)
+            or current_identity.st_dev != opened_identity.st_dev
+            or current_identity.st_ino != opened_identity.st_ino
+        ):
+            raise UnsafeOutputPath(f"{path} changed during deletion")
+        os.rmdir(name, dir_fd=parent_fd)
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        if parent_fd >= 0 and parent_fd != base_fd:
+            os.close(parent_fd)
+        if base_fd >= 0:
+            os.close(base_fd)
 
 
 def delete_output_targets(base: Path, targets: list[DeleteTarget]) -> None:
@@ -171,7 +243,7 @@ def delete_output_targets(base: Path, targets: list[DeleteTarget]) -> None:
                 # traversing them and independently refuses a link at `path`.
                 shutil.rmtree(path)
             else:
-                _delete_directory_keep_last(path, target.keep_last)
+                _delete_directory_keep_last(base, target.relative, target.keep_last)
         else:
             path.unlink()
 

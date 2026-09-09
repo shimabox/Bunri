@@ -1472,6 +1472,8 @@ def test_cli_song_keeps_identity_until_cache_deletion_can_be_retried(
 def test_cli_song_keeps_identity_when_package_file_deletion_fails(
     tmp_path, monkeypatch
 ):
+    import bunri.safepath as safepath_module
+
     digest = "d" * 40
     package = _write_cli_package(tmp_path, "Retry Package Delete", digest)
     sidecar = package / ".bunri-package.json"
@@ -1480,14 +1482,14 @@ def test_cli_song_keeps_identity_when_package_file_deletion_fails(
     cache = tmp_path / ".cache" / digest[:12]
     cache.mkdir(parents=True)
     (cache / "stem.wav").write_bytes(b"cached stem")
-    real_unlink = Path.unlink
+    real_unlink = safepath_module.os.unlink
 
     def fail_audio(path, *args, **kwargs):
-        if path == audio.resolve():
+        if path == audio.name and kwargs.get("dir_fd") is not None:
             raise OSError("simulated audio delete failure")
         return real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", fail_audio)
+    monkeypatch.setattr(safepath_module.os, "unlink", fail_audio)
     app = create_app(tmp_path, runner=ApiFakeRunner())
     with TestClient(app) as client:
         listed = client.get("/api/songs").json()
@@ -1500,7 +1502,7 @@ def test_cli_song_keeps_identity_when_package_file_deletion_fails(
         assert audio.is_file()
         assert client.get("/api/songs").json()[0]["id"] == song_id
 
-        monkeypatch.setattr(Path, "unlink", real_unlink)
+        monkeypatch.setattr(safepath_module.os, "unlink", real_unlink)
         retried = client.delete(f"/api/songs/{song_id}")
 
         assert retried.status_code == 204
@@ -1530,18 +1532,62 @@ def test_delete_package_unlinks_external_symlink_without_touching_target(tmp_pat
     assert external.read_bytes() == b"keep"
 
 
+def test_delete_package_does_not_follow_replacement_parent_symlink(
+    tmp_path, monkeypatch
+):
+    import bunri.safepath as safepath_module
+
+    digest = "0" * 40
+    package = _write_cli_package(tmp_path, "Swapped Package", digest)
+    audio_name = "Swapped Package.guitar.wav"
+    (package / audio_name).write_bytes(b"package audio")
+    moved_package = tmp_path / "moved-package"
+    external = tmp_path / "external-package"
+    external.mkdir()
+    external_audio = external / audio_name
+    external_identity = external / ".bunri-package.json"
+    external_audio.write_bytes(b"external audio")
+    external_identity.write_bytes(b"external identity")
+    real_scandir = safepath_module.os.scandir
+    swapped = False
+
+    def swap_package(scandir_path):
+        nonlocal swapped
+        if isinstance(scandir_path, int) and not swapped:
+            swapped = True
+            package.rename(moved_package)
+            package.symlink_to(external, target_is_directory=True)
+        return real_scandir(scandir_path)
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song_id = client.get("/api/songs").json()[0]["id"]
+        monkeypatch.setattr(safepath_module.os, "scandir", swap_package)
+
+        failed = client.delete(f"/api/songs/{song_id}")
+
+        assert failed.status_code == 500
+
+    assert swapped
+    assert package.is_symlink()
+    assert external_audio.read_bytes() == b"external audio"
+    assert external_identity.read_bytes() == b"external identity"
+
+
 def test_delete_song_reports_failure_when_package_rmdir_fails(tmp_path, monkeypatch):
+    import bunri.safepath as safepath_module
+
     digest = "1" * 40
     package = _write_cli_package(tmp_path, "Rmdir Failure", digest)
     sidecar = package / ".bunri-package.json"
-    real_rmdir = Path.rmdir
+    real_rmdir = safepath_module.os.rmdir
 
     def fail_package(path, *args, **kwargs):
-        if path == package.resolve():
+        if path == package.name and kwargs.get("dir_fd") is not None:
             raise OSError("simulated package rmdir failure")
         return real_rmdir(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "rmdir", fail_package)
+    monkeypatch.setattr(safepath_module.os, "rmdir", fail_package)
     app = create_app(tmp_path, runner=ApiFakeRunner())
     with TestClient(app) as client:
         song_id = client.get("/api/songs").json()[0]["id"]
