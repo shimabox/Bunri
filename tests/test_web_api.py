@@ -1428,6 +1428,47 @@ def test_delete_song_returns_204_and_removes_it_from_both_lists(client):
     assert client.delete(f"/api/songs/{song_id}").status_code == 404
 
 
+def test_cli_song_keeps_identity_until_cache_deletion_can_be_retried(
+    tmp_path, monkeypatch
+):
+    import bunri.safepath as safepath_module
+
+    digest = "c" * 40
+    package = _write_cli_package(tmp_path, "Retry CLI Delete", digest)
+    sidecar = package / ".bunri-package.json"
+    cache = tmp_path / ".cache" / digest[:12]
+    cache.mkdir(parents=True)
+    (cache / "stem.wav").write_bytes(b"cached stem")
+    real_rmtree = safepath_module.shutil.rmtree
+
+    def fail_cache(path, *args, **kwargs):
+        if path == cache.resolve():
+            raise OSError("simulated cache delete failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(safepath_module.shutil, "rmtree", fail_cache)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song_id = client.get("/api/songs").json()[0]["id"]
+
+        failed = client.delete(f"/api/songs/{song_id}")
+
+        assert failed.status_code == 500
+        assert package.is_dir()
+        assert sidecar.is_file()
+        assert cache.is_dir()
+        assert client.get("/api/songs").json()[0]["id"] == song_id
+
+        monkeypatch.setattr(safepath_module.shutil, "rmtree", real_rmtree)
+        retried = client.delete(f"/api/songs/{song_id}")
+
+        assert retried.status_code == 204
+        assert client.get("/api/songs").json() == []
+
+    assert not package.exists()
+    assert not cache.exists()
+
+
 def test_delete_song_returns_204_while_unrelated_pocket_single_is_active(client):
     from bunri.web.jobs import Job
 

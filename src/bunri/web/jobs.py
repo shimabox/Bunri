@@ -2020,20 +2020,54 @@ class JobStore:
                     continue
                 cache_dirs.add(Path(".cache") / prefix)
 
-            candidates: list[DeleteTarget] = []
-            candidates.extend(DeleteTarget(path, "directory") for path in sorted(package_dirs))
+            package_candidates = [
+                DeleteTarget(path, "directory") for path in sorted(package_dirs)
+            ]
+            auxiliary_candidates: list[DeleteTarget] = []
             for job in sorted(targets, key=lambda item: item.id):
                 log = Path(_log_relpath(job.id))
-                candidates.append(DeleteTarget(log, "file"))
-                candidates.append(DeleteTarget(log.with_suffix(".pid"), "file"))
-            candidates.extend(DeleteTarget(path, "file") for path in sorted(uploads))
-            candidates.extend(DeleteTarget(path, "directory") for path in sorted(cache_dirs))
-            candidates.extend(
+                auxiliary_candidates.append(DeleteTarget(log, "file"))
+                auxiliary_candidates.append(DeleteTarget(log.with_suffix(".pid"), "file"))
+            auxiliary_candidates.extend(
+                DeleteTarget(path, "file") for path in sorted(uploads)
+            )
+            cache_candidates = [
+                DeleteTarget(path, "directory") for path in sorted(cache_dirs)
+            ]
+            record_candidates = [
                 DeleteTarget(Path("web") / "jobs" / f"{job.id}.json", "file")
                 for job in sorted(targets, key=lambda item: item.id)
+            ]
+
+            # Unidentifying artifacts go first, followed by the package and
+            # finally its job records.  In particular, a CLI-only song has no
+            # job record to identify it after its package sidecar is gone, so
+            # a cache failure must leave that package intact for a retry.
+            candidates = (
+                cache_candidates
+                + auxiliary_candidates
+                + package_candidates
+                + record_candidates
             )
 
-            delete_output_targets(self.out_dir, candidates)
+            try:
+                delete_output_targets(self.out_dir, candidates)
+            except UnsafeOutputPath:
+                # Validation failures happen before any deletion and must
+                # keep that all-or-nothing safety property.
+                raise
+            except OSError:
+                if targets:
+                    # Existing Web deletion behavior permits a package to be
+                    # part of the partial deletion after an I/O failure. Its
+                    # job record still carries the digest, so this cannot
+                    # strand the remaining artifacts and the next request can
+                    # safely resume. CLI-only songs deliberately skip this.
+                    try:
+                        delete_output_targets(self.out_dir, package_candidates)
+                    except OSError:
+                        pass
+                raise
             for job_id in target_ids:
                 del self._jobs[job_id]
 
