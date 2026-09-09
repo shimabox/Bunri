@@ -7,6 +7,7 @@ from pathlib import Path
 
 from bunri.local_package import (
     all_package_names,
+    inspect_artifact,
     inspect_package_artifacts,
     inspect_package_identity,
     package_candidates,
@@ -94,8 +95,7 @@ def preflight(
         artifact = artifact_paths.get(path)
         if artifact is None:
             # Invalid format declarations are still checked as requested mp3 files.
-            from bunri.local_package import _inspect_artifact
-            artifact = _inspect_artifact(path, package_dir, hash_file=True)
+            artifact = inspect_artifact(path, package_dir, hash_file=True)
         if not artifact.present:
             assert artifact.issue is not None
             issues.append(f"{target or 'original'}: {artifact.issue}")

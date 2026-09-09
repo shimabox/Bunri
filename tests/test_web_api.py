@@ -82,6 +82,203 @@ def _job_status(client, job_id: str) -> str:
     return client.get(f"/api/jobs/{job_id}").json()["status"]
 
 
+def _write_cli_package(out_dir: Path, name: str, digest: str, *, formats=("wav",)) -> Path:
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    package = out_dir / name
+    package.mkdir(parents=True)
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            name,
+            name,
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", formats),),
+        ),
+    )
+    return package
+
+
+def test_cli_wav_package_is_listed_with_only_existing_downloads_and_can_be_deleted(tmp_path):
+    digest = "a" * 40
+    package = _write_cli_package(tmp_path, "CLI Song", digest)
+    for suffix in ("guitar.wav", "guitar.backing.wav", "guitar.player.html"):
+        (package / f"CLI Song.{suffix}").write_bytes(b"artifact")
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song = client.get("/api/songs").json()[0]
+        target = song["targets"][0]
+        assert song["digest"] == digest
+        assert song["package_name"] == "CLI Song"
+        assert target["id"] is None
+        assert target["status"] == "done"
+        assert target["package_url"].endswith("CLI%20Song.guitar.player.html")
+        assert {
+            file["format"]
+            for group in target["downloads"]
+            for file in group["files"]
+        } == {"wav"}
+        assert client.delete(f"/api/songs/{song['id']}").status_code == 204
+    assert not package.exists()
+
+
+def test_missing_cli_artifacts_are_reported_but_do_not_block_local_delete(tmp_path):
+    package = _write_cli_package(tmp_path, "Broken Song", "b" * 40, formats=("mp3",))
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song = client.get("/api/songs").json()[0]
+        target = song["targets"][0]
+        assert target["status"] == "missing"
+        assert target["missing_files"] is True
+        assert target["package_url"] is None
+        assert target["downloads"] == []
+        assert client.delete(f"/api/songs/{song['id']}").status_code == 204
+    assert not package.exists()
+
+
+def test_legacy_and_invalid_packages_are_named_without_exposing_diagnostics(tmp_path):
+    (tmp_path / "Legacy Song").mkdir()
+    invalid = tmp_path / "Invalid Song"
+    invalid.mkdir()
+    (invalid / ".bunri-package.json").write_text("not json")
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        assert client.get("/api/songs").json() == []
+        response = client.get("/api/songs-legacy").json()
+    assert response == {"packages": ["Invalid Song", "Legacy Song"]}
+    assert "json" not in str(response).lower()
+
+
+def test_duplicate_identity_is_visible_and_blocks_delete_and_reupload(tmp_path):
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    first = _write_cli_package(tmp_path, "First", digest)
+    second = _write_cli_package(tmp_path, "Second", digest)
+    for package, name in ((first, "First"), (second, "Second")):
+        for suffix in ("guitar.wav", "guitar.backing.wav"):
+            (package / f"{name}.{suffix}").write_bytes(b"artifact")
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        song = client.get("/api/songs").json()[0]
+        assert song["conflict"] is True
+        assert song["conflict_packages"] == ["First", "Second"]
+        assert client.delete(f"/api/songs/{song['id']}").status_code == 409
+        response = _upload(client, content=content, title="First", targets=["bass"])
+        assert response.status_code == 409
+    assert first.exists() and second.exists()
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
+def test_reupload_reuses_identity_matching_cli_package_title(tmp_path):
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    _write_cli_package(tmp_path, "CLI Song", digest)
+    runner = ApiFakeRunner()
+    app = create_app(tmp_path, runner=runner)
+    with TestClient(app) as client:
+        response = _upload(
+            client, content=content, title="Different request", targets=["bass"]
+        )
+        assert response.status_code == 202
+        job_id = response.json()["job_id"]
+        _wait_until(lambda: _job_status(client, job_id) == "done")
+        assert client.get(f"/api/jobs/{job_id}").json()["title"] == "CLI Song"
+    assert runner.calls[0]["title"] == "CLI Song"
+    assert not (tmp_path / "Different request").exists()
+    assert not (tmp_path / "CLI Song-2").exists()
+
+
+def test_job_state_overrides_completed_package_artifacts(tmp_path):
+    digest = "c" * 40
+    package = _write_cli_package(tmp_path, "Song", digest, formats=("mp3",))
+    for suffix in ("guitar.mp3", "guitar.backing.mp3", "guitar.player.html"):
+        (package / f"Song.{suffix}").write_bytes(b"artifact")
+    _write_job_file(
+        tmp_path,
+        "j-failed-package",
+        digest=digest,
+        title="Song",
+        status="error",
+        error="separation failed",
+    )
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        target = client.get("/api/songs").json()[0]["targets"][0]
+
+    assert target["status"] == "error"
+    assert target["package_url"] is None
+    assert target["downloads"] == []
+
+
+def test_canonically_equal_package_names_conflict_even_with_different_digests(tmp_path):
+    nfc = "ざらめのゆき"
+    nfd = unicodedata.normalize("NFD", nfc)
+    _write_cli_package(tmp_path, nfc, "d" * 40)
+    try:
+        _write_cli_package(tmp_path, nfd, "e" * 40)
+    except FileExistsError:
+        pytest.skip("filesystem does not distinguish NFC and NFD filenames")
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        songs = client.get("/api/songs").json()
+        assert len(songs) == 2
+        assert all(song["conflict"] for song in songs)
+        assert all(set(song["conflict_packages"]) == {nfc, nfd} for song in songs)
+        assert all(
+            client.delete(f"/api/songs/{song['id']}").status_code == 409
+            for song in songs
+        )
+
+
+def test_reupload_rejects_package_whose_title_does_not_derive_its_folder(tmp_path):
+    from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata, write_package_metadata
+
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    package = tmp_path / "Folder"
+    package.mkdir()
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Different Title",
+            "Folder",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("wav",)),),
+        ),
+    )
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        response = _upload(client, content=content, title="Folder", targets=["bass"])
+    assert response.status_code == 409
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
+def test_reupload_rejects_existing_job_named_differently_from_matching_package(tmp_path):
+    content = b"same source"
+    digest = hashlib.sha1(content).hexdigest()
+    _write_cli_package(tmp_path, "Package Name", digest)
+    _write_job_file(
+        tmp_path,
+        "j-other-name",
+        digest=digest,
+        title="Job Name",
+        status="error",
+    )
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        response = _upload(client, content=content, title="Package Name", targets=["bass"])
+    assert response.status_code == 409
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
 def test_pocket_status_is_hidden_when_not_connected(client):
     response = client.get("/api/pocket/status")
     assert response.status_code == 200

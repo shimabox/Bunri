@@ -350,6 +350,41 @@ def test_recovered_pocket_delete_finishes_partial_local_deletion(
         store.shutdown()
 
 
+def test_recovered_cli_delete_uses_saved_identity_after_sidecar_was_removed(
+    tmp_path, monkeypatch
+):
+    import bunri.web.jobs as jobs_module
+
+    package = tmp_path / "Song"
+    package.mkdir()
+    (package / "remaining.wav").write_bytes(b"partial local data")
+    delete_job = make_recoverable_delete(tmp_path, pocket_deleted=True)
+    remote_targets = []
+    monkeypatch.setattr(
+        jobs_module,
+        "delete_track",
+        lambda _out_dir, target, **_kwargs: remote_targets.append(target),
+    )
+
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        wait_for(lambda: store.get_job(delete_job.id).status == "done")
+        assert remote_targets == [
+            DeleteTargetIdentity(
+                song_id="a" * 12,
+                digest="a" * 40,
+                safe_name=None,
+            )
+        ]
+        assert not package.exists()
+        assert store.get_job(delete_job.id).result == {
+            "pocket_deleted": True,
+            "local_deleted": True,
+        }
+    finally:
+        store.shutdown()
+
+
 def test_recovered_pocket_delete_finishes_when_audio_is_already_missing(
     tmp_path, monkeypatch
 ):

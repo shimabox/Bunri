@@ -50,10 +50,22 @@ def test_artifacts_report_complete_formats_and_missing_files(tmp_path):
         (package / f"Song.{suffix}").write_bytes(b"audio")
     (package / "Song.guitar.mp3").write_bytes(b"")
 
-    result = inspect_package_artifacts(inspect_package_identity(out, "Song"))
+    result = inspect_package_artifacts(
+        inspect_package_identity(out, "Song"), hash_files=True
+    )
 
     target = result.targets[0]
     assert target.complete_formats == ("wav",)
     assert target.player.present is True
+    assert target.player.sha256 is not None
     assert dict(target.target_files)["mp3"].issue.endswith("空です")
     assert dict(target.backing_files)["mp3"].present is False
+
+
+def test_identity_rejects_a_directory_symlink(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "Alias").symlink_to(tmp_path, target_is_directory=True)
+    result = inspect_package_identity(out, "Alias")
+    assert result.state == "invalid"
+    assert result.metadata is None

@@ -26,7 +26,7 @@ from bunri.registry import REGISTRY
 from bunri.pocket.config import connection_fingerprint, read_config
 from bunri.pocket.http import PocketHTTPClient
 from bunri.pocket.lock import SyncLock, SyncLockBusy
-from bunri.pocket.local import package_name_key
+from bunri.local_package import package_name_key
 from bunri.pocket.service import (
     PocketServiceError,
     inspect_packages,
@@ -133,15 +133,70 @@ def _serialize_job(job: Job) -> dict:
 
 def _serialize_song(song: Song, pocket_job: Job | None = None) -> dict:
     targets = []
-    for job in song.targets:
-        serialized = _serialize_job(job)
-        serialized.pop("title")
-        serialized["target_label"] = _target_label(job.target)
+    for target in song.targets:
+        job = target.job
+        if job is not None:
+            serialized = _serialize_job(job)
+            serialized.pop("title")
+        else:
+            serialized = {
+                "id": None,
+                "target": target.target,
+                "status": target.status,
+                "created_at": song.created_at,
+                "started_at": None,
+                "finished_at": None,
+                "elapsed_seconds": None,
+                "package_url": None,
+                "downloads": [],
+                "error": None,
+            }
+        artifacts = target.artifacts
+        if artifacts is not None:
+            serialized["status"] = target.status
+            serialized["missing_files"] = not bool(artifacts.complete_formats)
+            if target.status == "done" and artifacts.complete_formats and song.package_name:
+                package_name = song.package_name
+                label = _target_label(target.target)
+                downloads = []
+                for track, track_label, suffix, files in (
+                    ("target", f"{label}のみ", "", dict(artifacts.target_files)),
+                    ("backing", f"{label}なし", ".backing", dict(artifacts.backing_files)),
+                ):
+                    downloads.append({
+                        "track": track,
+                        "label": track_label,
+                        "files": [
+                            {
+                                "format": audio_format,
+                                "url": f"/packages/{quote(f'{package_name}/{package_name}.{target.target}{suffix}.{audio_format}')}",
+                                "filename": f"{safe_filename(song.title)}_{track_label}.{audio_format}",
+                            }
+                            for audio_format in artifacts.complete_formats
+                            if files[audio_format].present
+                        ],
+                    })
+                serialized["downloads"] = downloads
+                serialized["package_url"] = (
+                    f"/packages/{quote(f'{package_name}/{package_name}.{target.target}.player.html')}"
+                    if artifacts.player.present
+                    else None
+                )
+            elif target.status != "done":
+                serialized["package_url"] = None
+                serialized["downloads"] = []
+        else:
+            serialized["missing_files"] = False
+        serialized["target_label"] = _target_label(target.target)
         targets.append(serialized)
     result = {
         "id": song.id,
+        "digest": song.digest,
         "title": song.title,
         "created_at": song.created_at,
+        "package_name": song.package_name,
+        "conflict": bool(song.conflicts),
+        "conflict_packages": list(song.conflicts),
         "targets": targets,
     }
     result["pocket_job"] = _serialize_job(pocket_job) if pocket_job is not None else None
@@ -395,10 +450,14 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         return [
             _serialize_song(
                 song,
-                store.latest_pocket_job(song.targets[0].digest) if song.targets else None,
+                store.latest_pocket_job(song.digest),
             )
             for song in store.list_songs()
         ]
+
+    @app.get("/api/songs-legacy")
+    def list_legacy_packages() -> dict:
+        return {"packages": list(store.legacy_package_names())}
 
     @app.get("/api/pocket/job")
     def pocket_job() -> dict:
@@ -453,17 +512,16 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         else:
             library_error = False
         digest_to_web_id = {
-            song.targets[0].digest: song.id
+            song.digest: song.id
             for song in store.list_songs()
-            if song.targets
         }
         safe_to_web_id = {}
         for song in store.list_songs():
-            package_name = next(
+            package_name = song.package_name or next(
                 (
-                    Path(job.package).parent.name
-                    for job in song.targets
-                    if job.package is not None
+                    Path(target.job.package).parent.name
+                    for target in song.targets
+                    if target.job is not None and target.job.package is not None
                 ),
                 safe_filename(song.title),
             )
@@ -596,9 +654,14 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                     ),
                 )
             song = next((item for item in store.list_songs() if item.id == song_id), None)
-            if song is None or not song.targets:
+            if song is None:
                 raise HTTPException(status_code=404, detail="song not found")
-            digest = song.targets[0].digest
+            if song.conflicts:
+                raise HTTPException(
+                    status_code=409,
+                    detail="同じ音源のパッケージが複数あります: " + ", ".join(song.conflicts),
+                )
+            digest = song.digest
             try:
                 mutation_lock = SyncLock(out_dir).acquire()
             except (OSError, SyncLockBusy) as exc:

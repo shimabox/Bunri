@@ -120,6 +120,25 @@ def all_package_names(out_dir: Path) -> list[str]:
     )
 
 
+def package_entry_names(out_dir: Path) -> list[str]:
+    """Return visible directory-shaped entries, including unsafe symlinks."""
+    try:
+        children = list(out_dir.iterdir())
+    except OSError:
+        return []
+    blocked = {"web", ".cache", ".pocket"}
+    return sorted(
+        (
+            child.name
+            for child in children
+            if not child.name.startswith(".")
+            and child.name.casefold() not in blocked
+            and (child.is_symlink() or child.is_dir())
+        ),
+        key=lambda name: (name.casefold(), name),
+    )
+
+
 def read_package_metadata_for_directory(
     path: Path,
     directory_name: str,
@@ -267,7 +286,7 @@ def inspect_package_identity(out_dir: Path, name: str) -> PackageIdentityInspect
     )
 
 
-def _inspect_artifact(path: Path, directory: Path, *, hash_file: bool) -> ArtifactInspection:
+def inspect_artifact(path: Path, directory: Path, *, hash_file: bool = False) -> ArtifactInspection:
     if not is_real_file_in(path, directory.resolve()):
         return ArtifactInspection(path, False, issue=f"{path}: 通常ファイルではありません")
     try:
@@ -291,7 +310,7 @@ def inspect_package_artifacts(
     identity: PackageIdentityInspection, *, hash_files: bool = False
 ) -> PackageArtifactInspection:
     directory = identity.directory
-    original = _inspect_artifact(
+    original = inspect_artifact(
         directory / f"{identity.name}.original.mp3", directory, hash_file=hash_files
     )
     issues: list[str] = []
@@ -307,7 +326,7 @@ def inspect_package_artifacts(
         target_files = tuple(
             (
                 audio_format,
-                _inspect_artifact(
+                inspect_artifact(
                     directory / f"{identity.name}.{target}.{audio_format}",
                     directory,
                     hash_file=hash_files,
@@ -318,7 +337,7 @@ def inspect_package_artifacts(
         backing_files = tuple(
             (
                 audio_format,
-                _inspect_artifact(
+                inspect_artifact(
                     directory / f"{identity.name}.{target}.backing.{audio_format}",
                     directory,
                     hash_file=hash_files,
@@ -326,7 +345,7 @@ def inspect_package_artifacts(
             )
             for audio_format in formats
         )
-        player = _inspect_artifact(
+        player = inspect_artifact(
             directory / f"{identity.name}.{target}.player.html",
             directory,
             hash_file=hash_files,
