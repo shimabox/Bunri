@@ -190,6 +190,11 @@ def _serialize_song(song: Song, pocket_job: Job | None = None) -> dict:
             if target.status in ("missing", "conflict"):
                 serialized["package_url"] = None
                 serialized["downloads"] = []
+        if target.status == "conflict":
+            # A saved completed job can still carry its old links. Conflict
+            # status always wins over those cached locations.
+            serialized["package_url"] = None
+            serialized["downloads"] = []
         serialized["target_label"] = _target_label(target.target)
         targets.append(serialized)
     result = {

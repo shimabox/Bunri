@@ -8,7 +8,6 @@ from pathlib import Path
 from bunri.local_package import (
     all_package_names,
     inspect_artifact,
-    inspect_package_artifacts,
     inspect_package_identity,
     package_candidates,
     package_name_key,
@@ -86,16 +85,13 @@ def preflight(
         if "mp3" not in formats:
             issues.append(f"{target}: .bunri-package.json の formats に mp3 がありません")
         requested.extend(((f"{safe_name}.{target}.mp3", target, "target"), (f"{safe_name}.{target}.backing.mp3", target, "backing")))
-    artifacts = inspect_package_artifacts(identity_result, hash_files=True)
-    artifact_paths = {artifact.path: artifact for target in artifacts.targets for _, artifact in (*target.target_files, *target.backing_files)}
-    artifact_paths[artifacts.original.path] = artifacts.original
     assets: list[LocalAsset] = []
     for filename, target, role in requested:
         path = package_dir / filename
-        artifact = artifact_paths.get(path)
-        if artifact is None:
-            # Invalid format declarations are still checked as requested mp3 files.
-            artifact = inspect_artifact(path, package_dir, hash_file=True)
+        # Pocket transfers only these requested MP3 assets. Keep their
+        # checksum and size validation in the shared artifact layer without
+        # hashing WAV exports, players, or an excluded original track.
+        artifact = inspect_artifact(path, package_dir, hash_file=True)
         if not artifact.present:
             assert artifact.issue is not None
             issues.append(f"{target or 'original'}: {artifact.issue}")

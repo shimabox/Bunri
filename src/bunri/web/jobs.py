@@ -1684,9 +1684,14 @@ class JobStore:
                 artifacts = artifact_by_target.get(target)
                 if job is not None and job.status in ("queued", "running", "error"):
                     status = job.status
+                elif digest in scan.conflicts and metadata is not None:
+                    # Pending and failed work stays actionable above, but a
+                    # completed job must not make either conflicting package
+                    # look safe to play or download.
+                    status = "conflict"
                 elif job is not None and artifact_package is None:
-                    # Legacy Web packages and conflicting identities have no
-                    # trustworthy artifact inspection to supersede the job.
+                    # Legacy Web packages have no identity file and therefore
+                    # no artifact inspection to supersede the saved job state.
                     status = job.status
                 elif job is not None:
                     status = (
@@ -1696,8 +1701,6 @@ class JobStore:
                     )
                 elif artifacts is not None and artifacts.complete_formats:
                     status = "done"
-                elif digest in scan.conflicts and metadata is not None:
-                    status = "conflict"
                 else:
                     status = "missing"
                 target_views.append(SongTarget(target, status, job, artifacts))
@@ -2058,11 +2061,16 @@ class JobStore:
             raise SongDeleteConflict("同じ音源のパッケージの身元を安全に確認できません。")
         package = identity_matches[0]
         assert package.metadata is not None
-        if not package_names_equal(safe_filename(package.metadata.title), package.name):
+        package_title = package.metadata.title
+        if len(package_title) > MAX_TITLE_CHARS or _storable(package_title) != package_title:
+            raise SongDeleteConflict(
+                "パッケージの曲名をジョブ記録に安全に保存できないため再利用できません。"
+            )
+        if not package_names_equal(safe_filename(package_title), package.name):
             raise SongDeleteConflict(
                 "パッケージ名とメタデータの曲名が一致しないため再利用できません。"
             )
-        metadata_directory = self.out_dir / safe_filename(package.metadata.title)
+        metadata_directory = self.out_dir / safe_filename(package_title)
         try:
             metadata_matches_directory = (
                 metadata_directory.is_dir()
@@ -2091,7 +2099,7 @@ class JobStore:
                 raise SongDeleteConflict(
                     "既存ジョブの曲名から同じパッケージフォルダを特定できないため再利用できません。"
                 )
-        return package.metadata.title
+        return package_title
 
     # -- mutation ---------------------------------------------------------
     def create_job(

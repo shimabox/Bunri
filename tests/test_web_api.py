@@ -256,6 +256,61 @@ def test_reupload_reuses_identity_matching_cli_package_title(tmp_path):
     assert not (tmp_path / "CLI Song-2").exists()
 
 
+def test_reupload_rejects_cli_package_title_too_long_for_a_job_record(tmp_path):
+    from bunri.web.jobs import MAX_TITLE_CHARS
+
+    content = b"same source with a long package title"
+    digest = hashlib.sha1(content).hexdigest()
+    title = "T" * (MAX_TITLE_CHARS + 1)
+    _write_cli_package(tmp_path, title, digest)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+
+    with TestClient(app) as client:
+        response = _upload(client, content=content, title="Short", targets=["bass"])
+        jobs = client.get("/api/jobs").json()
+
+    assert response.status_code == 409
+    assert jobs == []
+    assert not list((tmp_path / "web" / "jobs").glob("*.json"))
+    assert not list((tmp_path / "web" / "uploads").glob("*"))
+
+
+def test_completed_web_job_hides_links_when_its_package_identity_conflicts(tmp_path):
+    import shutil
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    content = b"web source copied under another name"
+    digest = hashlib.sha1(content).hexdigest()
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        created = _upload(client, content=content, title="Web Song")
+        _wait_until(lambda: _job_status(client, created.json()["job_id"]) == "done")
+        package = tmp_path / "Web Song"
+        write_package_metadata(
+            package / ".bunri-package.json",
+            PackageMetadata(
+                "Web Song",
+                "Web Song",
+                SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3", "wav")),),
+            ),
+        )
+        shutil.copytree(package, tmp_path / "Copied Web Song")
+
+        song = client.get("/api/songs").json()[0]
+
+    assert song["conflict"] is True
+    target = song["targets"][0]
+    assert target["status"] == "conflict"
+    assert target["package_url"] is None
+    assert target["downloads"] == []
+
+
 def test_job_state_overrides_completed_package_artifacts(tmp_path):
     digest = "c" * 40
     package = _write_cli_package(tmp_path, "Song", digest, formats=("mp3",))
