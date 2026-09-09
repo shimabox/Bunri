@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import json
 import threading
 import time
 import unicodedata
@@ -1154,6 +1155,100 @@ def test_reuploading_identical_content_dedups_once_done(client):
     assert body["dedup"] is True
     assert body["job_id"] == job_id
     assert len(client.fake_runner.calls) == 1
+
+
+def test_reupload_adopts_completed_cli_target_without_changing_artifacts(tmp_path):
+    content = b"completed by cli"
+    digest = hashlib.sha1(content).hexdigest()
+    package = _write_cli_package(tmp_path, "CLI Song", digest)
+    for suffix in ("guitar.wav", "guitar.backing.wav", "guitar.player.html"):
+        (package / f"CLI Song.{suffix}").write_bytes(f"cli-{suffix}".encode())
+    before = {
+        path.name: path.read_bytes()
+        for path in package.iterdir()
+        if path.is_file()
+    }
+
+    runner = ApiFakeRunner()
+    app = create_app(tmp_path, runner=runner)
+    with TestClient(app) as client:
+        response = _upload(
+            client,
+            content=content,
+            title="A different upload title",
+            targets=["guitar"],
+        )
+        body = response.json()
+        job_id = body["job_id"]
+
+        assert response.status_code == 200
+        assert body == {
+            "job_id": job_id,
+            "dedup": True,
+            "jobs": [{"id": job_id, "target": "guitar", "dedup": True}],
+        }
+        assert client.get(f"/api/jobs/{job_id}").json()["status"] == "done"
+        song = client.get("/api/songs").json()[0]
+        assert song["title"] == "CLI Song"
+        assert song["targets"][0]["id"] == job_id
+        assert song["targets"][0]["status"] == "done"
+        assert runner.calls == []
+
+    assert {
+        path.name: path.read_bytes()
+        for path in package.iterdir()
+        if path.is_file()
+    } == before
+    record = json.loads((tmp_path / f"web/jobs/{job_id}.json").read_text())
+    assert record["log"] is None
+    assert record["upload"] == f"web/uploads/{digest}.mp3"
+    assert record["created_at"] == record["started_at"] == record["finished_at"]
+
+    restarted_runner = ApiFakeRunner()
+    restarted = create_app(tmp_path, runner=restarted_runner)
+    with TestClient(restarted) as client:
+        assert client.get(f"/api/jobs/{job_id}").json()["status"] == "done"
+    assert restarted_runner.calls == []
+
+
+def test_reupload_adopts_completed_cli_target_and_runs_only_missing_target(tmp_path):
+    content = b"cli guitar plus web bass"
+    digest = hashlib.sha1(content).hexdigest()
+    package = _write_cli_package(tmp_path, "CLI Band", digest)
+    for suffix in ("guitar.wav", "guitar.backing.wav", "guitar.player.html"):
+        (package / f"CLI Band.{suffix}").write_bytes(f"cli-{suffix}".encode())
+    guitar_before = {
+        path.name: path.read_bytes()
+        for path in package.glob("CLI Band.guitar.*")
+    }
+
+    runner = ApiFakeRunner()
+    app = create_app(tmp_path, runner=runner)
+    with TestClient(app) as client:
+        response = _upload(
+            client,
+            content=content,
+            title="Ignored title",
+            targets=["bass", "guitar"],
+        )
+        jobs = response.json()["jobs"]
+
+        assert response.status_code == 202
+        assert jobs[0]["target"] == "guitar"
+        assert jobs[0]["dedup"] is True
+        assert jobs[1]["target"] == "bass"
+        assert jobs[1]["dedup"] is False
+        _wait_until(lambda: _job_status(client, jobs[1]["id"]) == "done")
+        assert runner.calls == [{"title": "CLI Band", "target": "bass"}]
+        song = client.get("/api/songs").json()[0]
+        guitar = next(item for item in song["targets"] if item["target"] == "guitar")
+        assert guitar["id"] == jobs[0]["id"]
+        assert guitar["status"] == "done"
+
+    assert {
+        path.name: path.read_bytes()
+        for path in package.glob("CLI Band.guitar.*")
+    } == guitar_before
 
 
 def test_multiple_targets_are_normalized_and_returned_per_target(client):

@@ -1415,11 +1415,12 @@ class JobStore:
             return None, reason
 
         job = Job.from_dict(data)
-        # `log` is filled in for real -- it is derived, and the first run
-        # would assign it anyway -- then the size check runs against the
-        # job's *fully grown* form; see `_fully_grown` for why measuring the
-        # record as it arrives is not enough.
-        job.log = _log_relpath(job.id)
+        # Pending work needs its derived log path when recovery re-queues it.
+        # A terminal record may intentionally have no log at all, as with a
+        # completed CLI package adopted by the Web UI, so do not invent a
+        # link to a file that was never created.
+        if job.status in ("queued", "running"):
+            job.log = _log_relpath(job.id)
         # The package this job would *produce* has to be usable too, not just
         # the one it stores. `safe_filename` sanitizes the title, but `target`
         # goes in raw, so a ".." there yields an escaping package the moment
@@ -1805,11 +1806,24 @@ class JobStore:
             ]
         return min(candidates, key=lambda job: (job.created_at, job.id), default=None)
 
-    def find_reusable(self, digest: str, target: str) -> Optional[Job]:
-        """Dedup lookup: a finished job for this digest+target wins outright
-        (no re-run needed); otherwise an already queued/running one wins (so
-        a second upload of the same file while the first is still working
-        doesn't queue a duplicate). Returns None if neither exists."""
+    def find_reusable(
+        self,
+        digest: str,
+        target: str,
+        *,
+        title: str | None = None,
+        upload: str | None = None,
+    ) -> Optional[Job]:
+        """Find or record completed work that can satisfy one target.
+
+        A finished job wins outright; otherwise an already queued/running
+        one wins so a duplicate upload cannot start competing work.  When
+        ``title`` and ``upload`` are supplied by :meth:`create_jobs`, a
+        conflict-free package produced by the CLI can also be adopted if its
+        metadata names this target and at least one format has both target
+        and backing artifacts.  Adoption persists a terminal job so the API
+        keeps a stable job id and restart recovery never queues separation.
+        """
         with self._lock:
             candidates = sorted(
                 (
@@ -1825,7 +1839,53 @@ class JobStore:
         for j in candidates:
             if j.status in ("queued", "running"):
                 return j
-        return None
+        if title is None or upload is None:
+            return None
+
+        scan = scan_local_packages(self.out_dir)
+        if digest in scan.conflicts:
+            return None
+        package = _ready_package_for_digest(scan, digest)
+        artifact_package = scan.artifacts.get(digest)
+        if package is None or artifact_package is None:
+            return None
+        artifacts = next(
+            (item for item in artifact_package.targets if item.target == target),
+            None,
+        )
+        if artifacts is None or not artifacts.complete_formats:
+            return None
+
+        timestamp = _now_iso()
+        job_id = new_job_id()
+        job = Job(
+            id=job_id,
+            digest=digest,
+            title=title,
+            target=target,
+            status="done",
+            created_at=timestamp,
+            started_at=timestamp,
+            finished_at=timestamp,
+            package=_derived_package(title, target),
+            log=None,
+            upload=upload,
+        )
+        problem = _validate_job_record(job.to_dict(), job.id)
+        if problem is not None:
+            raise UnsafeOutputPath(
+                f"completed package job {job.id} is unsafe to save: {problem}"
+            )
+        self._jobs[job.id] = job
+        try:
+            if not self._write_job(job):
+                raise UnsafeOutputPath(
+                    f"completed package job {job.id} could not be saved safely"
+                )
+        except BaseException:
+            self._jobs.pop(job.id, None)
+            raise
+        return job
 
     def delete_song(
         self,
@@ -2168,7 +2228,12 @@ class JobStore:
             results: list[tuple[Job, bool]] = []
             created_ids: list[str] = []
             for target in ordered_targets:
-                reusable = self.find_reusable(digest, target)
+                reusable = self.find_reusable(
+                    digest,
+                    target,
+                    title=title,
+                    upload=upload_rel,
+                )
                 if reusable is not None:
                     results.append((reusable, False))
                     continue
