@@ -695,6 +695,256 @@ def test_pocket_status_failure_shows_error_and_restores_button(tmp_path, failure
 
 
 @_needs_browser
+def test_visibility_refreshes_songs_and_job_without_refreshing_pocket_status(tmp_path):
+    calls = {"songs": 0, "job": 0, "status": 0}
+
+    def mock_requests(page):
+        def count_and_continue(kind):
+            def handler(route):
+                calls[kind] += 1
+                route.continue_()
+
+            return handler
+
+        page.route("**/api/songs", count_and_continue("songs"))
+        page.route("**/api/pocket/job", count_and_continue("job"))
+
+        def status_handler(route):
+            calls["status"] += 1
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": False,
+                    "package_count": 0,
+                    "target_count": 0,
+                    "songs": [],
+                    "remote_only": [],
+                }),
+            )
+
+        page.route("**/api/pocket/status", status_handler)
+
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_requests
+    ) as page:
+        page.wait_for_function("() => document.getElementById('sw-pocket-refresh').disabled === false")
+        assert calls == {"songs": 1, "job": 1, "status": 1}
+
+        with page.expect_response("**/api/songs"), page.expect_response("**/api/pocket/job"):
+            page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+
+        assert calls == {"songs": 2, "job": 2, "status": 1}
+
+
+@_needs_browser
+def test_pocket_status_requests_during_a_check_are_coalesced(tmp_path):
+    state = {"calls": 0, "first_route": None, "second_route": None}
+
+    def mock_status(page):
+        def handler(route):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                state["first_route"] = route
+                return
+            if state["calls"] == 2:
+                state["second_route"] = route
+                return
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "package_count": 3,
+                    "target_count": 2,
+                    "songs": [],
+                    "remote_only": [],
+                }),
+            )
+
+        page.route("**/api/pocket/status", handler)
+
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_status
+    ) as page:
+        page.wait_for_function("() => document.getElementById('sw-pocket-refresh').disabled")
+        page.evaluate("window.__bunriWeb.refresh(); window.__bunriWeb.refresh()")
+        assert state["calls"] == 1
+
+        with page.expect_request("**/api/pocket/status"):
+            state["first_route"].fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "package_count": 99,
+                    "target_count": 99,
+                    "songs": [],
+                    "remote_only": [],
+                }),
+            )
+
+        page.evaluate("window.__bunriWeb.refresh(); window.__bunriWeb.refresh()")
+        assert state["calls"] == 2
+
+        with page.expect_request("**/api/pocket/status"):
+            state["second_route"].fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "package_count": 98,
+                    "target_count": 98,
+                    "songs": [],
+                    "remote_only": [],
+                }),
+            )
+
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-count').textContent.startsWith("
+            "'出力先の全パッケージ 3件中、同期対象 2件 · ')"
+        )
+        assert state["calls"] == 3
+
+
+@_needs_browser
+def test_failed_pocket_status_check_still_runs_reserved_refresh(tmp_path):
+    state = {"calls": 0, "first_route": None}
+
+    def mock_status(page):
+        def handler(route):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                state["first_route"] = route
+                return
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "package_count": 1,
+                    "target_count": 1,
+                    "songs": [],
+                    "remote_only": [],
+                }),
+            )
+
+        page.route("**/api/pocket/status", handler)
+
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_status
+    ) as page:
+        page.wait_for_function("() => document.getElementById('sw-pocket-refresh').disabled")
+        page.evaluate("window.__bunriWeb.refresh()")
+
+        with page.expect_request("**/api/pocket/status"):
+            state["first_route"].fulfill(
+                status=500,
+                content_type="application/json",
+                body=json.dumps({"detail": "temporary failure"}),
+            )
+
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-count').textContent.startsWith("
+            "'出力先の全パッケージ 1件中、同期対象 1件 · ')"
+        )
+        refresh = page.locator("#sw-pocket-refresh")
+        assert state["calls"] == 2
+        assert refresh.is_enabled()
+        assert refresh.get_attribute("aria-busy") is None
+        assert refresh.text_content() == "状態を再読込"
+
+
+@pytest.mark.parametrize("initial_job_status, expected_status_calls", [
+    ("running", 2),
+    ("done", 1),
+])
+@_needs_browser
+def test_visibility_refreshes_status_only_when_a_tracked_pocket_job_finishes(
+    tmp_path, initial_job_status, expected_status_calls
+):
+    state = {"job_calls": 0, "status_calls": 0, "songs_calls": 0, "held_songs": None}
+
+    def mock_requests(page):
+        def job_handler(route):
+            state["job_calls"] += 1
+            status = initial_job_status if state["job_calls"] == 1 else "done"
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "connection_fingerprint": "a" * 64,
+                    "job": {
+                        "id": "j-pocket-all",
+                        "kind": "pocket_all",
+                        "status": status,
+                        "error": None,
+                        "progress": {
+                            "completed": state["job_calls"],
+                            "total": 2,
+                            "current": None,
+                        },
+                    },
+                }),
+            )
+
+        def songs_handler(route):
+            state["songs_calls"] += 1
+            if state["songs_calls"] == 2:
+                state["held_songs"] = route
+                return
+            route.continue_()
+
+        def status_handler(route):
+            state["status_calls"] += 1
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "connected": True,
+                    "connection_fingerprint": "a" * 64,
+                    "package_count": 0,
+                    "target_count": 0,
+                    "songs": [],
+                    "remote_only": [],
+                }),
+            )
+
+        page.route("**/api/pocket/job", job_handler)
+        page.route("**/api/songs", songs_handler)
+        page.route("**/api/pocket/status", status_handler)
+
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_requests
+    ) as page:
+        page.wait_for_function("() => document.getElementById('sw-pocket-refresh').disabled === false")
+        assert state["job_calls"] == 1
+        assert state["status_calls"] == 1
+
+        if initial_job_status == "running":
+            with page.expect_response("**/api/pocket/job"), page.expect_response(
+                "**/api/pocket/status"
+            ):
+                page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+        else:
+            with page.expect_response("**/api/pocket/job"):
+                page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-summary').textContent === "
+            "'全曲アップロード完了: 2件'"
+        )
+        assert state["held_songs"] is not None
+        assert state["status_calls"] == expected_status_calls
+        state["held_songs"].continue_()
+
+
+@_needs_browser
 def test_separation_completion_refreshes_pocket_status_for_new_song(tmp_path):
     import base64
 
@@ -1916,15 +2166,14 @@ def test_local_delete_ignores_older_pocket_status_response(tmp_path, monkeypatch
             page.click("#sw-delete-confirm")
 
             page.wait_for_function("window.__bunriWeb.getSongs().length === 0", timeout=10_000)
-            page.click("#sw-pocket-refresh")
-            page.wait_for_selector("#sw-remote-only:not([hidden])", timeout=10_000)
-            assert fresh_status_calls >= 1
-            assert page.locator(".sw-remote-only-item").count() == 1
+            assert fresh_status_calls == 0
 
             with page.expect_response("**/api/pocket/status") as old_response:
                 release_first.set()
             old_response.value.finished()
 
+            page.wait_for_selector("#sw-remote-only:not([hidden])", timeout=10_000)
+            assert fresh_status_calls == 1
             assert page.locator("#sw-remote-only").is_visible()
             assert page.locator(".sw-remote-only-item").count() == 1
             assert page.locator(".sw-remote-only-id").text_content() == pocket_song_id
