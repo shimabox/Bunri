@@ -9,7 +9,9 @@ tab/transcription steps to sequence around).
 
 from __future__ import annotations
 
+import json
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -20,6 +22,10 @@ import soundfile as sf
 from bunri.package import build_package
 
 _NEED_FFMPEG = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+_NEED_FFMPEG_AND_FFPROBE = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg required",
+)
 
 
 def _write_silence(path: Path, seconds: float = 0.3, sr: int = 44100) -> None:
@@ -112,6 +118,41 @@ def test_build_package_exports_expected_files_and_layout(tmp_path, song_input):
     for src in ("song.original.mp3", "song.guitar.mp3", "song.guitar.backing.mp3"):
         assert src in html, f"player must reference {src}"
     assert "ギター" in html
+
+
+@_NEED_FFMPEG_AND_FFPROBE
+def test_build_package_strips_metadata_from_all_exported_mp3_files(tmp_path):
+    source = tmp_path / "tagged-input.m4a"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+            "sine=frequency=440:duration=0.2",
+            "-metadata", "title=Private title",
+            "-metadata", "artist=Private artist",
+            "-metadata", "comment=Private comment",
+            "-metadata", "album=Private album",
+            "-c:a", "aac", str(source),
+        ],
+        check=True,
+    )
+
+    package_dir = build_package(source, tmp_path / "out", title="Song", mp3=True)
+
+    for name in (
+        "Song.original.mp3",
+        "Song.guitar.mp3",
+        "Song.guitar.backing.mp3",
+    ):
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format_tags",
+                "-of", "json", str(package_dir / name),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(probe.stdout).get("format", {}).get("tags", {}) == {}
 
 
 @_NEED_FFMPEG
