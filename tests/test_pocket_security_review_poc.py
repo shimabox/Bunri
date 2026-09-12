@@ -160,9 +160,10 @@ def test_poc_cli_transport_garbage_is_reported_without_traceback(tmp_path, garba
         result = _run_bunri_pocket(["delete", "--song-id", SONG_ID, "--yes", "-o", str(out)], cwd=tmp_path)
     combined = result.stdout + result.stderr
     assert TOKEN not in combined, "upload token printed to the terminal:\n" + combined[-3000:]
-    assert "Traceback" not in combined and "BadStatusLine" not in combined, (
+    assert "Traceback" not in combined, (
         "transport error escaped the CLI's error handling as a raw traceback:\n" + combined[-1500:]
     )
+    assert "error:" in combined
 
 
 def test_poc_cli_transport_garbage_never_prints_token_even_with_locals(tmp_path, garbage_server):
