@@ -121,7 +121,7 @@ def test_build_package_exports_expected_files_and_layout(tmp_path, song_input):
 
 
 @_NEED_FFMPEG_AND_FFPROBE
-def test_build_package_strips_metadata_from_all_exported_mp3_files(tmp_path):
+def test_build_package_writes_only_the_expected_title_to_exported_mp3_files(tmp_path):
     source = tmp_path / "tagged-input.m4a"
     subprocess.run(
         [
@@ -138,11 +138,12 @@ def test_build_package_strips_metadata_from_all_exported_mp3_files(tmp_path):
 
     package_dir = build_package(source, tmp_path / "out", title="Song", mp3=True)
 
-    for name in (
-        "Song.original.mp3",
-        "Song.guitar.mp3",
-        "Song.guitar.backing.mp3",
-    ):
+    expected_titles = {
+        "Song.original.mp3": "Song",
+        "Song.guitar.mp3": "Song (ギターのみ)",
+        "Song.guitar.backing.mp3": "Song (ギターなし)",
+    }
+    for name, title in expected_titles.items():
         probe = subprocess.run(
             [
                 "ffprobe", "-v", "error", "-show_entries", "format_tags",
@@ -152,7 +153,9 @@ def test_build_package_strips_metadata_from_all_exported_mp3_files(tmp_path):
             text=True,
             check=True,
         )
-        assert json.loads(probe.stdout).get("format", {}).get("tags", {}) == {}
+        assert json.loads(probe.stdout).get("format", {}).get("tags", {}) == {
+            "title": title
+        }
 
 
 @_NEED_FFMPEG

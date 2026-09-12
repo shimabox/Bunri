@@ -1,10 +1,10 @@
-# 実装依頼: Bunri Pocket 導線の所見 F1〜F6 の修正
+# 実装依頼（第2版・2026-09-13）: Bunri Pocket 導線の所見 F1〜F6 の修正
 
 ## 背景
 
 Bunri は、分離処理をローカルで完結させ、入力音源を外部へそのまま送信せず、利用者が明示的に実行した場合だけ分離後の MP3 を本人所有の Pocket 棚へ送る。現在は、送信 MP3 への入力タグの残留、Web 同期ジョブと確認済み接続先の不一致、環境プロキシへの認証情報送出、不正な HTTP 応答による未整形エラー、棚由来文字列による端末表示の偽装、README と実挙動の説明差がある。
 
-修正後は、送信される MP3 が音声だけになり、Web の同期が画面で確認した棚に束縛され、Bearer トークンが環境プロキシへ出ず、通信異常が常に整形されたエラーになり、棚由来の文字列で端末表示を偽装できなくなり、README が実挙動と一致する。
+第1版は所見 F1〜F6 に対応したが、F1 で MP3 のタグをすべて落としたため音楽アプリで曲名が表示されず、F3 で `https_proxy` も無視したためプロキシ経由でしか外部へ接続できない環境では Pocket に到達できないという後退が生じる。第2版では、入力由来のタグを除去しながら曲名だけを MP3 の title に書き、https 接続だけを環境プロキシに従わせる。Web 同期の接続先束縛、安全なエラー変換、端末表示の無害化など、第1版の他の修正は維持する。
 
 ## 対象と承認版
 
@@ -12,15 +12,21 @@ Bunri は、分離処理をローカルで完結させ、入力音源を外部�
 - ベースブランチ: main
 - ベース SHA: aa8f10f8196fcffc811bc53994892879d30d3219
 - 作業ブランチ: plan/2026-09-12-pocket-review-fixes
+- 第1版実装済み HEAD: abec1b80afb28ad9badbad8751c7074989c309a9
 - 承認済み計画: `docs/plans/2026-09-12-pocket-review-fixes/plan.md`
-- 承認済み計画の SHA-256: ae453899c22aad043dc43f743c3b3a7c6b676dd06bf234945fa546d76c5db0d2
+- 承認済み計画の SHA-256: ab134e72728ccfebe4390251ce887def39cde38c8c462f288f20619b6dd47389
 - 担当: gpt-5.6-sol / high。ジョブ記録の検証と回復、Web UI の JavaScript、既存テストの更新が絡む中難度で、実装境界が計画で確定しているため
+- 独立実装レビュー担当: gpt-6-astra / high
+- 計画レビュー担当（第2版）: gpt-6-astra / high（未実行、予定）
+- 起案担当: claude-fable-5-1（確認済み、effort 未確認）
 
 この依頼は下記の要件だけで実装を始められるように記述している。
 依頼を渡す側が指定した承認版のハッシュと内容を照合し、実装中に計画を
 書き換えて受け入れ基準を変えない。不一致は報告する。
 
 ## 作業環境
+
+### 第1版の着手条件（記録）
 
 実行を準備する采配役が固定ベース SHA から隔離 worktree と作業ブランチを
 作り、委譲前に承認版 plan / request をコピーしてハッシュを照合する。
@@ -42,7 +48,27 @@ Bunri は、分離処理をローカルで完結させ、入力音源を外部�
 `test_guard_*` 7 件）で、ベース SHA の実装に対して `test_poc_*` が失敗し、
 `test_guard_*` が成功する状態が着手時の前提である。
 
+### 第2版の着手条件
+
+第2版のタスク12〜16は、作業ブランチ
+`plan/2026-09-12-pocket-review-fixes` の既存 worktree で、第1版実装済みの
+HEAD `abec1b80afb28ad9badbad8751c7074989c309a9` の上で行う。ブランチや
+worktree は再作成しない。固定ベース SHA
+`aa8f10f8196fcffc811bc53994892879d30d3219` は diff の起点としてのみ使う。
+
+着手時は `git rev-parse HEAD` が
+`abec1b80afb28ad9badbad8751c7074989c309a9` で、作業ツリーが clean であることを
+前提とする。`tests/test_pocket_security_review_poc.py` は、第1版の修正が入っているため
+18件すべて成功する。第1版の PoC 11件失敗という前提は、第2版には適用しない。
+
+采配役は、第2版の `plan.md` と `request.md` の改訂版を同じ相対パスへ配置する。
+この配置は tracked ファイルの更新として現れる。実装担当は実行時添付情報の
+SHA-256 と照合し、不一致なら実装を始めず報告する。改訂版の計画書は第2版の
+実装 commit に含める。
+
 ## タスク(この順で)
+
+タスク1〜11は第1版で実装済みであり、記録として残す。第2版では、その後にタスク12〜16をこの順で実施する。第1版と第2版が競合する場合は、タスク12〜16の内容を正とする。
 
 1. F4 の HTTP 応答異常を安全なエラーへ変換する。
    - `src/bunri/pocket/http.py` の `_request` で、`self._opener.open(...)` と応答の読み取り（正常系の `response.read` と `HTTPError` 分岐の `exc.read`）を `except http.client.HTTPException as exc:` で捕捉する。
@@ -89,19 +115,50 @@ Bunri は、分離処理をローカルで完結させ、入力音源を外部�
     - `uv run pytest -q tests/test_pocket_security_review_poc.py` と `uv run pytest -q -n auto` を実行し、下記の「検証と報告」に従って全件テストの証拠を記録する。
     - 変更対象を明示して staging し、作業ブランチへローカル commit する。計画書、報告書、PoC テストを含める。
     - 独立実装レビュー（gpt-6-astra / high の新規セッション）は commit 後に采配役が別途行う。実装担当はレビューを起動しない。
+12. F1 を改訂し、曲名だけを MP3 の title に書く。
+    - `src/bunri/audio.py` の関数を `encode_mp3(src, dest, *, bitrate="192k", title: str | None = None)` とし、キーワード引数 `title` を追加する。
+    - `title` が渡された場合は、ffmpeg 引数の `-map_metadata -1` の直後に `-metadata`、`title=<title>` の順で置く。値は個別の引数として渡し、シェルを経由しない。
+    - `-fflags +bitexact -flags:a +bitexact` と `-map_metadata -1` は維持し、入力ファイル由来のタグと ffmpeg のバージョン情報は引き続き除去する。`normalize_to_wav` は変更しない。`-fflags +bitexact` の指定下でも `-metadata title` が書かれることは確認済みである。
+    - `src/bunri/package.py` の `_export_mp3(src, dest, *, title)` から title を渡す。既存の表示名を `song_title`、楽器の日本語ラベルを `spec.label_ja` とし、次の値を設定する。
+      - `<safe>.original.mp3`: `song_title`
+      - `<safe>.<target>.mp3`: `f"{song_title} ({spec.label_ja}のみ)"`
+      - `<safe>.<target>.backing.mp3`: `f"{song_title} ({spec.label_ja}なし)"`
+    - 曲名は manifest と library ですでに送信しているため、Pocket へ送る情報は増えない。
+13. F3 を改訂し、https だけ環境プロキシを使う。
+    - `src/bunri/pocket/http.py` の opener を、クライアント生成時に `urllib.request.build_opener(_NoRedirect(), urllib.request.ProxyHandler({k: v for k, v in urllib.request.getproxies().items() if k == "https"}))` で構築する。
+    - `https_proxy` があれば https 接続はその CONNECT トンネルを通り、Bearer トークンは TLS 内に留まる。
+    - http は loopback 限定で常に直接接続し、`http_proxy` は使わない。`no_proxy` は urllib の既定どおり尊重する。
+14. README の3箇所とプロキシ文を更新する。
+    - 冒頭の英語段落、日本語段落、Pocket 節の3箇所で、「送信 MP3 は入力ファイルのタグを引き継がない」という趣旨の文言を「送信 MP3 は入力ファイルのタグを引き継がず、曲名だけを title に書く」という趣旨へ改める。
+    - Pocket 節のプロキシ説明を、「https への接続は環境変数 `https_proxy` と `no_proxy` に従う。http（loopback 限定）は常に直接接続し、`http_proxy` は使わない」という趣旨へ改める。
+15. 第2版に合わせてテストを更新・追加する。
+    - `tests/test_pocket_http.py` で `ProxyHandler` の proxies が `{}` であることを検証していた第1版のテストを、環境に `http_proxy` と `https_proxy` の両方があるとき `{"https": ...}` だけになることを検証する形へ更新する。
+    - `https_proxy` をローカルの偽プロキシへ向けると、https 要求が偽プロキシへ `CONNECT` として届き、Authorization ヘッダは届かないことを追加で検証する。
+    - `http_proxy` だけを設定しても loopback 宛の http 要求が偽プロキシへ届かないことを、`tests/test_pocket_security_review_poc.py` の既存テストが変更なしで検証し、そのまま成功することを確認する。
+    - `tests/test_audio_metadata.py` と `tests/test_package.py` で tags が空であることを検証していた第1版のテストを、title だけが期待値どおり入り、artist、comment、album、encoder などの他のキーがないことを検証する形へ更新する。`build_package` 経由では3ファイルそれぞれの title を検証する。
+    - `tests/test_pocket_security_review_poc.py` は変更しない。title は同テストの禁止対象に含まれていない。
+16. 全件テストの証拠を記録し、第2版の変更を commit する。
+    - `uv run pytest -q tests/test_pocket_security_review_poc.py` と `uv run pytest -q -n auto` を実行し、下記の「検証と報告」に従って証拠を記録する。
+    - タスク12〜15の変更と改訂済み計画書を明示して staging し、同じ作業ブランチへローカル commit する。
+    - 追加 commit の push は行わない。検収後に別途確認する。
 
 ## 完了条件
 
 - [ ] `uv run pytest -q tests/test_pocket_security_review_poc.py` が全件成功する（`test_poc_*` 11 件が失敗から成功に変わり、`test_guard_*` 7 件は成功のまま）
 - [ ] `uv run pytest -q -n auto` が全件成功する（CI と同じコマンド）
-- [ ] F1: 入力ファイルにタグを付けた m4a を分離すると、`<safe>.original.mp3`、`<safe>.<target>.mp3`、`<safe>.<target>.backing.mp3` のいずれも `ffprobe -show_entries format_tags` の `tags` が空になることをテストで検証する
+- [ ] F1（第1版。第2版で置き換え）: 入力ファイルにタグを付けた m4a を分離すると、`<safe>.original.mp3`、`<safe>.<target>.mp3`、`<safe>.<target>.backing.mp3` のいずれも `ffprobe -show_entries format_tags` の `tags` が空になることをテストで検証する
 - [ ] F2: `POST /api/pocket/sync/{id}` と `POST /api/pocket/sync` は `pocket_fingerprint` 未指定または不一致で 409 を返し、ジョブを作成しない。一致した場合はジョブ記録に `pocket_connection_fingerprint` が保存される。実行前に config が別の棚へ変わっていた場合、ジョブは `error` になり、アップロードを開始せず `synchronize` が呼ばれない。`_validate_job_record` は fingerprint のない `pocket_single` と `pocket_all` の記録を不正として扱う
 - [ ] F2: Web UI で同期ボタンが `pocket_fingerprint` を付けて送信し、`/api/pocket/job` の fingerprint が変わったら曲ごとの状態を再読込することを、手動確認またはテンプレートの静的確認で検証する
-- [ ] F3: `http_proxy` を設定しても `PocketHTTPClient` はプロキシへ接続しないことをテストで検証する
+- [ ] F3（第1版。第2版で置き換え）: `http_proxy` を設定しても `PocketHTTPClient` はプロキシへ接続しないことをテストで検証する
 - [ ] F4: 棚が `NOPE\r\n\r\n` を返したとき、`bunri pocket connect` と `bunri pocket delete` はトレースバックを出さず整形されたエラーで終了し、`GET /api/pocket/status` は 200 で `state: unknown` を返す
 - [ ] F5: 棚由来の title に `[bold red]...[/]`、`[/x]`、`\x1bc`、`\x1bM` を含めても、一覧と確認表示はそれらを解釈も素通しもせず、コマンドはクラッシュしない
 - [ ] F6: README の約束の文言が方針の内容に更新されている
 - [ ] 作業ブランチ `plan/2026-09-12-pocket-review-fixes` へ commit 済み。変更対象を明示して staging し、計画書（`docs/plans/2026-09-12-pocket-review-fixes/plan.md` と `docs/plans/2026-09-12-pocket-review-fixes/request.md`）、`docs/reviews/2026-09-12-pocket-adversarial-review.md`、`tests/test_pocket_security_review_poc.py` を含める。個人環境のパス、秘密情報、私的リンクを含まない
+
+第2版では、上記の F1 と F3 を次の条件で置き換える。PoC 18件、全件テスト、F2、F4、F5、および commit の完了条件は維持する。F6 はタスク14の文言を満たすことを正とする。
+
+- [ ] F1: 入力ファイルにタグを付けた m4a を分離すると、`<safe>.original.mp3` の tags は `{"title": "<曲名>"}`、`<safe>.<target>.mp3` の tags は `{"title": "<曲名> (<楽器>のみ)"}`、`<safe>.<target>.backing.mp3` の tags は `{"title": "<曲名> (<楽器>なし)"}` だけになり、入力由来のタグと `encoder` を含まないことをテストで検証する。
+- [ ] F3: `http_proxy` を設定しても loopback 宛の http 要求はプロキシへ行かない。`https_proxy` を設定すると https 要求はそのプロキシへ `CONNECT` で届く。どちらもテストで検証する。
 
 ## 計画書の commit 方針
 
@@ -117,6 +174,13 @@ Bunri は、分離処理をローカルで完結させ、入力音源を外部�
 
 ## 未確定事項と判断の委ね方
 
+第2版では次の未確定事項を追加する。
+
+| 項目 | 内容 | 実装時の扱い |
+|---|---|---|
+| title の文字化け | 曲名に ffmpeg の `-metadata` が扱えない文字はない想定 | 特殊文字を含む曲名でテストが落ちる場合は止まって報告する |
+| `getproxies()` の macOS システム設定 | 環境変数がないとき urllib は macOS のシステムプロキシ設定を読む | 既定挙動として許容する。テストは環境変数で制御する |
+
 - 担当が判断してよい範囲:
   - fingerprint 必須化で `POST /api/pocket/sync` を呼ぶ既存テストは、テストの意図を保って正しい fingerprint を付ける。
   - `-map_metadata -1` は入力指定の後ろ、出力ファイル名の直前に置く。テストが ffmpeg 引数リストを厳密に比較している場合は、確定済み引数に合わせて期待値を更新してよい。
@@ -130,14 +194,15 @@ Bunri は、分離処理をローカルで完結させ、入力音源を外部�
   - 依存の追加、Pocket プロトコルの変更、対象外ファイルの変更、受け入れ基準の変更が必要になった場合。
   - 選択肢と推奨を報告し、自動で判断して実装を進めない。
 - 公開経路と許可範囲:
-  - 作業ブランチ `plan/2026-09-12-pocket-review-fixes` へのローカル commit までを許可する。
-  - push、PR 作成、main への統合、リリースタグは未承認であり、検収後に別途判断する。
+  - 第1版は PR #24 として公開済みで、main には未マージである。
+  - 第2版の追加 commit を同じ作業ブランチ `plan/2026-09-12-pocket-review-fixes` にローカル commit するまでを許可する。
+  - 追加 commit の push、main への統合、リリースタグは未承認であり、検収後に別途判断する。
   - 自動デプロイはない。CI は push 時に `uv run pytest -q -n auto` を実行するのみである。
   - 独立実装レビューは commit 後に采配役が gpt-6-astra / high の新規セッションで別途行い、セキュリティと並行性を確認する。実装担当はレビューを起動しない。
 
 ## 実行上の制約
 
-- この実装担当は commit までとし、push・PR 作成・公開を行わない
+- この実装担当は第2版の追加 commit までとし、追加 commit の push・main への統合・リリースを行わない
 - commit subject は既存の慣例を優先し、慣例がなければ日本語で変更内容と理由を簡潔に書く（このリポジトリの慣例は日本語の 1 行 subject）
 - サブエージェントを生成しない
 - スコープ外のファイルや既存の未 commit 編集を変更しない

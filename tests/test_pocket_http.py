@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socketserver
 import threading
 import urllib.error
 import urllib.request
@@ -13,13 +14,30 @@ from bunri import __version__ as bunri_version
 from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
 
 
-def test_default_opener_disables_environment_proxies(monkeypatch):
+def _clear_proxy_environment(monkeypatch):
+    for name in (
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_default_opener_uses_only_the_https_environment_proxy(monkeypatch):
     captured = []
 
     def build_opener(*handlers):
         captured.extend(handlers)
         return object()
 
+    _clear_proxy_environment(monkeypatch)
+    monkeypatch.setenv("http_proxy", "http://http-proxy.invalid:8080")
+    monkeypatch.setenv("https_proxy", "http://https-proxy.invalid:8443")
     monkeypatch.setattr(urllib.request, "build_opener", build_opener)
     PocketHTTPClient("https://example.invalid", "secret")
 
@@ -28,7 +46,57 @@ def test_default_opener_disables_environment_proxies(monkeypatch):
         if isinstance(handler, urllib.request.ProxyHandler)
     ]
     assert len(proxy_handlers) == 1
-    assert proxy_handlers[0].proxies == {}
+    assert proxy_handlers[0].proxies == {
+        "https": "http://https-proxy.invalid:8443"
+    }
+
+
+class _ConnectRecordingHandler(socketserver.BaseRequestHandler):
+    received: list[bytes] = []
+
+    def handle(self):
+        chunks = []
+        self.request.settimeout(2)
+        while True:
+            chunk = self.request.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b"\r\n\r\n" in b"".join(chunks):
+                break
+        type(self).received.append(b"".join(chunks))
+        self.request.sendall(
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+
+
+def test_https_proxy_receives_connect_without_authorization(monkeypatch):
+    proxy = socketserver.ThreadingTCPServer(
+        ("127.0.0.1", 0), _ConnectRecordingHandler
+    )
+    proxy.daemon_threads = True
+    thread = threading.Thread(target=proxy.serve_forever)
+    thread.start()
+    _ConnectRecordingHandler.received = []
+    try:
+        _clear_proxy_environment(monkeypatch)
+        monkeypatch.setenv(
+            "https_proxy", f"http://127.0.0.1:{proxy.server_address[1]}"
+        )
+
+        client = PocketHTTPClient("https://example.invalid", "secret-token")
+        with pytest.raises(OSError):
+            client.capabilities()
+    finally:
+        proxy.shutdown()
+        thread.join()
+        proxy.server_close()
+
+    assert len(_ConnectRecordingHandler.received) == 1
+    request = _ConnectRecordingHandler.received[0]
+    assert request.startswith(b"CONNECT example.invalid:443 HTTP/")
+    assert b"authorization:" not in request.lower()
+    assert b"secret-token" not in request
 
 
 @pytest.mark.parametrize("failure_point", ["open", "response_read", "error_read"])

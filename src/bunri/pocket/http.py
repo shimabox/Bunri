@@ -61,7 +61,14 @@ class PocketHTTPClient:
     def __init__(self, base_url: str, token: str, *, opener: Any = None, metadata_timeout: float = METADATA_TIMEOUT_SECONDS, media_timeout: float = MEDIA_TIMEOUT_SECONDS) -> None:
         self.base_url = base_url.rstrip("/"); self._token = token
         self._opener = opener or urllib.request.build_opener(
-            _NoRedirect(), urllib.request.ProxyHandler({})
+            _NoRedirect(),
+            urllib.request.ProxyHandler(
+                {
+                    key: value
+                    for key, value in urllib.request.getproxies().items()
+                    if key == "https"
+                }
+            ),
         )
         self.metadata_timeout, self.media_timeout = metadata_timeout, media_timeout
 
