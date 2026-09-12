@@ -794,7 +794,15 @@
   }
 
   function postPocket(url) {
-    return fetch(url, { method: "POST" }).then(function (res) {
+    if (pocketConnectionFingerprint === null) {
+      return Promise.reject(new Error(
+        "Pocket の接続先を確認できません。状態を再読込してください。"
+      ));
+    }
+    var separator = url.indexOf("?") === -1 ? "?" : "&";
+    var requestUrl = url + separator + "pocket_fingerprint="
+      + encodeURIComponent(pocketConnectionFingerprint);
+    return fetch(requestUrl, { method: "POST" }).then(function (res) {
       if (!res.ok) {
         return res.json().catch(function () { return {}; }).then(function (body) {
           throw new Error(body.detail || ("アップロードを開始できません (" + res.status + ")"));
@@ -1396,7 +1404,15 @@
       .then(function (res) { return res.json(); })
       .then(function (body) {
         if (generation !== pocketJobGeneration) return;
+        var connectionChanged = (
+          pocketConnectionFingerprint !== null
+          && body.connection_fingerprint !== pocketConnectionFingerprint
+        );
         setPocketConnected(body.connected, body.connection_fingerprint);
+        if (connectionChanged) {
+          pocketStatuses = Object.create(null);
+          refreshPocketStatus();
+        }
         var job = body.job;
         renderPocketProgress(job);
         if (job && (job.status === "queued" || job.status === "running")) {

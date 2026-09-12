@@ -25,6 +25,10 @@ def normalize_to_wav(
             "-ar", str(sample_rate),
             "-ac", str(channels),
             "-acodec", "pcm_s16le",
+            "-map_metadata", "-1",
+            "-vn",
+            "-fflags", "+bitexact",
+            "-flags:a", "+bitexact",
             str(out),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -45,7 +49,14 @@ def encode_mp3(src: Path, dest: Path, *, bitrate: str = "192k") -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg not found on PATH (install with: brew install ffmpeg)")
     def _run(out: Path) -> None:
-        cmd = ["ffmpeg", "-y", "-i", str(src), "-c:a", "libmp3lame", "-b:a", bitrate, str(out)]
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-c:a", "libmp3lame", "-b:a", bitrate,
+            "-map_metadata", "-1",
+            "-fflags", "+bitexact",
+            "-flags:a", "+bitexact",
+            str(out),
+        ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             tail = "\n".join(result.stderr.splitlines()[-8:])

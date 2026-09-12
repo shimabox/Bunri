@@ -13,7 +13,11 @@ from bunri import __version__
 from bunri.package import build_package, resolve_title
 from bunri.registry import REGISTRY
 
-app = typer.Typer(add_completion=False, rich_markup_mode="rich")
+app = typer.Typer(
+    add_completion=False,
+    rich_markup_mode="rich",
+    pretty_exceptions_show_locals=False,
+)
 console = Console()
 
 

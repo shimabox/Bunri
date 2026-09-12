@@ -1,13 +1,83 @@
 from __future__ import annotations
 
+import http.client
 import json
 import threading
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
 from bunri import __version__ as bunri_version
 from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
+
+
+def test_default_opener_disables_environment_proxies(monkeypatch):
+    captured = []
+
+    def build_opener(*handlers):
+        captured.extend(handlers)
+        return object()
+
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+    PocketHTTPClient("https://example.invalid", "secret")
+
+    proxy_handlers = [
+        handler for handler in captured
+        if isinstance(handler, urllib.request.ProxyHandler)
+    ]
+    assert len(proxy_handlers) == 1
+    assert proxy_handlers[0].proxies == {}
+
+
+@pytest.mark.parametrize("failure_point", ["open", "response_read", "error_read"])
+def test_http_protocol_exceptions_are_converted_to_safe_os_errors(failure_point):
+    class BrokenResponse:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            raise http.client.IncompleteRead(b"partial")
+
+    class BrokenErrorBody:
+        def read(self, _limit):
+            raise http.client.RemoteDisconnected("private transport detail")
+
+        def close(self):
+            pass
+
+    class BrokenOpener:
+        def open(self, request, timeout):
+            if failure_point == "open":
+                raise http.client.BadStatusLine("private status detail")
+            if failure_point == "error_read":
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    500,
+                    "private reason",
+                    {},
+                    BrokenErrorBody(),
+                )
+            return BrokenResponse()
+
+    client = PocketHTTPClient(
+        "https://example.invalid", "secret-token", opener=BrokenOpener()
+    )
+    with pytest.raises(OSError) as caught:
+        client._request("GET", "capabilities")
+
+    assert str(caught.value).startswith("Pocket の応答を解釈できません: ")
+    assert "private" not in str(caught.value)
+    assert "secret-token" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
 
 
 class Handler(BaseHTTPRequestHandler):

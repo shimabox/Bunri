@@ -14,7 +14,11 @@ from pathlib import Path
 import typer
 import uvicorn
 
-app = typer.Typer(add_completion=False, rich_markup_mode="rich")
+app = typer.Typer(
+    add_completion=False,
+    rich_markup_mode="rich",
+    pretty_exceptions_show_locals=False,
+)
 
 
 @app.command(

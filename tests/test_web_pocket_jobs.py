@@ -107,15 +107,18 @@ def test_pocket_job_uses_direct_service_and_omits_separation_fields(tmp_path, mo
             song_id="a" * 12,
             digest="a" * 40,
             safe_name="Song",
+            connection_fingerprint=CONNECTION_FINGERPRINT,
             sync_lock=SyncLock(tmp_path).acquire(),
         )
         wait_for(lambda: store.get_job(job.id).status == "done")
         saved = json.loads((tmp_path / "web" / "jobs" / f"{job.id}.json").read_text())
         assert saved["kind"] == "pocket_single"
+        assert saved["pocket_connection_fingerprint"] == CONNECTION_FINGERPRINT
         assert not ({"target", "upload", "package", "log"} & saved.keys())
         assert len(calls) == 1
         assert calls[0][1]["resolution"] == "song_id"
         assert calls[0][1]["include_original"] is True
+        assert calls[0][1]["expected_connection_fingerprint"] == CONNECTION_FINGERPRINT
     finally:
         store.shutdown()
 
@@ -549,6 +552,7 @@ def test_running_pocket_job_is_requeued_without_subprocess_recovery(tmp_path, mo
         "pocket_song_id": "a" * 12,
         "pocket_digest": "a" * 40,
         "pocket_safe_name": "Song",
+        "pocket_connection_fingerprint": CONNECTION_FINGERPRINT,
         "progress": None,
         "result": None,
     }))
@@ -576,6 +580,7 @@ def test_recovered_pocket_job_holds_sync_lock_while_queued(tmp_path, monkeypatch
         "pocket_song_id": "a" * 12,
         "pocket_digest": "a" * 40,
         "pocket_safe_name": "Song",
+        "pocket_connection_fingerprint": CONNECTION_FINGERPRINT,
         "progress": None,
         "result": None,
     }))
@@ -620,10 +625,12 @@ def test_pocket_batch_preserves_legacy_names_on_local_validation_error(
             song_id=None,
             digest=None,
             safe_name=None,
+            connection_fingerprint=CONNECTION_FINGERPRINT,
             sync_lock=SyncLock(tmp_path).acquire(),
         )
         wait_for(lambda: store.get_job(job.id).status == "error")
         saved = json.loads((tmp_path / "web" / "jobs" / f"{job.id}.json").read_text())
+        assert saved["pocket_connection_fingerprint"] == CONNECTION_FINGERPRINT
         assert saved["progress"]["legacy"] == ["Old One", "Old Two"]
         assert saved["progress"]["legacy_count"] == 2
         assert saved["result"]["legacy"] == ["Old One", "Old Two"]
@@ -671,6 +678,7 @@ def test_pocket_batch_job_bounds_names_and_keeps_complete_counts(
             song_id=None,
             digest=None,
             safe_name=None,
+            connection_fingerprint=CONNECTION_FINGERPRINT,
             sync_lock=SyncLock(tmp_path).acquire(),
         )
         wait_for(lambda: store.get_job(job.id).status == "error")
@@ -699,5 +707,48 @@ def test_pocket_batch_job_bounds_names_and_keeps_complete_counts(
         assert saved["result"]["pending"] == saved["progress"]["pending_count"]
         assert saved["result"]["legacy_count"] == item_count
         assert len(saved["result"]["legacy"]) == MAX_POCKET_JOB_NAMES_PER_STATE
+    finally:
+        store.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["pocket_single", "pocket_all"])
+def test_recovered_sync_job_stops_when_connection_changes(tmp_path, monkeypatch, kind):
+    import bunri.pocket.service as service_module
+
+    displayed = PocketConfig("https://shelf-a.invalid", TOKEN)
+    expected = connection_fingerprint(displayed)
+    save_config(tmp_path, PocketConfig("https://shelf-b.invalid", TOKEN))
+    if kind == "pocket_single":
+        make_local_song(tmp_path)
+    uploads = []
+    monkeypatch.setattr(
+        service_module,
+        "synchronize",
+        lambda *_args, **_kwargs: uploads.append(True) or SyncResult(),
+    )
+    job = Job(
+        id=f"j-changed-{kind}",
+        digest="",
+        title="",
+        target="",
+        status="queued",
+        created_at="2026-09-12T00:00:00+00:00",
+        kind=kind,
+        pocket_song_id="a" * 12 if kind == "pocket_single" else None,
+        pocket_digest="a" * 40 if kind == "pocket_single" else None,
+        pocket_safe_name="Song" if kind == "pocket_single" else None,
+        pocket_connection_fingerprint=expected,
+    )
+    write_job(tmp_path, job)
+
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        wait_for(lambda: store.get_job(job.id).status == "error")
+        failed = store.get_job(job.id)
+        assert failed.error == (
+            "接続先が変更されたため同期を中止しました。"
+            "状態を再読込して確認し直してください"
+        )
+        assert uploads == []
     finally:
         store.shutdown()

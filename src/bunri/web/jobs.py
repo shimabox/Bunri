@@ -985,12 +985,13 @@ def _validate_job_record(data: Any, expected_id: str) -> Optional[str]:
                 return f"{kind} has an invalid package name"
             if _safe_package_segment(data["pocket_safe_name"]) is not None:
                 return f"{kind} has an unsafe package name"
-        if kind == "pocket_delete":
+        if kind in ("pocket_single", "pocket_all", "pocket_delete"):
             if (
                 not isinstance(data.get("pocket_connection_fingerprint"), str)
                 or re.fullmatch(r"[0-9a-f]{64}", data["pocket_connection_fingerprint"]) is None
             ):
-                return "pocket_delete has an invalid connection fingerprint"
+                return f"{kind} has an invalid connection fingerprint"
+        if kind == "pocket_delete":
             result = data.get("result")
             if not isinstance(result, dict) or any(
                 type(result.get(name)) is not bool
@@ -2303,6 +2304,7 @@ class JobStore:
         song_id: str | None,
         digest: str | None,
         safe_name: str | None,
+        connection_fingerprint: str,
         sync_lock: SyncLock,
     ) -> Job:
         """Persist one direct Pocket job after its cross-process lock is held."""
@@ -2336,6 +2338,7 @@ class JobStore:
                 pocket_song_id=song_id,
                 pocket_digest=digest,
                 pocket_safe_name=safe_name,
+                pocket_connection_fingerprint=connection_fingerprint,
                 progress={
                     "total": 0,
                     "completed": 0,
@@ -2702,7 +2705,11 @@ class JobStore:
                 job.result = {"pocket_deleted": True, "local_deleted": True}
                 failed = False
             elif job.kind == "pocket_single":
-                assert job.pocket_song_id is not None and job.pocket_digest is not None
+                assert (
+                    job.pocket_song_id is not None
+                    and job.pocket_digest is not None
+                    and job.pocket_connection_fingerprint is not None
+                )
                 result = sync_one(
                     self.out_dir,
                     job.pocket_song_id,
@@ -2710,10 +2717,12 @@ class JobStore:
                     expected_digest=job.pocket_digest,
                     include_original=True,
                     lock=sync_lock,
+                    expected_connection_fingerprint=job.pocket_connection_fingerprint,
                 )
                 job.result = asdict(result)
                 failed = False
             else:
+                assert job.pocket_connection_fingerprint is not None
                 def update_progress(batch, current: str | None) -> None:
                     with self._lock:
                         job.progress = _pocket_batch_progress(batch, current)
@@ -2724,6 +2733,7 @@ class JobStore:
                     include_original=True,
                     lock=sync_lock,
                     progress=update_progress,
+                    expected_connection_fingerprint=job.pocket_connection_fingerprint,
                 )
                 update_progress(batch, None)
                 job.result = _pocket_batch_result(batch)

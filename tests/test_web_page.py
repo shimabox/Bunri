@@ -27,6 +27,26 @@ from bunri.web.app import create_app
 from bunri.web.jobs import safe_filename
 
 
+def test_pocket_sync_template_binds_requests_and_refreshes_changed_connection():
+    template = Path("src/bunri/web/templates/index.html.j2").read_text(encoding="utf-8")
+
+    assert re.search(
+        r'function postPocket\(url\).*?pocket_fingerprint="\s*'
+        r'\+ encodeURIComponent\(pocketConnectionFingerprint\).*?fetch\(requestUrl',
+        template,
+        re.DOTALL,
+    )
+    assert re.search(
+        r'pocketConnectionFingerprint !== null\s*'
+        r'&& body\.connection_fingerprint !== pocketConnectionFingerprint.*?'
+        r'if \(connectionChanged\) \{\s*'
+        r'pocketStatuses = Object\.create\(null\);\s*refreshPocketStatus\(\);',
+        template,
+        re.DOTALL,
+    )
+    assert "Pocket の接続先を確認できません。状態を再読込してください。" in template
+
+
 class PageFakeRunner:
     def __init__(self, *, write_player: bool = True, returncode: int = 0, delay: float = 0.1) -> None:
         self.write_player = write_player
