@@ -1038,7 +1038,12 @@ def test_separation_completion_refreshes_pocket_status_for_new_song(tmp_path):
 def test_single_pocket_upload_button_recovers_after_409(tmp_path):
     import base64
 
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import (
+        PocketConfig,
+        connection_fingerprint,
+        read_config,
+        save_config,
+    )
     from bunri.web.jobs import song_id
 
     out_dir = tmp_path / "out"
@@ -1069,6 +1074,7 @@ def test_single_pocket_upload_button_recovers_after_409(tmp_path):
             content_type="application/json",
             body=json.dumps({
                 "connected": True,
+                "connection_fingerprint": connection_fingerprint(read_config(out_dir)),
                 "target_count": 1,
                 "package_count": 1,
                 "songs": [{
