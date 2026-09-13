@@ -107,6 +107,43 @@ def test_pocket_sync_resolves_its_argument_only_as_a_safe_name(tmp_path, monkeyp
     assert result.exit_code == 0, result.output
     assert calls[0][0][1] == "aaaaaaaaaaaa"
     assert calls[0][1]["resolution"] == "safe_name"
+    assert calls[0][1]["expected_connection_fingerprint"] == (
+        pocket_cli.connection_fingerprint(
+            PocketConfig("https://example.invalid", "unused-token")
+        )
+    )
+
+
+def test_pocket_delete_sanitizes_local_safe_name_in_confirmation(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.config import PocketConfig
+    from bunri.pocket.service import DeleteTargetIdentity
+
+    monkeypatch.setattr(
+        pocket_cli,
+        "read_config",
+        lambda _out: PocketConfig("https://example.invalid", "unused-token"),
+    )
+    monkeypatch.setattr(
+        pocket_cli,
+        "resolve_delete_target",
+        lambda *_args: DeleteTargetIdentity(
+            song_id="a" * 12,
+            safe_name="Local\x1b[2J[/x]",
+            title="[bold red]Remote[/]",
+        ),
+    )
+
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["delete", "Song", "-o", str(tmp_path)],
+        env=_STABLE_TERMINAL,
+    )
+
+    assert result.exit_code == 1
+    assert "\x1b[2J" not in result.output
+    assert "Local�[2J[/x]" in result.output
+    assert "[bold red]Remote[/]" in result.output
 
 
 @pytest.mark.parametrize("arguments", [[], ["Song", "--all"]])
@@ -131,7 +168,10 @@ def test_pocket_sync_all_reports_every_legacy_package_on_local_validation_error(
         lambda _out: PocketConfig("https://example.invalid", "unused-token"),
     )
 
-    def fail_sync_all(*_args, **_kwargs):
+    calls = []
+
+    def fail_sync_all(*_args, **kwargs):
+        calls.append(kwargs)
         raise PocketServiceError(
             "ローカル検証に失敗しました。",
             kind="local",
@@ -150,6 +190,11 @@ def test_pocket_sync_all_reports_every_legacy_package_on_local_validation_error(
     assert "再生成が必要: Old One" in output
     assert "再生成が必要: Old Two" in output
     assert "ローカル検証に失敗しました。" in output
+    assert calls[0]["expected_connection_fingerprint"] == (
+        pocket_cli.connection_fingerprint(
+            PocketConfig("https://example.invalid", "unused-token")
+        )
+    )
 
 
 def test_pocket_sync_all_failure_does_not_recapture_exit(tmp_path, monkeypatch):

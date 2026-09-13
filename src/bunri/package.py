@@ -69,10 +69,10 @@ def _export(src: Path, dest: Path) -> Path:
     return dest
 
 
-def _export_mp3(src: Path, dest: Path) -> Path:
+def _export_mp3(src: Path, dest: Path, *, title: str) -> Path:
     # No replace_into here: audio.encode_mp3 does its own, so that a caller
     # reaching for it directly is protected too.
-    audio.encode_mp3(src, dest)
+    audio.encode_mp3(src, dest, title=title)
     console.print(f"→ [cyan]{dest}[/cyan]")
     return dest
 
@@ -263,9 +263,17 @@ def build_package(
         target_ref = f"{safe}.{spec.target}.mp3"
         backing_ref = f"{safe}.{spec.target}.backing.mp3"
         original_ref: str | None = f"{safe}.original.mp3"
-        _export_mp3(target_wav, package_dir / target_ref)
-        _export_mp3(backing_wav, package_dir / backing_ref)
-        _export_mp3(input_wav, package_dir / original_ref)
+        _export_mp3(
+            target_wav,
+            package_dir / target_ref,
+            title=f"{song_title} ({spec.label_ja}のみ)",
+        )
+        _export_mp3(
+            backing_wav,
+            package_dir / backing_ref,
+            title=f"{song_title} ({spec.label_ja}なし)",
+        )
+        _export_mp3(input_wav, package_dir / original_ref, title=song_title)
     else:
         target_ref = f"{safe}.{spec.target}.wav"
         backing_ref = f"{safe}.{spec.target}.backing.wav"

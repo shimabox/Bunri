@@ -555,19 +555,49 @@ def test_pocket_status_matches_web_song_id_across_unicode_normalization(
 def test_pocket_sync_lock_conflict_returns_409_without_creating_job(client):
     import base64
 
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
     from bunri.pocket.lock import SyncLock
 
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
-    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    config = PocketConfig("https://example.invalid", token)
+    save_config(client.out_dir, config)
     held = SyncLock(client.out_dir).acquire()
     try:
-        response = client.post("/api/pocket/sync")
+        response = client.post(
+            "/api/pocket/sync?pocket_fingerprint=" + connection_fingerprint(config)
+        )
     finally:
         held.release()
     assert response.status_code == 409
     assert client.get("/api/jobs").json() == []
     assert "example.invalid" not in response.text and token not in response.text
+
+
+@pytest.mark.parametrize("path", ["/api/pocket/sync/" + "a" * 12, "/api/pocket/sync"])
+def test_pocket_sync_requires_matching_connection_fingerprint(client, path):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    config = PocketConfig("https://example.invalid", token)
+    save_config(client.out_dir, config)
+
+    missing = client.post(path)
+    changed = client.post(path + "?pocket_fingerprint=" + "f" * 64)
+
+    assert missing.status_code == 409
+    assert missing.json()["detail"] == (
+        "Pocket の接続先を確認できないため同期を中止しました。"
+        "状態を再読込して確認し直してください。"
+    )
+    assert changed.status_code == 409
+    assert changed.json()["detail"] == (
+        "Pocket の接続先が変更されたため同期を中止しました。"
+        "状態を再読込して確認し直してください。"
+    )
+    assert client.get("/api/jobs").json() == []
+    assert connection_fingerprint(config) not in missing.text + changed.text
 
 
 def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, monkeypatch):
@@ -576,11 +606,12 @@ def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, m
 
     import bunri.web.jobs as jobs_module
     from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata, write_package_metadata
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
     from bunri.pocket.sync import SyncResult
 
     token = base64.urlsafe_b64encode(b"secret" * 8).decode().rstrip("=")
-    save_config(client.out_dir, PocketConfig("https://example.invalid/private", token))
+    config = PocketConfig("https://example.invalid/private", token)
+    save_config(client.out_dir, config)
     package = client.out_dir / "Song"
     package.mkdir()
     digest = "a" * 40
@@ -607,7 +638,10 @@ def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, m
         lambda _job: pytest.fail("display downloads must not be a Pocket sync input"),
     )
 
-    response = client.post("/api/pocket/sync/" + digest[:12])
+    fingerprint = connection_fingerprint(config)
+    response = client.post(
+        "/api/pocket/sync/" + digest[:12] + "?pocket_fingerprint=" + fingerprint
+    )
     assert response.status_code == 202
     job_id = response.json()["job_id"]
     _wait_until(lambda: _job_status(client, job_id) == "done")
@@ -618,6 +652,8 @@ def test_pocket_single_sync_is_queued_by_song_id_and_keeps_secrets_out(client, m
     assert sync_calls[0][1]["resolution"] == "song_id"
     assert sync_calls[0][1]["expected_digest"] == digest
     assert sync_calls[0][1]["include_original"] is True
+    assert sync_calls[0][1]["expected_connection_fingerprint"] == fingerprint
+    assert stored["pocket_connection_fingerprint"] == fingerprint
     assert token not in response.text + json.dumps(detail) + json.dumps(stored)
     assert "example.invalid" not in response.text + json.dumps(detail) + json.dumps(stored)
 
@@ -634,11 +670,12 @@ def test_pocket_single_sync_resolves_song_id_before_same_named_directory(
         TargetMetadata,
         write_package_metadata,
     )
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
     from bunri.pocket.sync import SyncResult
 
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
-    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    config = PocketConfig("https://example.invalid", token)
+    save_config(client.out_dir, config)
 
     def make_package(name: str, digest: str) -> None:
         package = client.out_dir / name
@@ -659,7 +696,10 @@ def test_pocket_single_sync_resolves_song_id_before_same_named_directory(
     make_package("Actual Song", "a" * 40)
     monkeypatch.setattr(jobs_module, "sync_one", lambda *args, **kwargs: SyncResult())
 
-    response = client.post("/api/pocket/sync/" + "a" * 12)
+    response = client.post(
+        "/api/pocket/sync/" + "a" * 12
+        + "?pocket_fingerprint=" + connection_fingerprint(config)
+    )
 
     assert response.status_code == 202
     job_id = response.json()["job_id"]
@@ -690,6 +730,9 @@ def test_pocket_job_tracking_never_waits_for_the_remote_inspection(tmp_path, mon
         "started_at": "2026-09-05T00:00:01+00:00",
         "finished_at": "2026-09-05T00:00:02+00:00",
         "error": "Pocket の同期に失敗しました。後で再実行してください。",
+        "pocket_connection_fingerprint": connection_fingerprint(
+            PocketConfig("https://example.invalid", token)
+        ),
         "progress": {
             "total": 2,
             "completed": 1,
@@ -736,7 +779,7 @@ def test_queued_pocket_job_blocks_a_second_pocket_job_of_another_kind(tmp_path):
         TargetMetadata,
         write_package_metadata,
     )
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
 
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
     save_config(tmp_path, PocketConfig("https://example.invalid", token))
@@ -778,6 +821,9 @@ def test_queued_pocket_job_blocks_a_second_pocket_job_of_another_kind(tmp_path):
         "started_at": "2026-09-05T00:00:02+00:00",
         "finished_at": None,
         "error": None,
+        "pocket_connection_fingerprint": connection_fingerprint(
+            PocketConfig("https://example.invalid", token)
+        ),
         "progress": None,
         "result": None,
     }), encoding="utf-8")
@@ -797,7 +843,11 @@ def test_queued_pocket_job_blocks_a_second_pocket_job_of_another_kind(tmp_path):
         try:
             assert running.wait(timeout=5)
             _wait_until(lambda: _job_status(c, "j-pocket-all") == "queued")
-            response = c.post("/api/pocket/sync/" + digest[:12])
+            response = c.post(
+                "/api/pocket/sync/" + digest[:12]
+                + "?pocket_fingerprint="
+                + connection_fingerprint(PocketConfig("https://example.invalid", token))
+            )
             jobs = c.get("/api/jobs").json()
         finally:
             release.set()
@@ -849,6 +899,7 @@ def test_songs_apply_batch_results_only_to_matching_packages(tmp_path, monkeypat
         "started_at": "2026-09-05T00:00:01+00:00",
         "finished_at": "2026-09-05T00:00:02+00:00",
         "error": "Pocket の同期に失敗しました。後で再実行してください。",
+        "pocket_connection_fingerprint": "f" * 64,
         "progress": {
             "total": 3,
             "completed": 1,
@@ -907,6 +958,7 @@ def test_songs_match_batch_progress_across_unicode_normalization(tmp_path, monke
             "started_at": "2026-09-05T00:00:01+00:00",
             "finished_at": "2026-09-05T00:00:02+00:00",
             "error": None,
+            "pocket_connection_fingerprint": "f" * 64,
             "progress": {
                 "total": 1,
                 "completed": 1,
@@ -976,6 +1028,7 @@ def test_songs_do_not_share_batch_progress_across_colliding_package_names(
             "started_at": "2026-09-05T00:00:01+00:00",
             "finished_at": "2026-09-05T00:00:02+00:00",
             "error": "failed",
+            "pocket_connection_fingerprint": "f" * 64,
             "progress": {
                 "total": 2,
                 "completed": 0,
@@ -1616,6 +1669,7 @@ def test_delete_song_returns_204_while_unrelated_pocket_single_is_active(client)
         pocket_song_id="b" * 12,
         pocket_digest="b" * 40,
         pocket_safe_name="Other",
+        pocket_connection_fingerprint="f" * 64,
     )
     store = client.app.state.job_store
     with store._lock:

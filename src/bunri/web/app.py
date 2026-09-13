@@ -593,8 +593,18 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         return config
 
     @app.post("/api/pocket/sync/{pocket_song_id}")
-    def create_pocket_sync(pocket_song_id: str) -> JSONResponse:
-        _pocket_config_or_409()
+    def create_pocket_sync(
+        pocket_song_id: str,
+        pocket_fingerprint: str | None = None,
+    ) -> JSONResponse:
+        if pocket_fingerprint is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Pocket の接続先を確認できないため同期を中止しました。"
+                    "状態を再読込して確認し直してください。"
+                ),
+            )
         if re.fullmatch(r"[0-9a-f]{12}", pocket_song_id) is None:
             raise HTTPException(status_code=400, detail="song ID が不正です。")
         try:
@@ -602,6 +612,15 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         except (OSError, SyncLockBusy) as exc:
             raise HTTPException(status_code=409, detail=safe_error(exc))
         try:
+            config = _pocket_config_or_409()
+            if pocket_fingerprint != connection_fingerprint(config):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Pocket の接続先が変更されたため同期を中止しました。"
+                        "状態を再読込して確認し直してください。"
+                    ),
+                )
             package = resolve_package(
                 out_dir,
                 pocket_song_id,
@@ -612,8 +631,12 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                 song_id=pocket_song_id,
                 digest=package.metadata.source.digest,
                 safe_name=package.directory.name,
+                connection_fingerprint=pocket_fingerprint,
                 sync_lock=sync_lock,
             )
+        except HTTPException:
+            sync_lock.release()
+            raise
         except PocketServiceError as exc:
             sync_lock.release()
             status = 404 if exc.kind == "not_found" else 409
@@ -626,19 +649,41 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         return JSONResponse({"job_id": job.id}, status_code=202)
 
     @app.post("/api/pocket/sync")
-    def create_pocket_sync_all() -> JSONResponse:
-        _pocket_config_or_409()
+    def create_pocket_sync_all(
+        pocket_fingerprint: str | None = None,
+    ) -> JSONResponse:
+        if pocket_fingerprint is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Pocket の接続先を確認できないため同期を中止しました。"
+                    "状態を再読込して確認し直してください。"
+                ),
+            )
         try:
             sync_lock = SyncLock(out_dir).acquire()
         except (OSError, SyncLockBusy) as exc:
             raise HTTPException(status_code=409, detail=safe_error(exc))
         try:
+            config = _pocket_config_or_409()
+            if pocket_fingerprint != connection_fingerprint(config):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Pocket の接続先が変更されたため同期を中止しました。"
+                        "状態を再読込して確認し直してください。"
+                    ),
+                )
             job = store.create_pocket_job(
                 song_id=None,
                 digest=None,
                 safe_name=None,
+                connection_fingerprint=pocket_fingerprint,
                 sync_lock=sync_lock,
             )
+        except HTTPException:
+            sync_lock.release()
+            raise
         except SyncLockBusy as exc:
             raise HTTPException(status_code=409, detail=safe_error(exc))
         except BaseException:

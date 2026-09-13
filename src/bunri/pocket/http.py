@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.error
@@ -59,7 +60,16 @@ class JSONDocument:
 class PocketHTTPClient:
     def __init__(self, base_url: str, token: str, *, opener: Any = None, metadata_timeout: float = METADATA_TIMEOUT_SECONDS, media_timeout: float = MEDIA_TIMEOUT_SECONDS) -> None:
         self.base_url = base_url.rstrip("/"); self._token = token
-        self._opener = opener or urllib.request.build_opener(_NoRedirect())
+        self._opener = opener or urllib.request.build_opener(
+            _NoRedirect(),
+            urllib.request.ProxyHandler(
+                {
+                    key: value
+                    for key, value in urllib.request.getproxies().items()
+                    if key == "https"
+                }
+            ),
+        )
         self.metadata_timeout, self.media_timeout = metadata_timeout, media_timeout
 
     def _upload_url(self, path: str) -> str:
@@ -76,18 +86,26 @@ class PocketHTTPClient:
         url = self._upload_url(path) if upload_route else self._api_url(path)
         request_headers = {"Authorization": f"Bearer {self._token}", "User-Agent": USER_AGENT, **(headers or {})}
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
-        try: response = self._opener.open(request, timeout=timeout or self.metadata_timeout)
-        except urllib.error.HTTPError as exc:
-            body = exc.read(JSON_LIMIT_BYTES + 1); code = None; supported = None
+        try:
             try:
-                envelope = json.loads(body[:limit]); error = envelope.get("error", {}); code = error.get("code"); supported = error.get("supported_schema_major")
-            except Exception: pass
-            retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
-            raise PocketHTTPError(exc.code, code, url, retry_after=retry_after, supported_major=supported) from None
-        with response:
-            body = response.read(limit + 1)
-            if len(body) > limit: raise PocketHTTPError(413, "RESPONSE_TOO_LARGE", url)
-            return response.status, response.headers, body
+                response = self._opener.open(
+                    request, timeout=timeout or self.metadata_timeout
+                )
+            except urllib.error.HTTPError as exc:
+                body = exc.read(JSON_LIMIT_BYTES + 1); code = None; supported = None
+                try:
+                    envelope = json.loads(body[:limit]); error = envelope.get("error", {}); code = error.get("code"); supported = error.get("supported_schema_major")
+                except Exception: pass
+                retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+                raise PocketHTTPError(exc.code, code, url, retry_after=retry_after, supported_major=supported) from None
+            with response:
+                body = response.read(limit + 1)
+                if len(body) > limit: raise PocketHTTPError(413, "RESPONSE_TOO_LARGE", url)
+                return response.status, response.headers, body
+        except http.client.HTTPException as exc:
+            raise OSError(
+                f"Pocket の応答を解釈できません: {type(exc).__name__}"
+            ) from None
 
     def capabilities(self) -> dict[str, Any]:
         status, _, body = self._request("GET", "capabilities")

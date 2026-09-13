@@ -519,6 +519,7 @@ def test_completed_pocket_job_does_not_claim_separation_package_or_upload(tmp_pa
         pocket_song_id=digest[:12],
         pocket_digest=digest,
         pocket_safe_name="untitled",
+        pocket_connection_fingerprint="f" * 64,
     )
     _write_job_file(tmp_path, pocket)
     package = tmp_path / "untitled"
@@ -544,6 +545,7 @@ def test_completed_pocket_job_does_not_rename_untitled_separation_job(tmp_path):
         status="done",
         created_at="2026-09-05T00:00:00+00:00",
         kind="pocket_all",
+        pocket_connection_fingerprint="f" * 64,
     )
     _write_job_file(tmp_path, pocket)
     upload = _make_upload(tmp_path)
@@ -591,6 +593,7 @@ def test_batch_pocket_job_uses_each_package_result_for_song_status(tmp_path):
         finished_at="2026-09-05T00:00:01+00:00",
         error="Pocket の同期に失敗しました。後で再実行してください。",
         kind="pocket_all",
+        pocket_connection_fingerprint="f" * 64,
         progress={
             "total": 3,
             "completed": 1,
@@ -670,6 +673,7 @@ def test_delete_song_excludes_own_delete_and_ignores_unrelated_single_sync(tmp_p
         pocket_song_id="b" * 12,
         pocket_digest="b" * 40,
         pocket_safe_name="Other",
+        pocket_connection_fingerprint="f" * 64,
     )
     try:
         store._jobs[own.id] = own
@@ -697,7 +701,7 @@ def test_delete_song_rejects_related_or_global_active_pocket_job(tmp_path, kind)
         pocket_song_id=digest[:12] if kind != "pocket_all" else None,
         pocket_digest=digest if kind != "pocket_all" else None,
         pocket_safe_name="Song" if kind != "pocket_all" else None,
-        pocket_connection_fingerprint="f" * 64 if kind == "pocket_delete" else None,
+        pocket_connection_fingerprint="f" * 64,
     )
     store = JobStore(tmp_path, runner=lambda *args: 1)
     try:
@@ -2814,3 +2818,26 @@ def test_default_runner_passes_target_to_the_cli(tmp_path, monkeypatch):
     # reaper can only signal the CLI itself and its ffmpeg children survive
     # (see test_terminate_pid_from_sidecar_kills_the_whole_process_tree).
     assert captured["kwargs"].get("start_new_session") is True
+
+
+@pytest.mark.parametrize("kind", ["pocket_single", "pocket_all"])
+def test_sync_job_record_requires_connection_fingerprint(kind):
+    from bunri.web.jobs import _validate_job_record
+
+    job_id = f"j-{kind}"
+    record = {
+        "id": job_id,
+        "kind": kind,
+        "status": "queued",
+        "created_at": "2026-09-12T00:00:00+00:00",
+    }
+    if kind == "pocket_single":
+        record.update({
+            "pocket_song_id": "a" * 12,
+            "pocket_digest": "a" * 40,
+            "pocket_safe_name": "Song",
+        })
+
+    assert _validate_job_record(record, job_id) == (
+        f"{kind} has an invalid connection fingerprint"
+    )
