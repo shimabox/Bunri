@@ -27,6 +27,7 @@ from bunri.pocket.service import (
     safe_delete_error,
     safe_error,
     sync_all,
+    sync_one,
 )
 
 
@@ -55,6 +56,41 @@ class EmptyRemoteClient:
 
     def head_media(self, song_id, name):
         return None
+
+
+@pytest.mark.parametrize("operation", ["one", "all"])
+def test_sync_stops_before_upload_when_connection_fingerprint_changes(
+    tmp_path, monkeypatch, operation
+):
+    import bunri.pocket.service as service_module
+
+    make_package(tmp_path, "Song", "a" * 40)
+    displayed = PocketConfig("https://shelf-a.invalid", TOKEN)
+    save_config(tmp_path, displayed)
+    expected = connection_fingerprint(displayed)
+    save_config(tmp_path, PocketConfig("https://shelf-b.invalid", TOKEN))
+    monkeypatch.setattr(
+        service_module,
+        "synchronize",
+        lambda *_args, **_kwargs: pytest.fail("upload must not start"),
+    )
+
+    with pytest.raises(PocketServiceError) as caught:
+        if operation == "one":
+            sync_one(
+                tmp_path,
+                "Song",
+                resolution="safe_name",
+                expected_connection_fingerprint=expected,
+            )
+        else:
+            sync_all(tmp_path, expected_connection_fingerprint=expected)
+
+    assert caught.value.kind == "connection_changed"
+    assert safe_error(caught.value) == (
+        "接続先が変更されたため同期を中止しました。"
+        "状態を再読込して確認し直してください"
+    )
 
 
 def test_all_package_names_is_complete_deterministic_and_excludes_internal_paths(tmp_path):

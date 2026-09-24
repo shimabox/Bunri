@@ -26,8 +26,16 @@ from bunri.pocket.service import (
     sync_one,
 )
 
-app = typer.Typer(add_completion=False, rich_markup_mode="rich")
+app = typer.Typer(
+    add_completion=False,
+    rich_markup_mode="rich",
+    pretty_exceptions_show_locals=False,
+)
 console = Console()
+
+
+def _safe_display(value: str) -> str:
+    return re.sub(r"[\x00-\x1f\x7f]", "\ufffd", value)
 
 
 def _fail(message: str) -> None:
@@ -77,7 +85,12 @@ def sync(
         _fail(safe_error(exc))
     try:
         if all_packages:
-            batch = sync_all(out, include_original=original, lock=lock)
+            batch = sync_all(
+                out,
+                include_original=original,
+                lock=lock,
+                expected_connection_fingerprint=connection_fingerprint(config),
+            )
             for name in batch.legacy:
                 console.print(f"[yellow]再生成が必要:[/yellow] {name}")
             for item in batch.items:
@@ -103,6 +116,7 @@ def sync(
             resolution="safe_name",
             include_original=original,
             lock=lock,
+            expected_connection_fingerprint=connection_fingerprint(config),
         )
     except typer.Exit:
         raise
@@ -171,7 +185,11 @@ def delete_command(
                 return
             console.print("Bunri Pocket の棚から削除する曲を選択してください。")
             for index, track in enumerate(tracks, 1):
-                console.print(f"  {index}. {track.title} — {track.song_id}")
+                console.print(
+                    f"  {index}. {_safe_display(track.title)} — {track.song_id}",
+                    markup=False,
+                    highlight=False,
+                )
             choice = typer.prompt("番号", type=int)
             if choice < 1 or choice > len(tracks):
                 _fail("選択した番号が範囲外です。")
@@ -187,9 +205,17 @@ def delete_command(
 
     console.print("Bunri Pocket の棚から次の曲を削除します。")
     if target.title:
-        console.print(f"  曲名: {target.title}")
+        console.print(
+            f"  曲名: {_safe_display(target.title)}",
+            markup=False,
+            highlight=False,
+        )
     if target.safe_name:
-        console.print(f"  safe name: {target.safe_name}")
+        console.print(
+            f"  safe name: {_safe_display(target.safe_name)}",
+            markup=False,
+            highlight=False,
+        )
     console.print(f"  song ID: {target.song_id}")
     if not yes:
         if not _stdin_is_tty():

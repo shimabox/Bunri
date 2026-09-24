@@ -27,6 +27,26 @@ from bunri.web.app import create_app
 from bunri.web.jobs import safe_filename
 
 
+def test_pocket_sync_template_binds_requests_and_refreshes_changed_connection():
+    template = Path("src/bunri/web/templates/index.html.j2").read_text(encoding="utf-8")
+
+    assert re.search(
+        r'function postPocket\(url\).*?pocket_fingerprint="\s*'
+        r'\+ encodeURIComponent\(pocketConnectionFingerprint\).*?fetch\(requestUrl',
+        template,
+        re.DOTALL,
+    )
+    assert re.search(
+        r'pocketConnectionFingerprint !== null\s*'
+        r'&& body\.connection_fingerprint !== pocketConnectionFingerprint.*?'
+        r'if \(connectionChanged\) \{\s*'
+        r'pocketStatuses = Object\.create\(null\);\s*refreshPocketStatus\(\);',
+        template,
+        re.DOTALL,
+    )
+    assert "Pocket の接続先を確認できません。状態を再読込してください。" in template
+
+
 class PageFakeRunner:
     def __init__(self, *, write_player: bool = True, returncode: int = 0, delay: float = 0.1) -> None:
         self.write_player = write_player
@@ -148,6 +168,10 @@ def _write_pocket_all_record(
     error: str | None,
     progress: dict[str, Any],
 ) -> None:
+    from bunri.pocket.config import connection_fingerprint, read_config
+
+    config = read_config(out_dir)
+    assert config is not None
     jobs_dir = out_dir / "web" / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
     finished_at = None if status in ("queued", "running") else "2026-09-05T00:00:02+00:00"
@@ -159,6 +183,7 @@ def _write_pocket_all_record(
         "started_at": "2026-09-05T00:00:01+00:00" if status != "queued" else None,
         "finished_at": finished_at,
         "error": error,
+        "pocket_connection_fingerprint": connection_fingerprint(config),
         "progress": progress,
         "result": None,
     }), encoding="utf-8")
@@ -500,7 +525,7 @@ def test_pocket_error_job_renders_failure_badge_and_safe_message(tmp_path, monke
         TargetMetadata,
         write_package_metadata,
     )
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
 
     out_dir = tmp_path / "out"
     jobs_dir = out_dir / "web" / "jobs"
@@ -534,6 +559,8 @@ def test_pocket_error_job_renders_failure_badge_and_safe_message(tmp_path, monke
         "upload": "web/uploads/song.mp3",
     }), encoding="utf-8")
     safe_message = "Pocket の同期に失敗しました。後で再実行してください。"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    config = PocketConfig("https://example.invalid", token)
     (jobs_dir / "j-pocket.json").write_text(json.dumps({
         "id": "j-pocket",
         "kind": "pocket_single",
@@ -545,11 +572,11 @@ def test_pocket_error_job_renders_failure_badge_and_safe_message(tmp_path, monke
         "pocket_song_id": digest[:12],
         "pocket_digest": digest,
         "pocket_safe_name": "Song",
+        "pocket_connection_fingerprint": connection_fingerprint(config),
         "progress": None,
         "result": None,
     }), encoding="utf-8")
-    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
-    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    save_config(out_dir, config)
 
     class OfflineShelf:
         def __init__(self, *_args, **_kwargs):
@@ -1011,7 +1038,12 @@ def test_separation_completion_refreshes_pocket_status_for_new_song(tmp_path):
 def test_single_pocket_upload_button_recovers_after_409(tmp_path):
     import base64
 
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import (
+        PocketConfig,
+        connection_fingerprint,
+        read_config,
+        save_config,
+    )
     from bunri.web.jobs import song_id
 
     out_dir = tmp_path / "out"
@@ -1042,6 +1074,7 @@ def test_single_pocket_upload_button_recovers_after_409(tmp_path):
             content_type="application/json",
             body=json.dumps({
                 "connected": True,
+                "connection_fingerprint": connection_fingerprint(read_config(out_dir)),
                 "target_count": 1,
                 "package_count": 1,
                 "songs": [{
@@ -1909,11 +1942,12 @@ def test_successful_delete_closes_dialog_updates_empty_state_and_focus(tmp_path)
 def test_local_only_delete_refreshes_remote_only_tracks(tmp_path):
     import base64
 
-    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
 
     out_dir = tmp_path / "out"
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
-    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    config = PocketConfig("https://example.invalid", token)
+    save_config(out_dir, config)
     status_state = {"calls": 0, "web_song_id": None}
     pocket_song_id = "a" * 12
 
@@ -1942,7 +1976,7 @@ def test_local_only_delete_refreshes_remote_only_tracks(tmp_path):
                 content_type="application/json",
                 body=json.dumps({
                     "connected": True,
-                    "connection_fingerprint": "a" * 64,
+                    "connection_fingerprint": connection_fingerprint(config),
                     "target_count": len(songs),
                     "package_count": len(songs),
                     "songs": songs,

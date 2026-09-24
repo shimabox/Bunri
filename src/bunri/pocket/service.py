@@ -485,6 +485,7 @@ def safe_error(exc: BaseException) -> str:
             "not_found": "同期する曲が見つかりません。",
             "conflict": "曲の identity が競合しているためアップロードできません。",
             "local": "ローカルパッケージを安全に同期できません。",
+            "connection_changed": "接続先が変更されたため同期を中止しました。状態を再読込して確認し直してください",
         }
         return messages.get(exc.kind, "Pocket の同期を開始できません。")
     if isinstance(exc, LocalPreflightError):
@@ -537,13 +538,22 @@ def sync_one(
     include_original: bool = True,
     lock: SyncLock | None = None,
     client: PocketHTTPClient | None = None,
+    expected_connection_fingerprint: str | None = None,
 ) -> SyncResult:
-    config = read_config(out_dir)
-    if config is None:
-        raise PocketServiceError("Pocket の接続設定がありません。", kind="not_connected")
     owned_lock = lock is None
     active_lock = lock or SyncLock(out_dir).acquire()
     try:
+        config = read_config(out_dir)
+        if config is None:
+            raise PocketServiceError("Pocket の接続設定がありません。", kind="not_connected")
+        if (
+            expected_connection_fingerprint is not None
+            and connection_fingerprint(config) != expected_connection_fingerprint
+        ):
+            raise PocketServiceError(
+                "接続先が変更されたため同期を中止しました。状態を再読込して確認し直してください",
+                kind="connection_changed",
+            )
         package = resolve_package(
             out_dir,
             selector,
@@ -565,13 +575,22 @@ def sync_all(
     lock: SyncLock | None = None,
     client: PocketHTTPClient | None = None,
     progress: Callable[[BatchResult, str | None], None] | None = None,
+    expected_connection_fingerprint: str | None = None,
 ) -> BatchResult:
-    config = read_config(out_dir)
-    if config is None:
-        raise PocketServiceError("Pocket の接続設定がありません。", kind="not_connected")
     owned_lock = lock is None
     active_lock = lock or SyncLock(out_dir).acquire()
     try:
+        config = read_config(out_dir)
+        if config is None:
+            raise PocketServiceError("Pocket の接続設定がありません。", kind="not_connected")
+        if (
+            expected_connection_fingerprint is not None
+            and connection_fingerprint(config) != expected_connection_fingerprint
+        ):
+            raise PocketServiceError(
+                "接続先が変更されたため同期を中止しました。状態を再読込して確認し直してください",
+                kind="connection_changed",
+            )
         found = inventory(out_dir, include_original=include_original)
         result = BatchResult(total=len(found.packages), legacy=list(found.legacy))
         result.items = [BatchItem(package.directory.name, "pending") for package in found.packages]
