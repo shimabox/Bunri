@@ -246,7 +246,7 @@ def test_pocket_delete_song_id_with_yes_needs_no_local_package(tmp_path, monkeyp
     )
     assert result.exit_code == 0, result.output
     assert calls[0].song_id == "abcdef123456" and calls[0].safe_name is None
-    assert "棚から削除しました: abcdef123456" in _plain(result.output)
+    assert "音源ポケットから削除しました: abcdef123456" in _plain(result.output)
 
 
 def test_pocket_delete_stops_when_connection_changes_after_confirmation(tmp_path, monkeypatch):

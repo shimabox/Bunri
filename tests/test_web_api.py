@@ -1884,7 +1884,7 @@ def test_pocket_status_distinguishes_library_failure_from_an_empty_shelf(
     assert "state" not in empty
     assert empty["remote_only"] == []
     assert unknown["state"] == "unknown"
-    assert unknown["message"] == "棚の状態を確認できません。"
+    assert unknown["message"] == "音源ポケットの状態を確認できません。"
     assert unknown["remote_only"] == []
     assert "private remote detail" not in str(unknown)
 

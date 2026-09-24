@@ -35,8 +35,8 @@ def _schema_major(value: object) -> str:
 def _unsupported_schema_message(remote_major: object, stage: str | None) -> str:
     progress = "アップロードは開始していません。" if stage is None else f"{stage} の更新段階でアップロードを中断しました。"
     return (
-        f"棚のデータ形式(schema major {remote_major})にこの Bunri は対応していません(対応: major 1)。{progress}\n"
-        "Bunri または棚(bunri-pocket)を新しいバージョンに更新してから再実行してください。"
+        f"音源ポケットのデータ形式(schema major {remote_major})にこの Bunri は対応していません(対応: major 1)。{progress}\n"
+        "Bunri または Bunri Pocket を新しいバージョンに更新してから再実行してください。"
     )
 
 
@@ -77,7 +77,7 @@ def _library(client: PocketHTTPClient, stage: str | None = None) -> JSONDocument
 
 
 def _payload_too_large(kind: str, name: str, size: int, limit: int) -> SyncError:
-    return SyncError(f"送信するデータが棚の上限を超えています: {kind} {name}({size} バイト、上限 {limit} バイト)。アップロードは中断しました。")
+    return SyncError(f"送信するデータが音源ポケットの上限を超えています: {kind} {name}({size} バイト、上限 {limit} バイト)。アップロードは中断しました。")
 
 
 def synchronize(package: LocalPackage, client: PocketHTTPClient, *, include_original: bool = True, clock: Callable[[], str] | None = None) -> SyncResult:

@@ -472,7 +472,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
         """Which Pocket synchronization the page should be following.
 
         Deliberately reads only local connection state and job records: the
-        remote shelf inspection behind /api/pocket/status can take one
+        remote Pocket inspection behind /api/pocket/status can take one
         timeout per song when Pocket is unreachable, and a page that had to
         wait for it would leave a running batch untracked -- no progress, no
         polling -- for that whole time after every reload.
@@ -580,7 +580,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
             "remote_only": remote_only,
         }
         if library_error:
-            response.update(state="unknown", message="棚の状態を確認できません。")
+            response.update(state="unknown", message="音源ポケットの状態を確認できません。")
         return response
 
     def _pocket_config_or_409():

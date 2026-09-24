@@ -297,7 +297,7 @@ def inspect_remote(package: LocalPackage, client: PocketHTTPClient) -> RemoteSta
                 return RemoteStatus(
                     "different",
                     False,
-                    "棚の状態に不整合があるためアップロードできません。",
+                    "音源ポケットの状態に不整合があるためアップロードできません。",
                 )
             return RemoteStatus("not_synced", True)
         if manifest_doc.value["source"]["digest"] != package.metadata.source.digest:
@@ -320,7 +320,7 @@ def inspect_remote(package: LocalPackage, client: PocketHTTPClient) -> RemoteSta
             return RemoteStatus("synced", True)
         return RemoteStatus("different", True)
     except (OSError, PocketHTTPError, ProtocolError, SyncError, ValueError):
-        return RemoteStatus("unknown", False, "棚の状態を確認できません。")
+        return RemoteStatus("unknown", False, "音源ポケットの状態を確認できません。")
 
 
 def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageStatus, ...]:
@@ -390,7 +390,7 @@ def list_library_tracks(
     *,
     client: PocketHTTPClient | None = None,
 ) -> tuple[LibraryTrack, ...]:
-    """Return the validated shelf library in its current display order."""
+    """Return the validated Pocket library in its current display order."""
     config = read_config(out_dir)
     if config is None:
         raise PocketServiceError("Pocket の接続設定がありません。", kind="not_connected")
@@ -398,7 +398,7 @@ def list_library_tracks(
     try:
         document = _library(remote)
     except ProtocolError as exc:
-        raise PocketServiceError("棚の library が破損しています。", kind="remote_invalid") from exc
+        raise PocketServiceError("音源ポケットの library が破損しています。", kind="remote_invalid") from exc
     if document is None:
         return ()
     return tuple(
@@ -426,7 +426,7 @@ def delete_track(
     lock: SyncLock | None = None,
     client: PocketHTTPClient | None = None,
 ) -> DeleteResult:
-    """Delete one shelf track while holding the shared Pocket mutation lock."""
+    """Delete one Pocket track while holding the shared Pocket mutation lock."""
     if not re.fullmatch(r"[0-9a-f]{12}", target.song_id):
         raise PocketServiceError("song ID が不正です。", kind="invalid_song_id")
     owned_lock = lock is None
@@ -453,7 +453,7 @@ def delete_track(
             raise
         except (TimeoutError, OSError) as exc:
             raise PocketServiceError(
-                "棚からの削除を確認できませんでした。",
+                "音源ポケットからの削除を確認できませんでした。",
                 kind="delete_unknown",
             ) from exc
         return DeleteResult(target.song_id)
@@ -477,7 +477,7 @@ def safe_error(exc: BaseException) -> str:
     if isinstance(exc, SyncError):
         if str(exc).startswith(("DIGEST_COLLISION:", "RACE_DIGEST_COLLISION:")):
             return "同じ song ID に別の入力音源があるため同期できません。"
-        return "Pocket の同期に失敗しました。棚の状態を確認して再実行してください。"
+        return "Pocket の同期に失敗しました。音源ポケットの状態を確認して再実行してください。"
     if isinstance(exc, PocketServiceError):
         messages = {
             "not_connected": "Pocket の接続設定がありません。",
@@ -494,7 +494,7 @@ def safe_error(exc: BaseException) -> str:
 
 
 def safe_delete_error(exc: BaseException) -> str:
-    """Return a secret-free error message for a shelf deletion."""
+    """Return a secret-free error message for a Pocket deletion."""
     if isinstance(exc, SyncLockBusy):
         return "別の Pocket 操作が実行中です。完了後に再実行してください。"
     if isinstance(exc, PocketHTTPError):
@@ -502,9 +502,9 @@ def safe_delete_error(exc: BaseException) -> str:
             401: "Pocket の認証に失敗しました。接続設定を更新してください。",
             409: "Pocket と Bunri のデータ形式に互換性がありません。",
             413: "送信するデータが Pocket の上限を超えています。",
-            422: "棚の library が破損しています。棚の内容は変更されていません。",
+            422: "音源ポケットの library が破損しています。音源ポケットの内容は変更されていません。",
             404: "Pocket の接続先または protocol を確認してください。",
-            503: "棚からの削除を確認できませんでした。同じ song ID で再実行できます。",
+            503: "音源ポケットからの削除を確認できませんでした。同じ song ID で再実行できます。",
         }
         if exc.status == 429:
             return "Pocket が要求を制限しました。後で再実行してください。" + (
@@ -518,9 +518,9 @@ def safe_delete_error(exc: BaseException) -> str:
             "not_found": "削除する曲が見つかりません。",
             "conflict": "曲の identity が競合しているため削除できません。",
             "local": "ローカルパッケージを安全に確認できません。",
-            "remote_invalid": "棚の library が破損しています。棚の内容は変更されていません。",
+            "remote_invalid": "音源ポケットの library が破損しています。音源ポケットの内容は変更されていません。",
             "invalid_song_id": "song ID は小文字16進12桁で指定してください。",
-            "delete_unknown": "棚からの削除を確認できませんでした。同じ song ID で再実行できます。",
+            "delete_unknown": "音源ポケットからの削除を確認できませんでした。同じ song ID で再実行できます。",
             "connection_changed": "接続先が変更されたため削除を中止しました。対象を選び直してください",
         }
         return messages.get(exc.kind, "Pocket の削除を開始できません。")

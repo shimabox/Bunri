@@ -1,4 +1,4 @@
-"""Commands for connecting and managing a Bunri Pocket shelf."""
+"""Commands for connecting and managing a Bunri Pocket."""
 
 from __future__ import annotations
 
@@ -150,7 +150,7 @@ def delete_command(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the final confirmation"),
     output: Path = typer.Option(Path("out"), "--output", "-o", help="Output directory"),
 ) -> None:
-    """Delete one track from the Bunri Pocket shelf."""
+    """Delete one track from Bunri Pocket."""
     if sum((safe_name is not None, song_id is not None, select)) != 1:
         _fail("SAFE_NAME、--song-id、--select のいずれか1つだけを指定してください。")
     if yes and select:
@@ -181,9 +181,9 @@ def delete_command(
                 client=PocketHTTPClient(config.base_url, config.token),
             )
             if not tracks:
-                console.print("棚に削除できる曲はありません。")
+                console.print("音源ポケットに削除できる曲はありません。")
                 return
-            console.print("Bunri Pocket の棚から削除する曲を選択してください。")
+            console.print("Bunri Pocket から削除する曲を選択してください。")
             for index, track in enumerate(tracks, 1):
                 console.print(
                     f"  {index}. {_safe_display(track.title)} — {track.song_id}",
@@ -203,7 +203,7 @@ def delete_command(
             message += " --song-id または --select で対象を指定できます。"
         _fail(message)
 
-    console.print("Bunri Pocket の棚から次の曲を削除します。")
+    console.print("Bunri Pocket から次の曲を削除します。")
     if target.title:
         console.print(
             f"  曲名: {_safe_display(target.title)}",
@@ -239,4 +239,4 @@ def delete_command(
         _fail(safe_delete_error(exc))
     finally:
         mutation_lock.release()
-    console.print(f"棚から削除しました: {result.song_id}")
+    console.print(f"音源ポケットから削除しました: {result.song_id}")

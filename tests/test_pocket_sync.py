@@ -57,8 +57,8 @@ def test_remote_digest_collision_stops_before_media(tmp_path):
 
 def test_unsupported_remote_manifest_and_server_409_have_same_update_guidance(tmp_path):
     expected = (
-        "棚のデータ形式(schema major 2)にこの Bunri は対応していません(対応: major 1)。アップロードは開始していません。\n"
-        "Bunri または棚(bunri-pocket)を新しいバージョンに更新してから再実行してください。"
+        "音源ポケットのデータ形式(schema major 2)にこの Bunri は対応していません(対応: major 1)。アップロードは開始していません。\n"
+        "Bunri または Bunri Pocket を新しいバージョンに更新してから再実行してください。"
     )
     manifest = {
         "schema_version": "2.0", "song_id": "a" * 12, "title": "Song",
@@ -91,7 +91,7 @@ def test_media_413_names_asset_size_and_limit(tmp_path):
 
     with pytest.raises(SyncError) as error:
         synchronize(package(tmp_path), TooLargeMediaClient())
-    assert str(error.value) == "送信するデータが棚の上限を超えています: media guitar.backing.mp3(18 バイト、上限 94371840 バイト)。アップロードは中断しました。"
+    assert str(error.value) == "送信するデータが音源ポケットの上限を超えています: media guitar.backing.mp3(18 バイト、上限 94371840 バイト)。アップロードは中断しました。"
     assert "secret" not in str(error.value)
 
 
@@ -104,7 +104,7 @@ def test_json_413_names_document_size_and_limit(tmp_path):
 
     with pytest.raises(SyncError) as error:
         synchronize(package(tmp_path), TooLargeJSONClient(), clock=lambda: "2026-08-30T00:00:00Z")
-    assert str(error.value) == "送信するデータが棚の上限を超えています: document manifest(741 バイト、上限 1048576 バイト)。アップロードは中断しました。"
+    assert str(error.value) == "送信するデータが音源ポケットの上限を超えています: document manifest(741 バイト、上限 1048576 バイト)。アップロードは中断しました。"
     assert "secret" not in str(error.value)
 
 

@@ -201,7 +201,7 @@ def test_pocket_delete_local_failure_records_partial_success(tmp_path, monkeypat
         wait_for(lambda: store.get_job(job.id).status == "error")
         failed = store.get_job(job.id)
         assert failed.result == {"pocket_deleted": True, "local_deleted": False}
-        assert "棚からは削除済み" in failed.error
+        assert "音源ポケットからは削除済み" in failed.error
         assert "private path" not in failed.error
     finally:
         store.shutdown()

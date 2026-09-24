@@ -1,1 +1,1 @@
-"""Opt-in client for a user-owned Bunri Pocket shelf."""
+"""Opt-in client for a user-owned Bunri Pocket."""
