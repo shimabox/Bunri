@@ -336,7 +336,7 @@ def test_remote_status_rejects_library_entry_without_manifest(tmp_path):
     status = inspect_remote(package, Client())
     assert status.state == "different"
     assert status.can_sync is False
-    assert status.message == "棚の状態に不整合があるためアップロードできません。"
+    assert status.message == "音源ポケットの状態に不整合があるためアップロードできません。"
 
 
 def test_batch_validates_every_local_package_before_first_http_call(tmp_path):

@@ -1,12 +1,12 @@
 # Bunri
 
-Bunri (分離, "separation") extracts a single instrument stem (guitar by default; bass, drums, vocals, piano also supported) from a song and builds a practice package: the instrument alone, the backing track without it, the original, and an offline HTML player with A-B loop and pitch-preserving slow-down. Separation is completed locally, and the input audio is never sent as-is. Only an explicit Pocket upload sends the separated MP3 files and, by default, an MP3 re-encoded from the original song to Bunri Pocket storage owned by the user. The CLI can omit the original with `--no-original`; the Web UI always includes it. Uploaded MP3 files do not inherit input tags and contain only the song title as their title tag, while the shelf manifest uses the input file's SHA-1 digest as an identifier. Documentation is in Japanese.
+Bunri (分離, "separation") extracts a single instrument stem (guitar by default; bass, drums, vocals, piano also supported) from a song and builds a practice package: the instrument alone, the backing track without it, the original, and an offline HTML player with A-B loop and pitch-preserving slow-down. Separation is completed locally, and the input audio is never sent as-is. Only an explicit Pocket upload sends the separated MP3 files and, by default, an MP3 re-encoded from the original song to Bunri Pocket storage owned by the user. The CLI can omit the original with `--no-original`; the Web UI always includes it. Uploaded MP3 files do not inherit input tags and contain only the song title as their title tag, while the Pocket manifest uses the input file's SHA-1 digest as an identifier. Documentation is in Japanese.
 
 | アップロード | 曲一覧 | 練習プレイヤー |
 |---|---|---|
 | ![アップロード](docs/images/upload.png) | ![曲一覧](docs/images/web-ui.png) | ![練習プレイヤー](docs/images/player.png) |
 
-音源から特定の楽器パート(まずはギター)の stem を抽出し、練習用パッケージ(その楽器だけ / その楽器を抜いた伴奏 / 原曲 + オフラインで再生できる HTML プレイヤー)を生成するツールです。分離処理はお使いのマシン内で完結し、入力音源がそのまま外部へ送信されることはありません。利用者が CLI の `bunri pocket` または Web UI のアップロード操作を明示的に実行した場合だけ、分離後の MP3 と、既定では原曲を再エンコードした MP3 が、利用者自身の Pocket storage へ送信されます。CLI は `--no-original` で原曲 MP3 を除外でき、Web UI は常に原曲 MP3 を含めます。送信 MP3 は入力ファイルのタグを引き継がず、曲名だけを title に書きますが、棚の manifest には識別子として入力ファイルの SHA-1 が入ります。Web UI も localhost 内だけで動作します。
+音源から特定の楽器パート(まずはギター)の stem を抽出し、練習用パッケージ(その楽器だけ / その楽器を抜いた伴奏 / 原曲 + オフラインで再生できる HTML プレイヤー)を生成するツールです。分離処理はお使いのマシン内で完結し、入力音源がそのまま外部へ送信されることはありません。利用者が CLI の `bunri pocket` または Web UI のアップロード操作を明示的に実行した場合だけ、分離後の MP3 と、既定では原曲を再エンコードした MP3 が、利用者自身の Pocket storage へ送信されます。CLI は `--no-original` で原曲 MP3 を除外でき、Web UI は常に原曲 MP3 を含めます。送信 MP3 は入力ファイルのタグを引き継がず、曲名だけを title に書きますが、音源ポケットの manifest には識別子として入力ファイルの SHA-1 が入ります。Web UI も localhost 内だけで動作します。
 
 ## クイックスタート
 
@@ -82,7 +82,7 @@ uv run bunri-web
 - 曲一覧には Web から登録した曲に加え、同じ出力先へ CLI で生成した検証済みパッケージも表示されます。1曲ごとに楽器別の「待機中 / 処理中(経過時間)/ 完了 / 失敗 / ファイル欠損」が表示され、実在する成果物だけにプレイヤーとダウンロードのリンクが表示されます
 - 完了した楽器の「ダウンロード」欄から、「楽器のみ」と「楽器なし」(その楽器を抜いた伴奏)を mp3 / wav で保存できます。ファイル名は「曲名_ギターのみ.mp3」のように分かりやすく、スマホに入れて聴いたり DAW に読み込んだりできます
 - 同じ音源(内容が同一)を再アップロードすると、CLI 生成分を含む既存の曲フォルダへ楽器が追加されます。同じ楽器が完了済みなら再分離せず既存の結果を再利用します
-- 曲を開いて「この曲を削除」を選ぶと、CLI 生成パッケージも含め、その曲の練習パッケージ、全ジョブ履歴とログ、ほかの曲と共有していないアップロード元とキャッシュをまとめて削除できます。Pocket 接続中は、確認画面で「Bunri Pocket の棚からも削除する」を明示的に選べます。この場合は棚の削除成功を確認してからローカルデータを削除します。待機中または処理中のジョブを含む曲は削除できません。削除は取り消せないため、確認画面の内容を確認してから実行してください
+- 曲を開いて「この曲を削除」を選ぶと、CLI 生成パッケージも含め、その曲の練習パッケージ、全ジョブ履歴とログ、ほかの曲と共有していないアップロード元とキャッシュをまとめて削除できます。Pocket 接続中は、確認画面で「Bunri Pocket からも削除する」を明示的に選べます。この場合は音源ポケットからの削除成功を確認してからローカルデータを削除します。待機中または処理中のジョブを含む曲は削除できません。削除は取り消せないため、確認画面の内容を確認してから実行してください
 - 身元ファイルが無い旧形式や身元を安全に確認できないフォルダは、曲カードにせず「再生成が必要なパッケージ」へ名前だけを表示します。同じ音源のフォルダが複数ある場合や、NFC 正規化後に同名となるフォルダがある場合は競合として表示し、削除・再アップロード・Pocket 同期を停止します
 
 ### 主なオプション
@@ -93,7 +93,7 @@ bunri-web -o path/to/out    # 出力先ディレクトリ(既定: out。bunri CL
 bunri-web --no-open         # 起動時のブラウザ自動オープンを無効化
 ```
 
-同じ出力先で Bunri Pocket に接続済みの場合、Web UI に「Bunri Pocket 連携中」と表示されます。曲ごとの `棚にある` / `未同期` / `差分あり` の確認と個別アップロード、出力先の全パッケージを対象にした全曲アップロードを利用できます。CLI 生成パッケージも Web の曲一覧と同期対象の両方に含まれます。棚にだけ残っている曲は、ローカル曲と分けた読み取り専用の「棚にのみある曲」一覧に表示されます。棚のみの曲を削除する場合は CLI の `--select` または `--song-id` を使います。接続先 URL や upload token は画面や API には表示されません。
+同じ出力先で Bunri Pocket に接続済みの場合、Web UI に「Bunri Pocket 連携中」と表示されます。曲ごとの `ポケットにある` / `未同期` / `差分あり` の確認と個別アップロード、出力先の全パッケージを対象にした全曲アップロードを利用できます。CLI 生成パッケージも Web の曲一覧と同期対象の両方に含まれます。音源ポケットにだけ残っている曲は、ローカル曲と分けた読み取り専用の「音源ポケットにのみある曲」一覧に表示されます。音源ポケットにのみある曲を削除する場合は CLI の `--select` または `--song-id` を使います。接続先 URL や upload token は画面や API には表示されません。
 
 ### できあがるファイル(ギターの場合)
 
@@ -179,13 +179,13 @@ bunri pocket delete --song-id abcdef123456 -o out
 bunri pocket delete --select -o out
 ```
 
-`sync` の曲名は表示名の検索語ではなく、`out/` 直下の directory 名です。棚の manifest では入力ファイルの SHA-1 を曲の識別子に使いますが、送信する MP3 は入力ファイルのタグを引き継がず、曲名だけを title に書きます。`--no-original` は今回 original MP3 を新しく送らない指定であり、Pocket にある original を削除しません。Web UI のアップロードは常に original MP3 を含みます。upload token は `out/.pocket/config.json` に平文で保存され、接続先ごとに `-o` で分かれます。Pocket の https 接続は環境変数 `https_proxy` と `no_proxy` に従います。http 接続は loopback に限定して常に直接接続し、`http_proxy` は使いません。接続情報を消すには対象の `out/.pocket` を削除してください。
+`sync` の曲名は表示名の検索語ではなく、`out/` 直下の directory 名です。音源ポケットの manifest では入力ファイルの SHA-1 を曲の識別子に使いますが、送信する MP3 は入力ファイルのタグを引き継がず、曲名だけを title に書きます。`--no-original` は今回 original MP3 を新しく送らない指定であり、Pocket にある original を削除しません。Web UI のアップロードは常に original MP3 を含みます。upload token は `out/.pocket/config.json` に平文で保存され、接続先ごとに `-o` で分かれます。Pocket の https 接続は環境変数 `https_proxy` と `no_proxy` に従います。http 接続は loopback に限定して常に直接接続し、`http_proxy` は使いません。接続情報を消すには対象の `out/.pocket` を削除してください。
 
 `.bunri-package.json` のない旧パッケージは同期せず「再生成が必要」と表示します。元の入力ファイルを指定して `bunri <入力ファイル>` を再実行すると MP3 を再出力でき、`out/.cache/` に同じ入力と target のキャッシュが残っていれば分離処理は省略されます。一括同期では旧パッケージをすべて報告し、それ以外の有効なパッケージの同期を続けます。
 
 `delete` は既定で最終確認を行います。自動化では対象が確定する safe name または `--song-id` と `--yes` を併用できますが、対話選択が必要な `--select` と `--yes` は併用できません。503、timeout、応答喪失などで削除完了を確認できない場合は、同じ song ID の削除を再実行すると安全に収束します。
 
-同じ出力先への Pocket 同期と削除は、CLI と Web で共通の Pocket mutation lock を使って1つずつ実行されます。別の操作が進行中の場合は待機せず拒否されます。途中で通信に失敗した一括同期はその曲で停止しますが、同期処理は冪等なので、問題を解消して同じ操作を再実行すると棚の状態へ収束します。棚から削除した曲がローカルに残っている場合は `未同期` と表示され、通常の `bunri pocket sync SAFE_NAME` または Web のアップロード操作で正式に棚へ復元できます。
+同じ出力先への Pocket 同期と削除は、CLI と Web で共通の Pocket mutation lock を使って1つずつ実行されます。別の操作が進行中の場合は待機せず拒否されます。途中で通信に失敗した一括同期はその曲で停止しますが、同期処理は冪等なので、問題を解消して同じ操作を再実行すると音源ポケットの状態へ収束します。音源ポケットから削除した曲がローカルに残っている場合は `未同期` と表示され、通常の `bunri pocket sync SAFE_NAME` または Web のアップロード操作で正式に音源ポケットへ復元できます。
 
 既存の分離 input に bare file 名 `pocket` を使う場合は、Pocket command と区別するため `bunri ./pocket` と指定してください。
 

@@ -2698,7 +2698,7 @@ class JobStore:
                 except Exception:
                     with self._lock:
                         job.status = "error"
-                        job.error = "棚からは削除済みですが、ローカルデータを削除できませんでした。ローカル削除を再実行してください。"
+                        job.error = "音源ポケットからは削除済みですが、ローカルデータを削除できませんでした。ローカル削除を再実行してください。"
                         job.finished_at = _now_iso()
                         self._write_job(job)
                     return
@@ -2785,7 +2785,7 @@ class JobStore:
                         )
                         if uncertain:
                             job.error = (
-                                "棚からの削除を確認できませんでした。ローカルデータは削除していません。"
+                                "音源ポケットからの削除を確認できませんでした。ローカルデータは削除していません。"
                                 "同じ操作を再実行できます。"
                             )
                         else:

@@ -210,7 +210,7 @@ def test_remote_only_tracks_render_as_read_only_text(tmp_path):
             page.wait_for_selector("#sw-remote-only:not([hidden])")
             item = page.locator(".sw-remote-only-item")
             assert item.locator("span").first.text_content() == "<b>Remote</b>"
-            assert item.locator(".sw-badge").text_content() == "棚のみ"
+            assert item.locator(".sw-badge").text_content() == "ポケットのみ"
             assert item.locator("button").count() == 0
             assert item.locator("b").count() == 0
 
@@ -278,7 +278,7 @@ def test_remote_only_tracks_survive_unknown_shelf_status(tmp_path):
         {
             "connected": True,
             "state": "unknown",
-            "message": "棚の状態を確認できません。",
+            "message": "音源ポケットの状態を確認できません。",
             "package_count": 0,
             "target_count": 0,
             "songs": [],
@@ -314,11 +314,11 @@ def test_remote_only_tracks_survive_unknown_shelf_status(tmp_path):
         page.wait_for_selector("#sw-remote-only-error:not([hidden])")
 
         assert page.locator("#sw-remote-only-error").text_content() == (
-            "棚の状態を確認できません。"
+            "音源ポケットの状態を確認できません。"
         )
         count = page.locator("#sw-pocket-count")
         assert re.fullmatch(
-            r"棚の状態を確認できません。 · \d{2}:\d{2}",
+            r"音源ポケットの状態を確認できません。 · \d{2}:\d{2}",
             count.text_content(),
         )
         assert "is-error" in count.get_attribute("class").split()
@@ -472,7 +472,7 @@ def test_separation_upload_shows_safe_message_for_pending_delete_409(tmp_path):
         )
 
         assert page.locator("#sw-upload-error").text_content() == (
-            "この曲は棚から削除中です。完了後に再度お試しください。"
+            "この曲は音源ポケットから削除中です。完了後に再度お試しください。"
         )
 
 
@@ -644,7 +644,7 @@ def test_pocket_connection_and_checking_render_before_status_responds(tmp_path):
         assert refresh.locator(".sw-refresh-spinner").count() == 1
         count = page.locator("#sw-pocket-count")
         first_count = count.text_content()
-        assert re.fullmatch(r"棚の状態を確認しています… \(\d+:\d{2}\)", first_count)
+        assert re.fullmatch(r"音源ポケットの状態を確認しています… \(\d+:\d{2}\)", first_count)
         page.wait_for_function(
             "previous => document.getElementById('sw-pocket-count').textContent !== previous",
             arg=first_count,
@@ -710,7 +710,7 @@ def test_pocket_status_failure_shows_error_and_restores_button(tmp_path, failure
             "document.getElementById('sw-pocket-count').classList.contains('is-error')"
         )
         assert re.fullmatch(
-            r"棚の状態を確認できません。 · \d{2}:\d{2}",
+            r"音源ポケットの状態を確認できません。 · \d{2}:\d{2}",
             count.text_content(),
         )
         assert "is-error" in count.get_attribute("class").split()
@@ -2002,7 +2002,7 @@ def test_local_only_delete_refreshes_remote_only_tracks(tmp_path):
         status_state["web_song_id"] = page.evaluate("window.__bunriWeb.getSongs()[0].id")
         page.wait_for_function(
             "window.__bunriWeb.getJobs()[0].status === 'done' && "
-            "document.querySelector('.sw-pocket-row .sw-badge').textContent === '棚にある'",
+            "document.querySelector('.sw-pocket-row .sw-badge').textContent === 'ポケットにある'",
             timeout=10_000,
         )
         assert status_state["calls"] == 2
@@ -2087,7 +2087,7 @@ def test_pocket_delete_uses_connection_fingerprint_captured_by_dialog(tmp_path):
         status_state["web_song_id"] = page.evaluate("window.__bunriWeb.getSongs()[0].id")
         page.wait_for_function(
             "window.__bunriWeb.getJobs()[0].status === 'done' && "
-            "document.querySelector('.sw-pocket-row .sw-badge').textContent === '棚にある'",
+            "document.querySelector('.sw-pocket-row .sw-badge').textContent === 'ポケットにある'",
             timeout=10_000,
         )
 

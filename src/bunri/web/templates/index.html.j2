@@ -517,7 +517,7 @@
     </section>
     <p id="sw-remote-only-error" class="sw-upload-error" role="status" aria-live="polite" hidden></p>
     <section id="sw-remote-only" class="sw-remote-only" aria-labelledby="sw-remote-only-title" hidden>
-      <h3 id="sw-remote-only-title">棚にのみある曲</h3>
+      <h3 id="sw-remote-only-title">音源ポケットにのみある曲</h3>
       <p class="sw-pocket-note">読み取り専用です。削除するには CLI の --select または --song-id を使ってください。</p>
       <ul id="sw-remote-only-list" class="sw-remote-only-list"></ul>
     </section>
@@ -533,12 +533,12 @@
       <li>練習パッケージ</li>
       <li>この曲の全ジョブ履歴とログ</li>
       <li>ほかの曲と共有していないアップロード元とキャッシュ</li>
-      <li id="sw-delete-pocket-summary" hidden>棚の library、manifest、media</li>
+      <li id="sw-delete-pocket-summary" hidden>音源ポケットの library、manifest、media</li>
     </ul>
     <label id="sw-delete-pocket-option" hidden>
-      <input type="checkbox" id="sw-delete-pocket"> Bunri Pocket の棚からも削除する
+      <input type="checkbox" id="sw-delete-pocket"> Bunri Pocket からも削除する
     </label>
-    <p id="sw-delete-pocket-note" class="sw-pocket-note" hidden>棚削除の確認後にローカルデータを削除します。</p>
+    <p id="sw-delete-pocket-note" class="sw-pocket-note" hidden>音源ポケットからの削除を確認してからローカルデータを削除します。</p>
     <p class="sw-delete-warning">この操作は取り消せません。</p>
     <div class="sw-delete-actions">
       <button type="button" id="sw-delete-cancel" class="sw-btn">キャンセル</button>
@@ -709,7 +709,7 @@
         if (!res.ok) {
           return res.json().catch(function () { return {}; }).then(function (body) {
             if (res.status === 409) {
-              throw new Error("この曲は棚から削除中です。完了後に再度お試しください。");
+              throw new Error("この曲は音源ポケットから削除中です。完了後に再度お試しください。");
             }
             throw new Error(body.detail || ("アップロードに失敗しました (" + res.status + ")"));
           });
@@ -785,7 +785,7 @@
     if (pocketChecking) return { text: "確認中", cls: "sw-badge-queued" };
     if (!status) return { text: "確認できません", cls: "sw-badge-error" };
     switch (status.state) {
-      case "synced": return { text: "棚にある", cls: "sw-badge-done" };
+      case "synced": return { text: "ポケットにある", cls: "sw-badge-done" };
       case "not_synced": return { text: "未同期", cls: "sw-badge-queued" };
       case "different": return { text: "差分あり", cls: "sw-badge-running" };
       case "legacy": return { text: "再生成が必要", cls: "sw-badge-error" };
@@ -828,7 +828,7 @@
       pocketCount.classList.remove("is-error");
     } else if (pocketChecking) {
       var elapsed = Math.floor((Date.now() - pocketStatusStartedAt) / 1000);
-      pocketCount.textContent = "棚の状態を確認しています… (" + fmtMMSS(elapsed) + ")";
+      pocketCount.textContent = "音源ポケットの状態を確認しています… (" + fmtMMSS(elapsed) + ")";
       pocketCount.classList.remove("is-error");
     } else {
       pocketCount.textContent = pocketCountText;
@@ -882,7 +882,7 @@
   }
 
   function renderPocketStatusFailure(message) {
-    pocketCountText = (message || "棚の状態を確認できません。") + " · " + localHHMM();
+    pocketCountText = (message || "音源ポケットの状態を確認できません。") + " · " + localHHMM();
     pocketCountIsError = true;
   }
 
@@ -1130,7 +1130,7 @@
         var pocketState = pocketBadge(pocketStatus, song.pocket_job);
         if (song.pocket_job && song.pocket_job.kind === "pocket_delete"
           && (song.pocket_job.status === "queued" || song.pocket_job.status === "running")) {
-          pocketState = { text: "棚から削除中", cls: "sw-badge-running" };
+          pocketState = { text: "ポケットから削除中", cls: "sw-badge-running" };
         }
         var pocketBadgeEl = document.createElement("span");
         pocketBadgeEl.className = "sw-badge " + pocketState.cls;
@@ -1395,7 +1395,7 @@
   }
 
   // Restores what the page should be following without touching the remote
-  // shelf: an unreachable Pocket must not delay a reload from picking a
+  // Pocket: an unreachable one must not delay a reload from picking a
   // running batch back up.
   function refreshPocketJob() {
     var generation = ++pocketJobGeneration;
@@ -1456,7 +1456,7 @@
           });
         }
         if (status.state === "unknown") {
-          remoteOnlyError.textContent = status.message || "棚の状態を確認できません。";
+          remoteOnlyError.textContent = status.message || "音源ポケットの状態を確認できません。";
           remoteOnlyError.hidden = false;
         } else {
           remoteOnlyError.textContent = "";
@@ -1475,7 +1475,7 @@
       })
       .catch(function () {
         if (generation !== pocketStatusGeneration) return;
-        remoteOnlyError.textContent = "棚の状態を確認できません。";
+        remoteOnlyError.textContent = "音源ポケットの状態を確認できません。";
         remoteOnlyError.hidden = false;
         renderRemoteOnly();
         renderPocketStatusFailure();
@@ -1504,7 +1504,7 @@
       id.textContent = track.song_id;
       var badge = document.createElement("span");
       badge.className = "sw-badge sw-badge-queued";
-      badge.textContent = "棚のみ";
+      badge.textContent = "ポケットのみ";
       item.appendChild(title);
       item.appendChild(id);
       item.appendChild(badge);
