@@ -8,6 +8,9 @@ Bunri has no downstream (transcription/tab) stages to sequence.
 add_pan_split() adds the L/R split to a package built before it existed,
 from the separated stem still in the cache, sharing the same cache stage and
 export steps as build_package().
+
+rewrite_players() writes an existing package's players again from the
+current template, from what the package's sidecar records.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from bunri.package_metadata import (
     read_package_metadata,
     set_target_pan_split,
 )
-from bunri.registry import TargetSpec, get_target
+from bunri.registry import REGISTRY, TargetSpec, get_target
 from bunri.safepath import (
     is_real_file_in,
     is_really,
@@ -237,8 +240,7 @@ def _export_pan_split(
 ) -> tuple[str | None, str | None, str | None]:
     """Publish a split into the package, or clear out a stale one.
 
-    Returns the player's (left, right, note): the two file names for a
-    split, or the reason text for a stem that has no split.
+    Returns the player's (left, right, note), see _pan_split_player_refs.
     """
     if decision.status != LEFT_RIGHT:
         # A package made by an earlier run can still hold L/R files that the
@@ -246,23 +248,33 @@ def _export_pan_split(
         # symlink sitting there is removed rather than followed.
         for name in _pan_split_names(safe, spec):
             (package_dir / name).unlink(missing_ok=True)
+    else:
+        for side, label in (("left", "L のみ"), ("right", "R のみ")):
+            src = cache_dir / f"{spec.target}.{side}.wav"
+            _export(src, package_dir / f"{safe}.{spec.target}.{side}.wav")
+            if mp3:
+                _export_mp3(
+                    src,
+                    package_dir / f"{safe}.{spec.target}.{side}.mp3",
+                    title=f"{song_title} ({spec.label_ja} {label})",
+                )
+    return _pan_split_player_refs(safe, spec, decision.status, mp3=mp3)
+
+
+def _pan_split_player_refs(
+    safe: str, spec: TargetSpec, status: str, *, mp3: bool
+) -> tuple[str | None, str | None, str | None]:
+    """The player's (left, right, note) for a split result: the two file
+    names for a split (the mp3s when they were written, else the wavs), or
+    the reason text for a stem that has no split."""
+    if status != LEFT_RIGHT:
         return None, None, PAN_SPLIT_SINGLE_NOTE
-    refs: list[str] = []
-    for side, label in (("left", "L のみ"), ("right", "R のみ")):
-        wav_name = f"{safe}.{spec.target}.{side}.wav"
-        src = cache_dir / f"{spec.target}.{side}.wav"
-        _export(src, package_dir / wav_name)
-        if mp3:
-            mp3_name = f"{safe}.{spec.target}.{side}.mp3"
-            _export_mp3(
-                src,
-                package_dir / mp3_name,
-                title=f"{song_title} ({spec.label_ja} {label})",
-            )
-            refs.append(mp3_name)
-        else:
-            refs.append(wav_name)
-    return refs[0], refs[1], None
+    audio_format = "mp3" if mp3 else "wav"
+    return (
+        f"{safe}.{spec.target}.left.{audio_format}",
+        f"{safe}.{spec.target}.right.{audio_format}",
+        None,
+    )
 
 
 def _player_refs(safe: str, spec: TargetSpec, mp3: bool) -> tuple[str | None, str, str]:
@@ -644,3 +656,51 @@ def add_pan_split(
     except ProcessLockBusy as exc:
         return PanSplitOutcome("failed", str(exc))
     return PanSplitOutcome("done", decision=decision)
+
+
+@dataclass(frozen=True)
+class PlayerRewriteOutcome:
+    status: Literal["done", "skipped", "legacy", "failed"]
+    reason: str | None = None
+    targets: tuple[TargetSpec, ...] = ()
+
+
+def rewrite_players(out_dir: Path, safe_name: str) -> PlayerRewriteOutcome:
+    """Write an existing package's players again from the current template.
+
+    Everything the player needs comes from the sidecar (title, formats and
+    the recorded L/R result per target), so no audio is read or written and
+    neither the sidecar nor the cache changes. Targets the registry does not
+    know are left alone.
+    """
+    identity = inspect_package_identity(out_dir, safe_name)
+    if identity.state == "legacy":
+        return PlayerRewriteOutcome("legacy", LEGACY_MESSAGE)
+    if identity.state != "ready" or identity.metadata is None:
+        reason = identity.issues[0] if identity.issues else "身元ファイルを読み取れません"
+        return PlayerRewriteOutcome("failed", reason)
+    metadata = identity.metadata
+    # File names follow the directory, as in add_pan_split.
+    safe = identity.name
+    written: list[TargetSpec] = []
+    for item in metadata.targets:
+        spec = REGISTRY.get(item.target)
+        if spec is None:
+            continue
+        mp3 = "mp3" in item.formats
+        # Same rule as build_package / add_pan_split: no recorded result (a
+        # package from before the split, or a target it does not apply to)
+        # means no L/R buttons at all.
+        left = right = note = None
+        if spec.pan_split and item.pan_split is not None:
+            left, right, note = _pan_split_player_refs(safe, spec, item.pan_split, mp3=mp3)
+        _write_player(
+            identity.directory, safe, spec, metadata.title,
+            mp3=mp3, left=left, right=right, note=note,
+        )
+        written.append(spec)
+    if not written:
+        return PlayerRewriteOutcome(
+            "skipped", "書き直せるプレイヤーがありません(分離ジョブの実行中の可能性)"
+        )
+    return PlayerRewriteOutcome("done", targets=tuple(written))

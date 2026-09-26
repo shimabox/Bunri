@@ -34,6 +34,11 @@ def dispatch() -> None:
 
         sys.argv = [sys.argv[0], *sys.argv[2:]]
         lr_split_app(prog_name="bunri lr-split")
+    elif len(sys.argv) > 1 and sys.argv[1] == "player":
+        from bunri.player_cli import app as player_app
+
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        player_app(prog_name="bunri player")
     else:
         app()
 
