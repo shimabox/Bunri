@@ -223,7 +223,7 @@ bunri pocket delete --select -o out
 
 同じ出力先への Pocket 同期と削除は、CLI と Web で共通の Pocket mutation lock を使って1つずつ実行されます。別の操作が進行中の場合は待機せず拒否されます。途中で通信に失敗した一括同期はその曲で停止しますが、同期処理は冪等なので、問題を解消して同じ操作を再実行すると音源ポケットの状態へ収束します。音源ポケットから削除した曲がローカルに残っている場合は `未同期` と表示され、通常の `bunri pocket sync SAFE_NAME` または Web のアップロード操作で正式に音源ポケットへ復元できます。
 
-既存の分離 input に bare file 名 `pocket` を使う場合は、Pocket command と区別するため `bunri ./pocket` と指定してください。
+分離する入力ファイルの名前がちょうど `pocket` / `lr-split` / `player` の場合は、サブコマンドと区別するため `bunri ./pocket` のように `./` を付けて指定してください。
 
 ## Docker で使う
 
