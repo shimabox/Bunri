@@ -320,16 +320,17 @@
     transform: rotate(180deg);
   }
   .sw-downloads {
-    display: flex;
+    display: grid;
+    grid-template-columns: repeat(2, max-content);
     align-items: center;
-    flex-wrap: wrap;
+    justify-content: start;
     gap: 8px;
     min-width: 0;
     padding: 8px 0 2px 5em;
   }
   .sw-downloads[hidden] { display: none; }
   .sw-download-group {
-    display: inline-flex;
+    display: flex;
     align-items: stretch;
     border: 1px solid #e6d9c4;
     border-radius: 999px;
@@ -338,6 +339,7 @@
   }
   .sw-download-label {
     display: inline-flex;
+    flex: 1 1 auto;
     align-items: center;
     padding: 5px 11px;
     background: #ece0cc;
@@ -364,7 +366,10 @@
   }
   a.sw-download-link:hover { background: #e9f5f2; }
   @media (max-width: 480px) {
-    .sw-downloads { padding-left: 0; }
+    .sw-downloads {
+      grid-template-columns: minmax(0, 1fr);
+      padding-left: 0;
+    }
   }
   details.sw-error-details {
     margin-top: 8px;

@@ -1643,6 +1643,77 @@ def test_download_toggle_focus_survives_partial_completion_polling_redraw(tmp_pa
 
 
 @_needs_browser
+def test_download_groups_form_two_aligned_columns_and_stack_on_narrow_screens(tmp_path):
+    app = create_app(tmp_path / "out", runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        _upload_from_page(page, tmp_path / "lr-song.mp3")
+        page.wait_for_selector("a.sw-open-link", timeout=10_000)
+
+        def with_left_right_tracks(route):
+            response = route.fetch()
+            songs = response.json()
+            for song in songs:
+                for target in song["targets"]:
+                    if not target["downloads"]:
+                        continue
+                    for track, label in (("left", "L のみ"), ("right", "R のみ")):
+                        target["downloads"].append({
+                            "track": track,
+                            "label": label,
+                            "files": [
+                                {
+                                    "format": audio_format,
+                                    "url": f"/packages/lr/lr.guitar.{track}.{audio_format}",
+                                    "filename": f"lr_{label}.{audio_format}",
+                                }
+                                for audio_format in ("mp3", "wav")
+                            ],
+                        })
+            route.fulfill(response=response, json=songs)
+
+        page.route("**/api/songs", with_left_right_tracks)
+        page.evaluate("window.__bunriWeb.refresh()")
+        groups = page.locator(".sw-download-group")
+        page.wait_for_function(
+            "document.querySelectorAll('.sw-download-group').length === 4",
+            timeout=5_000,
+        )
+        assert groups.locator(".sw-download-label").all_text_contents() == [
+            "ギターのみ", "ギターなし", "L のみ", "R のみ",
+        ]
+
+        page.locator("button.sw-download-toggle").click()
+        assert page.locator(".sw-downloads").is_visible()
+
+        def boxes():
+            return groups.evaluate_all(
+                "groups => groups.map(group => {"
+                "  const box = group.getBoundingClientRect();"
+                "  return { x: box.x, y: box.y, width: box.width };"
+                "})"
+            )
+
+        wide = boxes()
+        assert wide[0]["x"] == wide[2]["x"]
+        assert wide[1]["x"] == wide[3]["x"]
+        assert wide[0]["x"] < wide[1]["x"]
+        assert wide[0]["width"] == wide[2]["width"]
+        assert wide[1]["width"] == wide[3]["width"]
+        assert wide[0]["y"] == wide[1]["y"]
+        assert wide[2]["y"] == wide[3]["y"]
+        assert wide[0]["y"] < wide[2]["y"]
+
+        page.set_viewport_size({"width": 400, "height": 800})
+        narrow = boxes()
+        assert len({box["x"] for box in narrow}) == 1
+        assert [box["y"] for box in narrow] == sorted(box["y"] for box in narrow)
+        assert len({box["y"] for box in narrow}) == 4
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+        )
+
+
+@_needs_browser
 def test_dragover_highlights_dropzone(tmp_path):
     app = create_app(tmp_path / "out", runner=PageFakeRunner())
     with _running_server(app) as base_url, _open_page(base_url) as page:
