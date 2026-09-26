@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from bunri.local_package import (
     safe_package_name_issue,
 )
 from bunri.package_metadata import PackageMetadata, SourceIdentity
-from bunri.pocket.protocol import AssetInfo
+from bunri.pocket.protocol import STEM_SUFFIXES, AssetInfo
 from bunri.registry import REGISTRY
 
 
@@ -79,6 +80,7 @@ def preflight(
         raise LocalPreflightError(issues, identity=identity)
     if "package metadata targets must be an array" in identity_result.issues:
         raise LocalPreflightError(issues, identity=identity)
+    pan_splits = {item.target: item.pan_split for item in metadata.targets} if metadata is not None else {}
     requested: list[tuple[str, str | None, str | None]] = []
     if include_original: requested.append((f"{safe_name}.original.mp3", None, None))
     for target, formats in target_values:
@@ -87,7 +89,12 @@ def preflight(
         if "mp3" not in formats:
             issues.append(f"{target}: .bunri-package.json の formats に mp3 がありません")
         requested.extend(((f"{safe_name}.{target}.mp3", target, "target"), (f"{safe_name}.{target}.backing.mp3", target, "backing")))
+        # L/R files are collected whenever the sidecar records a split; sync
+        # decides per Pocket whether they are sent.
+        if pan_splits.get(target) == "left_right":
+            requested.extend(((f"{safe_name}.{target}.left.mp3", target, "left"), (f"{safe_name}.{target}.right.mp3", target, "right")))
     assets: list[LocalAsset] = []
+    missing_lr = False
     for filename, target, role in requested:
         path = package_dir / filename
         # Pocket transfers only these requested MP3 assets. Keep their
@@ -97,11 +104,17 @@ def preflight(
         if not artifact.present:
             assert artifact.issue is not None
             issues.append(f"{target or 'original'}: {artifact.issue}")
+            missing_lr = missing_lr or role in ("left", "right")
             continue
         size, checksum = artifact.size, artifact.sha256
         assert size is not None and checksum is not None
-        remote = "original.mp3" if target is None else (f"{target}.mp3" if role == "target" else f"{target}.backing.mp3")
+        remote = "original.mp3" if target is None else f"{target}{STEM_SUFFIXES[role]}.mp3"
         assets.append(LocalAsset(AssetInfo(remote, size, checksum, target, role), path))
+    if missing_lr:
+        # The recorded split makes `bunri lr-split` skip the package, so the
+        # rebuild needs --force.
+        command = f"bunri lr-split {shlex.quote(safe_name)} --force -o {shlex.quote(str(out_dir))}"
+        issues.append(f"身元ファイルには L のみ / R のみありと記録されていますが、L/R の mp3 がありません。`{command}` で作り直してください")
     if issues:
         no_mp3 = any("formats に mp3" in issue for issue in issues)
         raise LocalPreflightError(

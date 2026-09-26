@@ -29,16 +29,49 @@ def test_preflight_hashes_assets_in_contract_order(tmp_path):
     assert all(x.descriptor.bytes > 0 and len(x.descriptor.sha256) == 64 for x in package.assets)
 
 
-def test_preflight_ignores_lr_split_files_and_field(tmp_path):
+def _split_package(tmp_path: Path, pan_split: str | None) -> tuple[Path, Path]:
     out = tmp_path / "out"; directory = out / "Song"; directory.mkdir(parents=True)
-    metadata = PackageMetadata("A title", "Song", SourceIdentity("sha1", "a" * 40, "a" * 12), (TargetMetadata("guitar", ("mp3", "wav"), "left_right"),))
+    metadata = PackageMetadata("A title", "Song", SourceIdentity("sha1", "a" * 40, "a" * 12), (TargetMetadata("guitar", ("mp3", "wav"), pan_split),))
     write_package_metadata(directory / ".bunri-package.json", metadata)
     for name in ("Song.original.mp3", "Song.guitar.mp3", "Song.guitar.backing.mp3"): (directory / name).write_bytes(name.encode())
     for side in ("left", "right"):
-        for audio_format in ("mp3", "wav"): (directory / f"Song.guitar.{side}.{audio_format}").write_bytes(b"lr")
+        for audio_format in ("mp3", "wav"): (directory / f"Song.guitar.{side}.{audio_format}").write_bytes(f"{side}.{audio_format}".encode())
+    return out, directory
+
+
+def test_preflight_adds_left_and_right_for_a_recorded_split(tmp_path):
+    out, directory = _split_package(tmp_path, "left_right")
+    package = preflight(out, "Song")
+    assert [(x.descriptor.remote_name, x.descriptor.target, x.descriptor.role) for x in package.assets] == [
+        ("original.mp3", None, None),
+        ("guitar.mp3", "guitar", "target"),
+        ("guitar.backing.mp3", "guitar", "backing"),
+        ("guitar.left.mp3", "guitar", "left"),
+        ("guitar.right.mp3", "guitar", "right"),
+    ]
+    left = package.assets[3]
+    assert left.path == directory / "Song.guitar.left.mp3"
+    assert left.descriptor.bytes == len(b"left.mp3") and len(left.descriptor.sha256) == 64
+
+
+@pytest.mark.parametrize("pan_split", ["single", None])
+def test_preflight_ignores_lr_files_without_a_recorded_split(tmp_path, pan_split):
+    out, _ = _split_package(tmp_path, pan_split)
     package = preflight(out, "Song")
     assert [x.descriptor.remote_name for x in package.assets] == ["original.mp3", "guitar.mp3", "guitar.backing.mp3"]
-    assert package.metadata.targets[0].pan_split == "left_right"
+
+
+@pytest.mark.parametrize("missing", ["left", "right"])
+def test_preflight_stops_when_recorded_lr_mp3_is_missing(tmp_path, missing):
+    out, directory = _split_package(tmp_path, "left_right")
+    (directory / f"Song.guitar.{missing}.mp3").unlink()
+    with pytest.raises(LocalPreflightError) as exc:
+        preflight(out, "Song")
+    assert exc.value.kind == "general"
+    assert any(f"Song.guitar.{missing}.mp3" in issue for issue in exc.value.issues)
+    guidance = [issue for issue in exc.value.issues if "bunri lr-split" in issue]
+    assert len(guidance) == 1
+    assert f"bunri lr-split Song --force -o {out}" in guidance[0]
 
 
 def test_preflight_accepts_nfd_directory_with_nfc_sidecar(tmp_path):

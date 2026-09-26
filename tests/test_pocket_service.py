@@ -34,8 +34,17 @@ from bunri.pocket.service import (
 TOKEN = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
 
 
+SUPPORTED = {"api": {"major": 1}, "features": {"pan_split": True}}
+UNSUPPORTED = {"api": {"major": 1}}
+
+
 def make_package(
-    out: Path, name: str, digest: str, *, metadata_name: str | None = None
+    out: Path,
+    name: str,
+    digest: str,
+    *,
+    metadata_name: str | None = None,
+    pan_split: str | None = None,
 ) -> None:
     directory = out / name
     directory.mkdir(parents=True)
@@ -43,14 +52,20 @@ def make_package(
         name,
         metadata_name or name,
         SourceIdentity("sha1", digest, digest[:12]),
-        (TargetMetadata("guitar", ("mp3",)),),
+        (TargetMetadata("guitar", ("mp3",), pan_split),),
     )
     write_package_metadata(directory / ".bunri-package.json", metadata)
-    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+    suffixes = ["original.mp3", "guitar.mp3", "guitar.backing.mp3"]
+    if pan_split == "left_right":
+        suffixes += ["guitar.left.mp3", "guitar.right.mp3"]
+    for suffix in suffixes:
         (directory / f"{name}.{suffix}").write_bytes(suffix.encode())
 
 
 class EmptyRemoteClient:
+    def capabilities(self):
+        return SUPPORTED
+
     def get_json(self, path):
         return None
 
@@ -136,6 +151,9 @@ def test_nfd_package_is_inspected_inventoried_and_resolved_by_either_form(tmp_pa
     class FailingRemoteClient:
         def __init__(self):
             self.calls = 0
+
+        def capabilities(self):
+            return SUPPORTED
 
         def get_json(self, path):
             self.calls += 1
@@ -293,6 +311,10 @@ def test_remote_status_uses_only_get_and_head(tmp_path):
         def __init__(self):
             self.calls = []
 
+        def capabilities(self):
+            self.calls.append(("CAPABILITIES", None))
+            return SUPPORTED
+
         def get_json(self, path):
             self.calls.append(("GET", path))
             return None
@@ -304,7 +326,7 @@ def test_remote_status_uses_only_get_and_head(tmp_path):
     client = Client()
     status = inspect_remote(package, client)
     assert status.state == "not_synced"
-    assert [method for method, _ in client.calls] == ["GET", "GET"]
+    assert [method for method, _ in client.calls] == ["CAPABILITIES", "GET", "GET"]
 
 
 def test_remote_status_rejects_library_entry_without_manifest(tmp_path):
@@ -312,6 +334,9 @@ def test_remote_status_rejects_library_entry_without_manifest(tmp_path):
     package = inventory(tmp_path).packages[0]
 
     class Client:
+        def capabilities(self):
+            return SUPPORTED
+
         def get_json(self, path):
             if path.startswith("manifest/"):
                 return None
@@ -361,6 +386,9 @@ def test_batch_stops_after_first_remote_failure_and_marks_rest_pending(tmp_path)
     class Client:
         def __init__(self):
             self.calls = []
+
+        def capabilities(self):
+            return SUPPORTED
 
         def get_json(self, path):
             self.calls.append(path)
@@ -479,3 +507,121 @@ def test_sync_safe_error_keeps_existing_http_wording(status, expected):
     error = PocketHTTPError(status, "PRIVATE", "https://secret.invalid/token")
 
     assert safe_error(error) == expected
+
+
+class MemoryClient:
+    """An in-memory Pocket that records every request."""
+
+    def __init__(self, capabilities=SUPPORTED):
+        self.capabilities_value = capabilities
+        self.docs = {}
+        self.media = {}
+        self.calls = []
+
+    def capabilities(self):
+        self.calls.append(("CAPABILITIES",))
+        if isinstance(self.capabilities_value, Exception):
+            raise self.capabilities_value
+        return self.capabilities_value
+
+    def get_json(self, path):
+        self.calls.append(("GET", path))
+        return self.docs.get(path)
+
+    def head_media(self, song_id, name):
+        self.calls.append(("HEAD", name))
+        return self.media.get((song_id, name))
+
+    def put_media(self, song_id, name, path, size, checksum):
+        self.calls.append(("PUT_MEDIA", name))
+        self.media[(song_id, name)] = (checksum, size)
+        return checksum
+
+    def put_json(self, path, data, condition):
+        import json
+
+        self.calls.append(("PUT_JSON", path))
+        self.docs[path] = JSONDocument(json.loads(data), '"next"')
+        return '"next"'
+
+
+def test_batch_reads_capabilities_once_and_reports_support(tmp_path):
+    save_config(tmp_path, PocketConfig("https://example.invalid", TOKEN))
+    make_package(tmp_path, "A", "a" * 40, pan_split="left_right")
+    make_package(tmp_path, "B", "b" * 40, pan_split="single")
+    make_package(tmp_path, "C", "c" * 40)
+
+    client = MemoryClient(UNSUPPORTED)
+    for supported, uploads in ((False, 9), (True, 2)):
+        client.capabilities_value = SUPPORTED if supported else UNSUPPORTED
+        client.calls.clear()
+        result = sync_all(tmp_path, client=client)
+        assert [item.status for item in result.items] == ["done"] * 3
+        assert client.calls.count(("CAPABILITIES",)) == 1
+        assert client.calls[0] == ("CAPABILITIES",)
+        assert result.pan_split_supported is supported
+        assert all(item.result.pan_split_supported is supported for item in result.items)
+        assert len([call for call in client.calls if call[0] == "PUT_MEDIA"]) == uploads
+    # After the update, only A's L/R files were new.
+    assert [call[1] for call in client.calls if call[0] == "PUT_MEDIA"] == [
+        "guitar.left.mp3", "guitar.right.mp3",
+    ]
+
+
+def test_batch_capabilities_failure_stops_before_any_upload(tmp_path):
+    save_config(tmp_path, PocketConfig("https://example.invalid", TOKEN))
+    make_package(tmp_path, "A", "a" * 40)
+    client = MemoryClient(PocketHTTPError(401, "UNAUTHORIZED", "https://example.invalid"))
+    with pytest.raises(PocketHTTPError):
+        sync_all(tmp_path, client=client)
+    assert client.calls == [("CAPABILITIES",)]
+
+
+def test_remote_status_depends_on_pocket_support_for_a_three_file_sync(tmp_path):
+    from bunri.pocket.sync import RemoteFeatures, synchronize
+
+    make_package(tmp_path, "Song", "a" * 40, pan_split="left_right")
+    package = inventory(tmp_path).packages[0]
+    client = MemoryClient(UNSUPPORTED)
+    synchronize(package, client)
+    assert sorted(name for _, name in client.media) == ["guitar.backing.mp3", "guitar.mp3", "original.mp3"]
+
+    client.calls.clear()
+    unsupported = inspect_remote(package, client, RemoteFeatures(pan_split=False))
+    assert (unsupported.state, unsupported.can_sync) == ("synced", True)
+    assert ("HEAD", "guitar.left.mp3") not in client.calls
+    supported = inspect_remote(package, client, RemoteFeatures(pan_split=True))
+    assert (supported.state, supported.can_sync) == ("different", True)
+    assert ("CAPABILITIES",) not in client.calls
+
+    synchronize(package, client, features=RemoteFeatures(pan_split=True))
+    assert inspect_remote(package, client, RemoteFeatures(pan_split=True)).state == "synced"
+
+
+def test_status_listing_reads_capabilities_once(tmp_path):
+    for name, digest in (("A", "a" * 40), ("B", "b" * 40), ("C", "c" * 40)):
+        make_package(tmp_path, name, digest, pan_split="left_right")
+    client = MemoryClient(UNSUPPORTED)
+    statuses = inspect_packages(tmp_path, client)
+    assert [status.remote.state for status in statuses] == ["not_synced"] * 3
+    assert client.calls.count(("CAPABILITIES",)) == 1
+    assert client.calls[0] == ("CAPABILITIES",)
+
+
+def test_status_listing_keeps_local_states_when_capabilities_fail(tmp_path):
+    make_package(tmp_path, "Good", "a" * 40)
+    make_package(tmp_path, "Other", "b" * 40, pan_split="left_right")
+    make_package(tmp_path, "Dup1", "c" * 40)
+    shutil.copytree(tmp_path / "Dup1", tmp_path / "Dup2")
+    (tmp_path / "Legacy").mkdir()
+    client = MemoryClient(PocketHTTPError(401, "UNAUTHORIZED", "https://example.invalid"))
+
+    statuses = {item.safe_name: item.remote for item in inspect_packages(tmp_path, client)}
+
+    assert client.calls == [("CAPABILITIES",)]
+    assert statuses["Legacy"].state == "legacy"
+    assert statuses["Dup1"].conflict is True and statuses["Dup2"].conflict is True
+    for name in ("Good", "Other"):
+        assert statuses[name].state == "unknown"
+        assert statuses[name].can_sync is False
+        assert statuses[name].message == "音源ポケットの状態を確認できません。"

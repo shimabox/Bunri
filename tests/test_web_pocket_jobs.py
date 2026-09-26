@@ -639,6 +639,45 @@ def test_pocket_batch_preserves_legacy_names_on_local_validation_error(
         store.shutdown()
 
 
+@pytest.mark.parametrize("supported", [False, True])
+def test_pocket_job_results_carry_pan_split_support(tmp_path, monkeypatch, supported):
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    monkeypatch.setattr(
+        jobs_module,
+        "sync_one",
+        lambda *_args, **_kwargs: SyncResult(media_uploaded=3, pan_split_supported=supported),
+    )
+    monkeypatch.setattr(
+        jobs_module,
+        "sync_all",
+        lambda *_args, **_kwargs: BatchResult(
+            total=1,
+            items=[BatchItem("Song", "done", result=SyncResult(pan_split_supported=supported))],
+            pan_split_supported=supported,
+        ),
+    )
+    store = JobStore(tmp_path, runner=lambda *args: 99)
+    try:
+        for song_id, digest, safe_name in (("a" * 12, "a" * 40, "Song"), (None, None, None)):
+            job = store.create_pocket_job(
+                song_id=song_id,
+                digest=digest,
+                safe_name=safe_name,
+                connection_fingerprint=CONNECTION_FINGERPRINT,
+                sync_lock=SyncLock(tmp_path).acquire(),
+            )
+            wait_for(lambda: store.get_job(job.id).status == "done")
+            finished = store.get_job(job.id)
+            assert finished.kind == ("pocket_single" if song_id else "pocket_all")
+            assert finished.result["pan_split_supported"] is supported
+            saved = json.loads((tmp_path / "web" / "jobs" / f"{job.id}.json").read_text())
+            assert saved["result"]["pan_split_supported"] is supported
+    finally:
+        store.shutdown()
+
+
 def test_pocket_batch_job_bounds_names_and_keeps_complete_counts(
     tmp_path, monkeypatch
 ):

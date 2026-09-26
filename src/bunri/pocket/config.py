@@ -61,11 +61,17 @@ def validate_token(raw: str) -> str:
     return token
 
 
+def _schema_1x(current: object) -> bool:
+    # Any schema 1.x minor is readable by this client; newer minors only add
+    # optional fields.
+    return isinstance(current, str) and re.fullmatch(r"1\.\d+", current) is not None
+
+
 def validate_capabilities(value: object) -> None:
     expected = {
         ("api", "major"): 1, ("schemas", "manifest", "major"): 1,
-        ("schemas", "manifest", "latest"): "1.0", ("schemas", "library", "major"): 1,
-        ("schemas", "library", "latest"): "1.0", ("limits", "media_bytes"): 94_371_840,
+        ("schemas", "manifest", "latest"): _schema_1x, ("schemas", "library", "major"): 1,
+        ("schemas", "library", "latest"): _schema_1x, ("limits", "media_bytes"): 94_371_840,
         ("limits", "json_bytes"): 1_048_576, ("media", "hash"): "SHA-256",
         ("media", "conditional_json_put"): True,
     }
@@ -74,7 +80,8 @@ def validate_capabilities(value: object) -> None:
         for part in path:
             if not isinstance(current, dict) or part not in current: raise ValueError(f"Pocket capabilities に {'.'.join(path)} がありません")
             current = current[part]
-        if type(current) is not type(wanted) or current != wanted: raise ValueError(f"Pocket capabilities の {'.'.join(path)} が対応していません")
+        accepted = wanted(current) if callable(wanted) else type(current) is type(wanted) and current == wanted
+        if not accepted: raise ValueError(f"Pocket capabilities の {'.'.join(path)} が対応していません")
     media = value.get("media") if isinstance(value, dict) else None
     if not isinstance(media, dict) or not isinstance(media.get("content_types"), list) or "audio/mpeg" not in media["content_types"]:
         raise ValueError("Pocket capabilities が audio/mpeg に対応していません")

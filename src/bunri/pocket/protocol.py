@@ -17,6 +17,10 @@ SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 TARGET = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
 UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\Z")
+PAN_SPLIT_VALUES = ("left_right", "single")
+# Stem role → remote file name suffix after the target: guitar.mp3,
+# guitar.backing.mp3, guitar.left.mp3, guitar.right.mp3.
+STEM_SUFFIXES = {"target": "", "backing": ".backing", "left": ".left", "right": ".right"}
 
 
 class ProtocolError(ValueError):
@@ -208,14 +212,18 @@ def validate_manifest(value: Any, route_song_id: str | None = None) -> dict[str,
             elif target in seen: issues.append(f"target {target} is duplicated")
             else: seen.add(target)
             _nonempty(instrument.get("label"), f"instruments[{index}].label", issues)
+            pan_split = instrument.get("pan_split")
+            if "pan_split" in instrument and pan_split not in PAN_SPLIT_VALUES: issues.append(f"instruments[{index}].pan_split is invalid")
             stems = instrument.get("stems")
-            if not isinstance(stems, list) or len(stems) != 2: issues.append(f"instruments[{index}].stems must contain target and backing"); continue
-            roles: set[str] = set()
+            if not isinstance(stems, list) or len(stems) not in (2, 4): issues.append(f"instruments[{index}].stems must contain target and backing, plus left and right when split"); continue
+            roles: list[str] = []
             for stem in stems:
-                if not isinstance(stem, dict) or stem.get("role") not in ("target", "backing"): issues.append(f"instruments[{index}] has an invalid stem role"); continue
-                role = stem["role"]; roles.add(role)
-                _asset(stem, f"{target}.mp3" if role == "target" else f"{target}.backing.mp3", f"instruments[{index}].{role}", issues)
-            if roles != {"target", "backing"}: issues.append(f"instruments[{index}] must have each stem role exactly once")
+                if not isinstance(stem, dict) or stem.get("role") not in STEM_SUFFIXES: issues.append(f"instruments[{index}] has an invalid stem role"); continue
+                role = stem["role"]; roles.append(role)
+                _asset(stem, f"{target}{STEM_SUFFIXES[role]}.mp3", f"instruments[{index}].{role}", issues)
+            expected = ["target", "backing"] if len(stems) == 2 else ["target", "backing", "left", "right"]
+            if sorted(roles) != sorted(expected): issues.append(f"instruments[{index}] must have each stem role exactly once")
+            elif len(stems) == 4 and pan_split != "left_right": issues.append(f"instruments[{index}] has left/right stems without pan_split left_right")
     if issues: raise ProtocolError("; ".join(issues))
     return value
 
@@ -256,11 +264,28 @@ class AssetInfo:
     role: str | None = None
 
 
+def pan_split_supported(capabilities: object) -> bool:
+    """Whether a Pocket accepts pan_split and left/right stems.
+
+    Only api.major 1 with features.pan_split exactly true counts; a missing
+    features object or any other value means an older Pocket.
+    """
+    if not isinstance(capabilities, dict): return False
+    api, features = capabilities.get("api"), capabilities.get("features")
+    if not isinstance(api, dict) or not isinstance(features, dict): return False
+    major = api.get("major")
+    return isinstance(major, int) and not isinstance(major, bool) and major == 1 and features.get("pan_split") is True
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def merge_manifest(*, metadata: Any, assets: list[AssetInfo], remote: dict[str, Any] | None, include_original: bool, clock: Callable[[], str] = _now) -> tuple[dict[str, Any], bool]:
+def _minor(version: str) -> int:
+    return int(version.split(".", 1)[1])
+
+
+def merge_manifest(*, metadata: Any, assets: list[AssetInfo], remote: dict[str, Any] | None, include_original: bool, clock: Callable[[], str] = _now, pan_split_supported: bool = False) -> tuple[dict[str, Any], bool]:
     if remote is not None:
         validate_manifest(remote, metadata.source.cache_key)
         if remote["source"]["digest"] != metadata.source.digest: raise ProtocolError("source digest collision", code="DIGEST_COLLISION")
@@ -275,11 +300,24 @@ def merge_manifest(*, metadata: Any, assets: list[AssetInfo], remote: dict[str, 
     for entry in metadata.targets:
         old = deepcopy(old_inst.get(entry.target, {})); old.update(target=entry.target, label=REGISTRY[entry.target].label_ja)
         old_stems = {x.get("role"): x for x in old.get("stems", []) if isinstance(x, dict)}
+        roles = ["target", "backing"]
+        if pan_split_supported:
+            # The sidecar is authoritative: a package rebuilt without a
+            # recorded split must drop a pan_split left by an earlier sync.
+            if entry.pan_split in PAN_SPLIT_VALUES: old["pan_split"] = entry.pan_split
+            else: old.pop("pan_split", None)
+            if entry.pan_split == "left_right" and all(f"{entry.target}{STEM_SUFFIXES[r]}.mp3" in by_name for r in ("left", "right")):
+                roles += ["left", "right"]
         stems = []
-        for role, name in (("target", f"{entry.target}.mp3"), ("backing", f"{entry.target}.backing.mp3")):
-            stem = asset_value(by_name[name], old_stems.get(role)); stem["role"] = role; stems.append(stem)
+        for role in roles:
+            stem = asset_value(by_name[f"{entry.target}{STEM_SUFFIXES[role]}.mp3"], old_stems.get(role)); stem["role"] = role; stems.append(stem)
         old["stems"] = stems; old_inst[entry.target] = old
     result["instruments"] = [old_inst[k] for k in sorted(old_inst)]
+    if pan_split_supported and _minor(result["schema_version"]) < 1 and any(
+        isinstance(x, dict) and ("pan_split" in x or any(isinstance(s, dict) and s.get("role") in ("left", "right") for s in x.get("stems", [])))
+        for x in result["instruments"]
+    ):
+        result["schema_version"] = "1.1"
     previous_time = remote.get("updated_at") if remote else ""
     result["updated_at"] = previous_time
     changed = remote is None or stable_json(result) != stable_json(remote)

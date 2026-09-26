@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Callable
 
 from bunri.pocket.http import JSON_LIMIT_BYTES, MEDIA_LIMIT_BYTES, JSONDocument, PocketHTTPClient, PocketHTTPError
-from bunri.pocket.local import LocalPackage
-from bunri.pocket.protocol import ProtocolError, merge_library, merge_manifest, stable_json, validate_library, validate_manifest
+from bunri.pocket.local import LocalAsset, LocalPackage
+from bunri.pocket.protocol import ProtocolError, merge_library, merge_manifest, pan_split_supported, stable_json, validate_library, validate_manifest
 
 
 class SyncError(RuntimeError):
@@ -22,6 +22,27 @@ class SyncResult:
     manifest_skipped: int = 0
     library_updated: int = 0
     library_skipped: int = 0
+    pan_split_supported: bool = False
+
+
+@dataclass(frozen=True)
+class RemoteFeatures:
+    pan_split: bool
+
+
+def probe_features(client: PocketHTTPClient) -> RemoteFeatures:
+    """Read the Pocket's optional features once, before any document is read.
+
+    HTTP and JSON errors propagate: an older Pocket still answers
+    capabilities, so a failure here is not a reason to fall back.
+    """
+    return RemoteFeatures(pan_split=pan_split_supported(client.capabilities()))
+
+
+def assets_to_send(package: LocalPackage, features: RemoteFeatures) -> tuple[LocalAsset, ...]:
+    if features.pan_split:
+        return package.assets
+    return tuple(asset for asset in package.assets if asset.descriptor.role not in ("left", "right"))
 
 
 def _schema_major(value: object) -> str:
@@ -80,7 +101,10 @@ def _payload_too_large(kind: str, name: str, size: int, limit: int) -> SyncError
     return SyncError(f"送信するデータが音源ポケットの上限を超えています: {kind} {name}({size} バイト、上限 {limit} バイト)。アップロードは中断しました。")
 
 
-def synchronize(package: LocalPackage, client: PocketHTTPClient, *, include_original: bool = True, clock: Callable[[], str] | None = None) -> SyncResult:
+def synchronize(package: LocalPackage, client: PocketHTTPClient, *, include_original: bool = True, clock: Callable[[], str] | None = None, features: RemoteFeatures | None = None) -> SyncResult:
+    if features is None:
+        features = probe_features(client)
+    assets = assets_to_send(package, features)
     song_id = package.metadata.source.cache_key
     pre_manifest, pre_library = _manifest(client, song_id), _library(client)
     if pre_manifest is not None and pre_manifest.value["source"]["digest"] != package.metadata.source.digest:
@@ -88,7 +112,7 @@ def synchronize(package: LocalPackage, client: PocketHTTPClient, *, include_orig
     if pre_manifest is None and pre_library is not None and any(x["song_id"] == song_id for x in pre_library.value["songs"]):
         raise SyncError("library が存在しない manifest を参照しています。アップロードは開始していません。")
     uploaded = skipped = 0
-    for asset in package.assets:
+    for asset in assets:
         info = client.head_media(song_id, asset.descriptor.remote_name)
         if info == (asset.descriptor.sha256, asset.descriptor.bytes): skipped += 1; continue
         try: returned = client.put_media(song_id, asset.descriptor.remote_name, asset.path, asset.descriptor.bytes, asset.descriptor.sha256)
@@ -104,7 +128,7 @@ def synchronize(package: LocalPackage, client: PocketHTTPClient, *, include_orig
         current = _manifest(client, song_id, "manifest")
         if current is not None and current.value["source"]["digest"] != package.metadata.source.digest:
             raise SyncError(f"RACE_DIGEST_COLLISION:{current.value['source']['digest']}")
-        kwargs = {"metadata": package.metadata, "assets": [x.descriptor for x in package.assets], "remote": current.value if current else None, "include_original": include_original}
+        kwargs = {"metadata": package.metadata, "assets": [x.descriptor for x in assets], "remote": current.value if current else None, "include_original": include_original, "pan_split_supported": features.pan_split}
         if clock is not None: kwargs["clock"] = clock
         manifest, changed = merge_manifest(**kwargs)
         if not changed: manifest_skipped = 1; break
@@ -141,4 +165,4 @@ def synchronize(package: LocalPackage, client: PocketHTTPClient, *, include_orig
             raise
         library_updated = 1; break
     else: raise SyncError("library の競合が解消しません。再実行してください。")
-    return SyncResult(uploaded, skipped, manifest_updated, manifest_skipped, library_updated, library_skipped)
+    return SyncResult(uploaded, skipped, manifest_updated, manifest_skipped, library_updated, library_skipped, features.pan_split)

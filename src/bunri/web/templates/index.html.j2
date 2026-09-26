@@ -68,6 +68,7 @@
   }
   .sw-pocket-summary[hidden] { display: none; }
   .sw-pocket-summary.is-error { color: #c0392b; }
+  .sw-pocket-notice { color: #8a7f74; font-weight: 400; }
   .sw-pocket-row { border-bottom: 1px solid #f1e8da; padding: 10px 0 12px; }
   .sw-pocket-row-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .sw-pocket-message { margin: 6px 0 0; color: #8a7f74; font-size: 0.78rem; }
@@ -511,6 +512,7 @@
         <button type="button" id="sw-pocket-refresh" class="sw-btn">状態を再読込</button>
         <span id="sw-pocket-count" class="sw-pocket-note"></span>
         <p id="sw-pocket-summary" class="sw-pocket-summary" role="status" aria-live="polite" hidden></p>
+        <p id="sw-pocket-notice" class="sw-pocket-summary sw-pocket-notice" role="status" aria-live="polite" hidden></p>
       </div>
     </div>
     <p id="sw-empty" class="sw-empty">まだ曲はありません。</p>
@@ -568,6 +570,7 @@
   var API_POCKET_JOB = "/api/pocket/job";
   var API_POCKET_SYNC = "/api/pocket/sync";
   var POLL_INTERVAL_MS = 2000;
+  var PAN_SPLIT_UNSUPPORTED_NOTICE = "この音源ポケットは L のみ / R のみに未対応です。音源ポケットを更新して再同期すると送られます";
 
   var dropzone = document.getElementById("sw-dropzone");
   var fileInput = document.getElementById("sw-file-input");
@@ -600,6 +603,7 @@
   var pocketRefreshInitialLabel = pocketRefresh.textContent;
   var pocketCount = document.getElementById("sw-pocket-count");
   var pocketSummary = document.getElementById("sw-pocket-summary");
+  var pocketNotice = document.getElementById("sw-pocket-notice");
   var remoteOnlyError = document.getElementById("sw-remote-only-error");
   var remoteOnlySection = document.getElementById("sw-remote-only");
   var remoteOnlyList = document.getElementById("sw-remote-only-list");
@@ -825,6 +829,8 @@
     pocketSummary.hidden = true;
     pocketSummary.textContent = "";
     pocketSummary.classList.remove("is-error");
+    pocketNotice.hidden = true;
+    pocketNotice.textContent = "";
   }
 
   function renderPocketCount() {
@@ -919,7 +925,17 @@
     return 0;
   }
 
+  function renderPocketNotice(job) {
+    // Same line as `bunri pocket sync` prints for a Pocket without L/R support.
+    var unsupported = (job.kind === "pocket_single" || job.kind === "pocket_all")
+      && (job.status === "done" || job.status === "error")
+      && job.result && job.result.pan_split_supported === false;
+    pocketNotice.textContent = unsupported ? PAN_SPLIT_UNSUPPORTED_NOTICE : "";
+    pocketNotice.hidden = !unsupported;
+  }
+
   function renderPocketSummary(job) {
+    renderPocketNotice(job);
     if (job.kind !== "pocket_all" || (job.status !== "done" && job.status !== "error")) return;
     var completed = pocketJobCount(job, "completed");
     var failed = pocketJobCount(job, "failed");

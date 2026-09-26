@@ -1889,6 +1889,52 @@ def test_pocket_status_distinguishes_library_failure_from_an_empty_shelf(
     assert "private remote detail" not in str(unknown)
 
 
+def test_pocket_status_survives_a_capabilities_failure_with_unknown_songs(
+    client, monkeypatch
+):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.http import PocketHTTPError
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(client.out_dir, PocketConfig("https://example.invalid", token))
+    for name, digest in (("First", "a" * 40), ("Second", "b" * 40)):
+        package = _write_cli_package(client.out_dir, name, digest, formats=("mp3",))
+        for suffix in ("original", "guitar", "guitar.backing"):
+            (package / f"{name}.{suffix}.mp3").write_bytes(b"audio")
+    (client.out_dir / "Legacy").mkdir()
+
+    requests = []
+
+    class UnauthorizedPocket:
+        def capabilities(self):
+            requests.append("capabilities")
+            raise PocketHTTPError(401, "UNAUTHORIZED", "https://example.invalid")
+
+        def get_json(self, path):
+            requests.append(path)
+            raise PocketHTTPError(401, "UNAUTHORIZED", "https://example.invalid")
+
+        def head_media(self, song_id, name):
+            pytest.fail("media must not be checked when capabilities failed")
+
+    monkeypatch.setattr(app_module, "PocketHTTPClient", lambda *_args: UnauthorizedPocket())
+
+    response = client.get("/api/pocket/status")
+
+    assert response.status_code == 200
+    songs = {song["safe_name"]: song for song in response.json()["songs"]}
+    assert songs["Legacy"]["state"] == "legacy"
+    for name in ("First", "Second"):
+        assert songs[name]["state"] == "unknown"
+        assert songs[name]["can_sync"] is False
+        assert songs[name]["message"] == "音源ポケットの状態を確認できません。"
+    # One capabilities read for the listing; the library read is the
+    # remote-only list, which is unchanged.
+    assert requests == ["capabilities", "library"]
+
+
 def test_delete_unknown_song_is_404(client):
     assert client.delete("/api/songs/not-a-song").status_code == 404
 
