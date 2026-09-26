@@ -478,7 +478,8 @@ def test_lr_buttons_are_absent_when_the_split_does_not_apply():
     )
     markup = _markup(out)
     assert _button(markup, "left") is None and _button(markup, "right") is None
-    assert 'id="tm-audio-left"' not in markup and 'class="tm-pan-note"' not in markup
+    assert 'id="tm-audio-left"' not in markup and 'id="tm-pan-note"' not in markup
+    assert 'class="tm-lr-group"' not in markup
     assert "<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> トラック切替" in markup
     assert "L のみ" not in markup
 
@@ -503,7 +504,8 @@ def test_lr_tracks_render_buttons_audio_and_help():
     assert markup.index('data-track="backing"') < markup.index('data-track="left"')
     assert "<kbd>1</kbd>〜<kbd>5</kbd> トラック切替" in markup
     assert "/ L のみ / R のみ) は、この HTML と同じフォルダに置いてください" in markup
-    assert 'class="tm-pan-note"' not in markup
+    assert 'id="tm-pan-note"' not in markup and 'class="tm-lr-group"' not in markup
+    assert "aria-describedby" not in markup
     assert 'case "4": switchTrack("left")' in out
     assert 'case "5": switchTrack("right")' in out
 
@@ -521,7 +523,14 @@ def test_lr_note_renders_disabled_buttons_and_the_reason():
     left, right = _button(markup, "left"), _button(markup, "right")
     assert left and "disabled" in left and "（無し）" not in left
     assert right and "disabled" in right and "（無し）" not in right
-    assert '<p class="tm-pan-note">L/R に分かれていない曲です</p>' in markup
+    # The reason is a tooltip on the wrapper (disabled buttons may not show their
+    # own title) plus visually-hidden text for screen readers, not a visible row.
+    assert '<span class="tm-lr-group" title="L/R に分かれていない曲です">' in markup
+    assert 'aria-describedby="tm-pan-note"' in left and 'aria-describedby="tm-pan-note"' in right
+    assert '<span id="tm-pan-note" class="tm-visually-hidden">L/R に分かれていない曲です</span>' in markup
+    assert "<p" not in markup.split('class="tm-lr-group"')[1].split("再生")[0]
+    group = markup.split('<span class="tm-lr-group"')[1].split("</span>")[0]
+    assert 'data-track="left"' in group and 'data-track="right"' in group
     assert 'id="tm-audio-left"' not in markup and 'id="tm-audio-right"' not in markup
     assert "/ L のみ / R のみ)" not in markup
 
@@ -582,5 +591,19 @@ def test_single_player_has_unavailable_lr_tracks(tmp_path):
             "'button.tm-trk[data-track=\"'+t+'\"]').disabled;})"
         )
         assert disabled == [True, True]
+        # The reason is not a visible row: the text is visually hidden, the
+        # tooltip lives on the wrapper, and both buttons point at the text.
+        info = page.evaluate(
+            "(()=>{var n=document.getElementById('tm-pan-note');var r=n.getBoundingClientRect();"
+            "var g=document.querySelector('.tm-lr-group');"
+            "return {text:n.textContent,w:r.width,h:r.height,title:g.title,"
+            "kids:g.querySelectorAll('button').length,"
+            "desc:['left','right'].map(function(t){return document.querySelector("
+            "'button.tm-trk[data-track=\"'+t+'\"]').getAttribute('aria-describedby');})};})()"
+        )
+        assert info["text"] == "L/R に分かれていない曲です"
+        assert info["w"] <= 1 and info["h"] <= 1, info
+        assert info["title"] == "L/R に分かれていない曲です"
+        assert info["kids"] == 2 and info["desc"] == ["tm-pan-note", "tm-pan-note"]
         page.keyboard.press("4")
         assert page.evaluate("window.__player.state().activeTrack") == "original"

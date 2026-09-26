@@ -128,10 +128,26 @@
     padding: 1px 6px;
     font-size: 0.72rem;
   }
-  .tm-pan-note {
-    margin: -8px 0 18px;
-    color: #8a7f74;
-    font-size: 0.82rem;
+  .tm-lr-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    cursor: not-allowed;
+  }
+  /* Disabled buttons may not receive hover/title events in some browsers, so the
+     wrapper takes the pointer and shows the tooltip instead. */
+  .tm-lr-group > button:disabled { pointer-events: none; }
+  .tm-visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
   .tm-offline-note {
     margin: 18px 0 0;
@@ -168,14 +184,17 @@
     <button type="button" class="tm-btn tm-trk" data-track="original"{% if not original_src %} disabled{% endif %}>原曲{% if not original_src %}（無し）{% endif %}</button>
     <button type="button" class="tm-btn tm-trk" data-track="target"{% if not target_src %} disabled{% endif %}>{{ instrument_label }}のみ{% if not target_src %}（無し）{% endif %}</button>
     <button type="button" class="tm-btn tm-trk" data-track="backing"{% if not backing_src %} disabled{% endif %}>{{ instrument_label }}なし{% if not backing_src %}（無し）{% endif %}</button>
-    {% if show_pan_split %}
-    <button type="button" class="tm-btn tm-trk" data-track="left"{% if not left_src %} disabled{% endif %}>L のみ{% if not left_src and not pan_split_note %}（無し）{% endif %}</button>
-    <button type="button" class="tm-btn tm-trk" data-track="right"{% if not right_src %} disabled{% endif %}>R のみ{% if not right_src and not pan_split_note %}（無し）{% endif %}</button>
+    {% if show_pan_split and pan_split_note %}
+    <span class="tm-lr-group" title="{{ pan_split_note }}">
+      <button type="button" class="tm-btn tm-trk" data-track="left" aria-describedby="tm-pan-note"{% if not left_src %} disabled{% endif %}>L のみ</button>
+      <button type="button" class="tm-btn tm-trk" data-track="right" aria-describedby="tm-pan-note"{% if not right_src %} disabled{% endif %}>R のみ</button>
+    </span>
+    <span id="tm-pan-note" class="tm-visually-hidden">{{ pan_split_note }}</span>
+    {% elif show_pan_split %}
+    <button type="button" class="tm-btn tm-trk" data-track="left"{% if not left_src %} disabled{% endif %}>L のみ{% if not left_src %}（無し）{% endif %}</button>
+    <button type="button" class="tm-btn tm-trk" data-track="right"{% if not right_src %} disabled{% endif %}>R のみ{% if not right_src %}（無し）{% endif %}</button>
     {% endif %}
   </div>
-  {% if pan_split_note %}
-  <p class="tm-pan-note">{{ pan_split_note }}</p>
-  {% endif %}
 
   <div class="tm-row">
     <button type="button" id="tm-play" class="tm-btn tm-play">再生</button>
