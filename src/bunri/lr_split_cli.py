@@ -53,6 +53,22 @@ def _fail(message: str) -> None:
     raise typer.Exit(1)
 
 
+def _all_names(out: Path) -> list[str]:
+    # `all_package_names` returns [] for an output directory it cannot read,
+    # which would look like "nothing to do". Check it first so a wrong -o
+    # fails instead of ending with an all-zero summary.
+    shown = _safe_display(str(out))
+    if not out.exists():
+        _fail(f"出力先が見つかりません: {shown}")
+    if not out.is_dir():
+        _fail(f"出力先がディレクトリではありません: {shown}")
+    try:
+        list(out.iterdir())
+    except OSError:
+        _fail(f"出力先を読めません: {shown}")
+    return all_package_names(out)
+
+
 def _report(name: str, outcome: PanSplitOutcome) -> None:
     # Package names and reasons come from the file system, so they go out as
     # plain Text (never parsed as markup) with control characters replaced.
@@ -93,6 +109,9 @@ def main(
     if spec is None or not spec.pan_split:
         _fail("この target は L/R 分割に対応していません")
     out = output.resolve()
+    # Listed before the lock is taken: the lock creates out/.cache, which
+    # would turn a mistyped output directory into an empty one.
+    names = _all_names(out) if all_packages else [safe_name]
     try:
         lock = ProcessLock(
             verified_mkdir(out, ".cache") / "pan_split.lock",
@@ -101,7 +120,6 @@ def main(
     except (OSError, ProcessLockBusy) as exc:
         _fail(str(exc))
     try:
-        names = all_package_names(out) if all_packages else [safe_name]
         counts = {"done": 0, "skipped": 0, "failed": 0, "legacy": 0}
         last: PanSplitOutcome | None = None
         for index, name in enumerate(names, 1):

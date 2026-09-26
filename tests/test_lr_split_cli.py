@@ -258,6 +258,35 @@ def test_all_reports_each_package_and_a_summary(tmp_path):
     assert "集計: 完了=0 スキップ=2 失敗=0 再生成が必要=1" in output
 
 
+def test_all_fails_when_the_output_directory_is_missing(tmp_path):
+    missing = tmp_path / "typo"
+
+    result, output = _run("--all", "-o", str(missing))
+
+    assert result.exit_code == 1
+    assert "出力先が見つかりません:" in output
+    assert "集計" not in output
+    assert not missing.exists()
+
+
+def test_all_fails_when_the_output_is_a_file(tmp_path):
+    target = tmp_path / "file"
+    target.write_text("x", encoding="utf-8")
+
+    result, output = _run("--all", "-o", str(target))
+
+    assert result.exit_code == 1
+    assert "出力先がディレクトリではありません:" in output
+    assert "集計" not in output
+
+
+def test_all_succeeds_with_zero_counts_for_an_empty_output_directory(tmp_path):
+    result, output = _run("--all", "-o", str(tmp_path))
+
+    assert result.exit_code == 0, output
+    assert "集計: 完了=0 スキップ=0 失敗=0 再生成が必要=0" in output
+
+
 # --------------------------------------------------------------------------
 # usage errors, lock
 # --------------------------------------------------------------------------

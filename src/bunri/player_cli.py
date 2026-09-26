@@ -15,8 +15,7 @@ from typing import Optional
 import typer
 from rich.text import Text
 
-from bunri.local_package import all_package_names
-from bunri.lr_split_cli import _LEGACY_HINT, _fail, _print, _safe_display
+from bunri.lr_split_cli import _LEGACY_HINT, _all_names, _fail, _print, _safe_display
 from bunri.package import PlayerRewriteOutcome, rewrite_players
 
 app = typer.Typer(
@@ -57,7 +56,7 @@ def main(
     if (safe_name is None) == (not all_packages):
         _fail("SAFE_NAME と --all のどちらか一方だけを指定してください。")
     out = output.resolve()
-    names = all_package_names(out) if all_packages else [safe_name]
+    names = _all_names(out) if all_packages else [safe_name]
     counts = {"done": 0, "skipped": 0, "failed": 0, "legacy": 0}
     last: PlayerRewriteOutcome | None = None
     for name in names:
