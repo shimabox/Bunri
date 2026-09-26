@@ -106,3 +106,70 @@ def test_identity_rejects_a_directory_symlink(tmp_path):
     result = inspect_package_identity(out, "Alias")
     assert result.state == "invalid"
     assert result.metadata is None
+
+
+def _pan_split_package(tmp_path, pan_split):
+    out = tmp_path / "out"
+    package = out / "Song"
+    package.mkdir(parents=True)
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Song",
+            "Song",
+            SourceIdentity("sha1", "a" * 40, "a" * 12),
+            (TargetMetadata("guitar", ("mp3", "wav"), pan_split),),
+        ),
+    )
+    for suffix in ("guitar", "guitar.backing"):
+        for audio_format in ("mp3", "wav"):
+            (package / f"Song.{suffix}.{audio_format}").write_bytes(b"audio")
+    (package / "Song.guitar.player.html").write_bytes(b"<html>")
+    (package / "Song.original.mp3").write_bytes(b"audio")
+    return out, package
+
+
+def test_left_right_files_are_inspected_without_affecting_completeness(tmp_path):
+    out, package = _pan_split_package(tmp_path, "left_right")
+    (package / "Song.guitar.left.mp3").write_bytes(b"audio")
+    (package / "Song.guitar.right.wav").write_bytes(b"audio")
+
+    result = inspect_package_artifacts(inspect_package_identity(out, "Song"))
+
+    target = result.targets[0]
+    assert target.pan_split == "left_right"
+    assert {k: v.present for k, v in target.left_files} == {"mp3": True, "wav": False}
+    assert {k: v.present for k, v in target.right_files} == {"mp3": False, "wav": True}
+    assert target.complete_formats == ("mp3", "wav")
+    assert result.issues == ()
+
+
+def test_single_and_unrecorded_split_inspect_no_lr_files(tmp_path):
+    out, package = _pan_split_package(tmp_path, "single")
+    (package / "Song.guitar.left.mp3").write_bytes(b"stale")
+    target = inspect_package_artifacts(inspect_package_identity(out, "Song")).targets[0]
+    assert (target.pan_split, target.left_files, target.right_files) == ("single", (), ())
+
+    (package / ".bunri-package.json").unlink()
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Song", "Song", SourceIdentity("sha1", "a" * 40, "a" * 12),
+            (TargetMetadata("guitar", ("mp3", "wav")),),
+        ),
+    )
+    target = inspect_package_artifacts(inspect_package_identity(out, "Song")).targets[0]
+    assert (target.pan_split, target.left_files, target.right_files) == (None, (), ())
+
+
+def test_invalid_pan_split_makes_the_identity_invalid(tmp_path):
+    out, package = _package(tmp_path)
+    sidecar = package / ".bunri-package.json"
+    value = json.loads(sidecar.read_text())
+    value["targets"][0]["pan_split"] = "both"
+    sidecar.write_text(json.dumps(value))
+
+    result = inspect_package_identity(out, "Song")
+
+    assert result.state == "invalid"
+    assert any("pan_split" in issue for issue in result.issues)

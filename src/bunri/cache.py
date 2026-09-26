@@ -112,6 +112,26 @@ def stage_is_fresh(
     return all(is_real_file_in(o, expected_dir) for o in outputs)
 
 
+def stage_completed(cache_dir: Path, stage_name: str, outputs: list[Path]) -> bool:
+    """True if a stage finished at some point, whatever params it ran with.
+
+    For callers that need a stage's outputs but cannot know the params it was
+    run with (e.g. which separation model produced a package's stem). The
+    meta still has to be a readable real file: clear_stage_meta removes it
+    for as long as a re-run is replacing the outputs, so a half-written set
+    never counts. Same real-file rules as stage_is_fresh otherwise.
+    """
+    expected_dir = cache_dir.resolve()
+    meta_path = _meta_path(cache_dir, stage_name)
+    if not is_real_file_in(meta_path, expected_dir):
+        return False
+    try:
+        json.loads(meta_path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return all(is_real_file_in(o, expected_dir) for o in outputs)
+
+
 def clear_stage_meta(cache_dir: Path, stage_name: str) -> None:
     """Drop a stage's meta, so nothing it used to vouch for counts as fresh
     until the stage completes and writes a new one.

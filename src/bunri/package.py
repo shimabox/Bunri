@@ -1,30 +1,64 @@
-"""Package orchestration: normalize -> separate -> export practice package.
+"""Package orchestration: normalize -> separate -> pan split -> export
+practice package.
 
 Ported from tab-maker's pipeline.py run_stage cache-check pattern and its
 --stem-only export path, collapsed into a single build_package() call since
 Bunri has no downstream (transcription/tab) stages to sequence.
+
+add_pan_split() adds the L/R split to a package built before it existed,
+from the separated stem still in the cache, sharing the same cache stage and
+export steps as build_package().
+
+rewrite_players() writes an existing package's players again from the
+current template, from what the package's sidecar records.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from rich.console import Console
 
-from bunri import audio, cache
+from bunri import audio, cache, pan_split
+from bunri.local_package import inspect_package_identity
+from bunri.lock import ProcessLockBusy
+from bunri.pan_split import LEFT_RIGHT, PanSplitDecision, pan_label, split_stem
 from bunri.player import render_player
-from bunri.package_metadata import begin_target, complete_target, read_package_metadata
-from bunri.registry import get_target
-from bunri.safepath import replace_into, verified_mkdir
+from bunri.package_metadata import (
+    TargetNotFoundError,
+    begin_target,
+    complete_target,
+    read_package_metadata,
+    set_target_pan_split,
+)
+from bunri.registry import REGISTRY, TargetSpec, get_target
+from bunri.safepath import (
+    is_real_file_in,
+    is_really,
+    real_subdir,
+    replace_into,
+    verified_mkdir,
+)
 from bunri.separate import separate
 
 console = Console()
 
 _NORMALIZE_VERSION = 1
 _SEPARATE_VERSION = 1
+_PAN_SPLIT_VERSION = 1
+
+PAN_SPLIT_SINGLE_NOTE = "L/R に分かれていない曲です"
+LEGACY_MESSAGE = (
+    "身元ファイルがありません。元の入力音源から再生成してください。"
+    "キャッシュが残っていれば分離処理は省略されます。"
+)
 
 
 # `#`/`%` are stripped too: left in, they'd survive into the on-disk slug and
@@ -106,6 +140,181 @@ def _normalize_step(
     cache.write_stage_meta(cache_dir, "normalize", _NORMALIZE_VERSION, params)
     console.print("[green]✓[/green] normalize")
     return True
+
+
+def _pan_split_params(target: str) -> dict[str, object]:
+    return {
+        "target": target,
+        "n_fft": pan_split.N_FFT,
+        "hop": pan_split.HOP,
+        "pad_mode": pan_split.PAD_MODE,
+        "bins": pan_split.BINS,
+        "smooth": pan_split.SMOOTH,
+        "min_peak_distance": pan_split.MIN_PEAK_DISTANCE,
+        "softness": pan_split.SOFTNESS,
+        "min_share": pan_split.MIN_SHARE,
+    }
+
+
+def describe_pan_split(decision: PanSplitDecision) -> str:
+    """"境界 L12、L/R 45%/55%" for a split, "L/R に分かれていない曲" otherwise."""
+    if decision.status != LEFT_RIGHT:
+        return "L/R に分かれていない曲"
+    assert decision.boundary_angle is not None and decision.left_share is not None
+    left = round(decision.left_share * 100)
+    return f"境界 {pan_label(decision.boundary_angle)}、L/R {left}%/{100 - left}%"
+
+
+def _read_cached_decision(path: Path) -> PanSplitDecision | None:
+    try:
+        return PanSplitDecision.from_json(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _pan_split_step(
+    cache_dir: Path, spec: TargetSpec, *, force: bool, upstream_ran: bool
+) -> PanSplitDecision:
+    """Cache stage `pan_split:<target>`: decide on the cached stem and, for a
+    split, write <target>.left.wav / <target>.right.wav beside it.
+
+    The decision json is always written and is the stage's declared output;
+    the two wavs are required on top of it only when the json says they
+    exist. `force` (no_cache, `lr-split --force`) and `upstream_ran` (the
+    stem was just re-separated) recompute regardless.
+    """
+    stage = f"pan_split:{spec.target}"
+    params = _pan_split_params(spec.target)
+    result_json = cache_dir / f"{spec.target}.pan_split.json"
+    left_wav = cache_dir / f"{spec.target}.left.wav"
+    right_wav = cache_dir / f"{spec.target}.right.wav"
+    if not force and not upstream_ran and cache.stage_is_fresh(
+        cache_dir, stage, _PAN_SPLIT_VERSION, params, [result_json]
+    ):
+        decision = _read_cached_decision(result_json)
+        expected_dir = cache_dir.resolve()
+        if decision is not None and (
+            decision.status != LEFT_RIGHT
+            or (
+                is_real_file_in(left_wav, expected_dir)
+                and is_real_file_in(right_wav, expected_dir)
+            )
+        ):
+            console.print("[dim]∙ pan_split: cached[/dim]")
+            return decision
+    # Same discipline as the other stages: no meta while the outputs are
+    # being replaced (see cache.clear_stage_meta).
+    cache.clear_stage_meta(cache_dir, stage)
+    start = time.perf_counter()
+    with console.status("[bold]pan_split[/bold] running…"):
+        decision = split_stem(cache_dir / f"{spec.target}.wav", left_wav, right_wav)
+    if decision.status != LEFT_RIGHT:
+        left_wav.unlink(missing_ok=True)
+        right_wav.unlink(missing_ok=True)
+    payload = json.dumps(decision.to_json(), ensure_ascii=False) + "\n"
+    replace_into(result_json, lambda tmp: tmp.write_text(payload, encoding="utf-8"))
+    cache.write_stage_meta(cache_dir, stage, _PAN_SPLIT_VERSION, params)
+    elapsed = time.perf_counter() - start
+    detail = describe_pan_split(decision) if decision.status == LEFT_RIGHT else "山が 1 つ"
+    console.print(f"[green]✓[/green] pan_split ({elapsed:.0f}s, {detail})")
+    return decision
+
+
+def _pan_split_names(safe: str, spec: TargetSpec) -> tuple[str, ...]:
+    return tuple(
+        f"{safe}.{spec.target}.{side}.{audio_format}"
+        for side in ("left", "right")
+        for audio_format in ("wav", "mp3")
+    )
+
+
+def _export_pan_split(
+    package_dir: Path,
+    safe: str,
+    spec: TargetSpec,
+    cache_dir: Path,
+    decision: PanSplitDecision,
+    *,
+    mp3: bool,
+    song_title: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Publish a split into the package, or clear out a stale one.
+
+    Returns the player's (left, right, note), see _pan_split_player_refs.
+    """
+    if decision.status != LEFT_RIGHT:
+        # A package made by an earlier run can still hold L/R files that the
+        # sidecar no longer vouches for. unlink removes the name, so a
+        # symlink sitting there is removed rather than followed.
+        for name in _pan_split_names(safe, spec):
+            (package_dir / name).unlink(missing_ok=True)
+    else:
+        for side, label in (("left", "L のみ"), ("right", "R のみ")):
+            src = cache_dir / f"{spec.target}.{side}.wav"
+            _export(src, package_dir / f"{safe}.{spec.target}.{side}.wav")
+            if mp3:
+                _export_mp3(
+                    src,
+                    package_dir / f"{safe}.{spec.target}.{side}.mp3",
+                    title=f"{song_title} ({spec.label_ja} {label})",
+                )
+    return _pan_split_player_refs(safe, spec, decision.status, mp3=mp3)
+
+
+def _pan_split_player_refs(
+    safe: str, spec: TargetSpec, status: str, *, mp3: bool
+) -> tuple[str | None, str | None, str | None]:
+    """The player's (left, right, note) for a split result: the two file
+    names for a split (the mp3s when they were written, else the wavs), or
+    the reason text for a stem that has no split."""
+    if status != LEFT_RIGHT:
+        return None, None, PAN_SPLIT_SINGLE_NOTE
+    audio_format = "mp3" if mp3 else "wav"
+    return (
+        f"{safe}.{spec.target}.left.{audio_format}",
+        f"{safe}.{spec.target}.right.{audio_format}",
+        None,
+    )
+
+
+def _player_refs(safe: str, spec: TargetSpec, mp3: bool) -> tuple[str | None, str, str]:
+    """The player's (original, target, backing) file names: the mp3s when
+    they were written, else the wavs (and no original, which is mp3 only)."""
+    if mp3:
+        return (
+            f"{safe}.original.mp3",
+            f"{safe}.{spec.target}.mp3",
+            f"{safe}.{spec.target}.backing.mp3",
+        )
+    return None, f"{safe}.{spec.target}.wav", f"{safe}.{spec.target}.backing.wav"
+
+
+def _write_player(
+    package_dir: Path,
+    safe: str,
+    spec: TargetSpec,
+    song_title: str,
+    *,
+    mp3: bool,
+    left: str | None,
+    right: str | None,
+    note: str | None,
+) -> Path:
+    original_ref, target_ref, backing_ref = _player_refs(safe, spec, mp3)
+    player_dest = package_dir / f"{safe}.{spec.target}.player.html"
+    player_html = render_player(
+        song_title,
+        original=original_ref,
+        target=target_ref,
+        backing=backing_ref,
+        instrument_label=spec.label_ja,
+        left=left,
+        right=right,
+        pan_split_note=note,
+    )
+    replace_into(player_dest, lambda tmp: tmp.write_text(player_html, encoding="utf-8"))
+    console.print(f"→ [cyan]{player_dest}[/cyan]")
+    return player_dest
 
 
 def build_package(
@@ -201,10 +410,12 @@ def build_package(
     # normalize_ran forces a re-separation: if the upstream step re-ran, this
     # step's cached stems were built against an input.wav that may no longer
     # match what's on disk (tab-maker pipeline.run's force cascade).
+    separate_ran = True
     if not no_cache and not normalize_ran and cache.stage_is_fresh(
         cache_dir, separate_step, _SEPARATE_VERSION, separate_params, outputs
     ):
         console.print("[dim]∙ separate: cached[/dim]")
+        separate_ran = False
     else:
         # Same discipline as normalize above, and this stage is where it
         # actually bit: separate() moves the target stem into the cache
@@ -239,6 +450,14 @@ def build_package(
         )
         console.print(f"[green]✓[/green] separate ({elapsed:.0f}s)")
 
+    # A re-separated stem forces a new split, the same cascade as normalize
+    # -> separate above.
+    decision = (
+        _pan_split_step(cache_dir, spec, force=no_cache, upstream_ran=separate_ran)
+        if spec.pan_split
+        else None
+    )
+
     # Defense in depth on top of _safe_filename's own sanitizing: even if a
     # future change to that function (or a caller bypassing it) let a
     # path-separator-bearing title through, this refuses to write outside
@@ -260,9 +479,8 @@ def build_package(
     _export(backing_wav, package_dir / f"{safe}.{spec.target}.backing.wav")
 
     if mp3:
-        target_ref = f"{safe}.{spec.target}.mp3"
-        backing_ref = f"{safe}.{spec.target}.backing.mp3"
-        original_ref: str | None = f"{safe}.original.mp3"
+        original_ref, target_ref, backing_ref = _player_refs(safe, spec, mp3)
+        assert original_ref is not None
         _export_mp3(
             target_wav,
             package_dir / target_ref,
@@ -274,27 +492,215 @@ def build_package(
             title=f"{song_title} ({spec.label_ja}なし)",
         )
         _export_mp3(input_wav, package_dir / original_ref, title=song_title)
-    else:
-        target_ref = f"{safe}.{spec.target}.wav"
-        backing_ref = f"{safe}.{spec.target}.backing.wav"
-        original_ref = None
 
-    player_dest = package_dir / f"{safe}.{spec.target}.player.html"
-    player_html = render_player(
-        song_title,
-        original=original_ref,
-        target=target_ref,
-        backing=backing_ref,
-        instrument_label=spec.label_ja,
+    # begin_target above took this target out of the sidecar, so nothing
+    # links to the L/R files (or their absence) until complete_target below.
+    left = right = note = None
+    if decision is not None:
+        left, right, note = _export_pan_split(
+            package_dir, safe, spec, cache_dir, decision, mp3=mp3, song_title=song_title
+        )
+    _write_player(
+        package_dir, safe, spec, song_title, mp3=mp3, left=left, right=right, note=note
     )
-    replace_into(player_dest, lambda tmp: tmp.write_text(player_html, encoding="utf-8"))
-    console.print(f"→ [cyan]{player_dest}[/cyan]")
 
     complete_target(
         sidecar,
         expected=pending,
         target=spec.target,
         formats=("mp3", "wav") if mp3 else ("wav",),
+        pan_split=decision.status if decision is not None else None,
     )
 
     return package_dir
+
+
+@dataclass(frozen=True)
+class PanSplitOutcome:
+    status: Literal["done", "skipped", "legacy", "failed"]
+    reason: str | None = None
+    decision: PanSplitDecision | None = None
+
+
+def _same_file_content(left: Path, right: Path) -> bool:
+    if left.stat().st_size != right.stat().st_size:
+        return False
+
+    def sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    return sha256(left) == sha256(right)
+
+
+def add_pan_split(
+    out_dir: Path, safe_name: str, *, target: str = "guitar", force: bool = False
+) -> PanSplitOutcome:
+    """Add the L/R split to an existing package, from its cached stem.
+
+    No input audio is needed: the separated stem in out/.cache/<key>/ is the
+    input, the same one build_package() splits. A package whose sidecar
+    already records a split result is skipped unless `force`.
+
+    Expected problems (no cache, a stem that does not match, the target being
+    regenerated meanwhile) come back as a "failed" outcome; anything else
+    propagates.
+    """
+    spec = get_target(target)
+    if not spec.pan_split:
+        return PanSplitOutcome("failed", "この target は L/R 分割に対応していません")
+    identity = inspect_package_identity(out_dir, safe_name)
+    if identity.state == "legacy":
+        return PanSplitOutcome("legacy", LEGACY_MESSAGE)
+    if identity.state != "ready" or identity.metadata is None:
+        reason = identity.issues[0] if identity.issues else "身元ファイルを読み取れません"
+        return PanSplitOutcome("failed", reason)
+    metadata = identity.metadata
+    item = next((x for x in metadata.targets if x.target == spec.target), None)
+    if item is None:
+        return PanSplitOutcome(
+            "skipped",
+            f"{spec.target} の項目がありません({spec.target} のパッケージでないか、"
+            "分離ジョブの実行中)",
+        )
+    if item.pan_split is not None and not force:
+        return PanSplitOutcome("skipped", f"記録済み ({item.pan_split})")
+
+    key = metadata.source.cache_key
+    cache_dir = out_dir / ".cache" / key
+    if not (
+        not cache_dir.is_symlink()
+        and cache_dir.is_dir()
+        and is_really(cache_dir, real_subdir(out_dir, ".cache", key))
+    ):
+        return PanSplitOutcome(
+            "failed",
+            f"キャッシュがありません: {cache_dir}。元の入力音源から再生成してください。",
+        )
+    try:
+        cache.ensure_input_identity(
+            cache_dir, cache.InputDigest(metadata.source.digest, key)
+        )
+    except ValueError:
+        return PanSplitOutcome("failed", "キャッシュが別の入力のものです")
+    stem = cache_dir / f"{spec.target}.wav"
+    if not cache.stage_completed(cache_dir, f"separate:{spec.target}", [stem]):
+        return PanSplitOutcome(
+            "failed",
+            "分離済み stem がキャッシュにありません。元の入力音源から再生成してください。",
+        )
+    # File names follow the directory, as the rest of the package's files do
+    # (see local_package.inspect_package_artifacts); the sidecar is addressed
+    # by the name it declares.
+    safe = identity.name
+    package_dir = identity.directory
+    # The package's own copy of the stem, when it is still there, must be the
+    # one the split is made from: another package sharing this cache may have
+    # re-separated it with a different model since. The copy may have been
+    # deleted (the README says the wavs can go), and then the cache is it.
+    package_stem = package_dir / f"{safe}.{spec.target}.wav"
+    if is_real_file_in(package_stem, package_dir.resolve()) and not _same_file_content(
+        package_stem, stem
+    ):
+        return PanSplitOutcome(
+            "failed",
+            "パッケージの stem とキャッシュが一致しません。元の入力音源から再生成してください。",
+        )
+
+    mp3 = "mp3" in item.formats
+    sidecar = package_dir / ".bunri-package.json"
+    try:
+        decision = _pan_split_step(cache_dir, spec, force=force, upstream_ran=False)
+        # Ordered so the web UI, which only lists L/R files the sidecar says
+        # exist, never links to a file that is missing: for a split the
+        # files and player land first and the sidecar last; for no split the
+        # sidecar stops vouching first, then the old files go.
+        if decision.status == LEFT_RIGHT:
+            left, right, note = _export_pan_split(
+                package_dir, safe, spec, cache_dir, decision,
+                mp3=mp3, song_title=metadata.title,
+            )
+            _write_player(
+                package_dir, safe, spec, metadata.title,
+                mp3=mp3, left=left, right=right, note=note,
+            )
+            set_target_pan_split(
+                sidecar, safe_name=metadata.safe_name, target=spec.target,
+                pan_split=decision.status,
+            )
+        else:
+            set_target_pan_split(
+                sidecar, safe_name=metadata.safe_name, target=spec.target,
+                pan_split=decision.status,
+            )
+            left, right, note = _export_pan_split(
+                package_dir, safe, spec, cache_dir, decision,
+                mp3=mp3, song_title=metadata.title,
+            )
+            _write_player(
+                package_dir, safe, spec, metadata.title,
+                mp3=mp3, left=left, right=right, note=note,
+            )
+    except TargetNotFoundError:
+        # A regeneration of this target began after the checks above. The
+        # files written so far may stay behind, but that regeneration
+        # rewrites all of them when it completes.
+        return PanSplitOutcome(
+            "failed",
+            f"{spec.target} の項目が消えました(Web で分離ジョブ実行中の可能性)。"
+            "完了後に再実行してください。",
+        )
+    except ProcessLockBusy as exc:
+        return PanSplitOutcome("failed", str(exc))
+    return PanSplitOutcome("done", decision=decision)
+
+
+@dataclass(frozen=True)
+class PlayerRewriteOutcome:
+    status: Literal["done", "skipped", "legacy", "failed"]
+    reason: str | None = None
+    targets: tuple[TargetSpec, ...] = ()
+
+
+def rewrite_players(out_dir: Path, safe_name: str) -> PlayerRewriteOutcome:
+    """Write an existing package's players again from the current template.
+
+    Everything the player needs comes from the sidecar (title, formats and
+    the recorded L/R result per target), so no audio is read or written and
+    neither the sidecar nor the cache changes. Targets the registry does not
+    know are left alone.
+    """
+    identity = inspect_package_identity(out_dir, safe_name)
+    if identity.state == "legacy":
+        return PlayerRewriteOutcome("legacy", LEGACY_MESSAGE)
+    if identity.state != "ready" or identity.metadata is None:
+        reason = identity.issues[0] if identity.issues else "身元ファイルを読み取れません"
+        return PlayerRewriteOutcome("failed", reason)
+    metadata = identity.metadata
+    # File names follow the directory, as in add_pan_split.
+    safe = identity.name
+    written: list[TargetSpec] = []
+    for item in metadata.targets:
+        spec = REGISTRY.get(item.target)
+        if spec is None:
+            continue
+        mp3 = "mp3" in item.formats
+        # Same rule as build_package / add_pan_split: no recorded result (a
+        # package from before the split, or a target it does not apply to)
+        # means no L/R buttons at all.
+        left = right = note = None
+        if spec.pan_split and item.pan_split is not None:
+            left, right, note = _pan_split_player_refs(safe, spec, item.pan_split, mp3=mp3)
+        _write_player(
+            identity.directory, safe, spec, metadata.title,
+            mp3=mp3, left=left, right=right, note=note,
+        )
+        written.append(spec)
+    if not written:
+        return PlayerRewriteOutcome(
+            "skipped", "書き直せるプレイヤーがありません(分離ジョブの実行中の可能性)"
+        )
+    return PlayerRewriteOutcome("done", targets=tuple(written))

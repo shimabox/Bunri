@@ -10,6 +10,7 @@ tab/transcription steps to sequence around).
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -177,7 +178,9 @@ def test_build_package_skips_mp3_when_disabled(tmp_path, song_input):
     import json
     sidecar = json.loads((package_dir / ".bunri-package.json").read_text())
     assert sidecar["schema_version"] == 1
-    assert sidecar["targets"] == [{"target": "guitar", "formats": ["wav"]}]
+    assert sidecar["targets"] == [
+        {"target": "guitar", "formats": ["wav"], "pan_split": "single"}
+    ]
     assert len(sidecar["source"]["digest"]) == 40
 
 
@@ -238,7 +241,9 @@ def test_build_package_uses_resolved_title_in_metadata_and_player(
     assert package_dir == out_dir / expected_safe_name
     sidecar = json.loads((package_dir / ".bunri-package.json").read_text())
     assert sidecar["title"] == expected_title
-    assert sidecar["targets"] == [{"target": "guitar", "formats": ["wav"]}]
+    assert sidecar["targets"] == [
+        {"target": "guitar", "formats": ["wav"], "pan_split": "single"}
+    ]
     html = (package_dir / f"{expected_safe_name}.guitar.player.html").read_text(
         encoding="utf-8"
     )
@@ -319,7 +324,7 @@ def test_build_package_targets_coexist_in_cache(tmp_path, song_input):
     import json
     sidecar = json.loads((vocals_dir / ".bunri-package.json").read_text())
     assert sidecar["targets"] == [
-        {"target": "guitar", "formats": ["mp3", "wav"]},
+        {"target": "guitar", "formats": ["mp3", "wav"], "pan_split": "single"},
         {"target": "vocals", "formats": ["mp3", "wav"]},
     ]
 
@@ -340,7 +345,7 @@ def test_build_package_normalize_rerun_forces_reseparation(tmp_path, song_input)
     # are still intact, but the force cascade must re-separate anyway because
     # its cached stems were built against an input.wav that no longer
     # provably matches.
-    [cache_dir] = (out_dir / ".cache").iterdir()
+    [cache_dir] = [p for p in (out_dir / ".cache").iterdir() if p.is_dir()]
     (cache_dir / "input.wav").unlink()
 
     build_package(song_input, out_dir, title="song")
@@ -673,3 +678,145 @@ def test_failed_regeneration_leaves_current_target_invalidated(tmp_path, song_in
         build_package(song_input, out_dir, title="song")
     sidecar = json.loads((package_dir / ".bunri-package.json").read_text())
     assert sidecar["targets"] == []
+
+
+# ---------------------------------------------------------------------------
+# L/R (stereo position) split of the guitar stem
+# ---------------------------------------------------------------------------
+class _PannedFakeSeparator(_PackageFakeSeparator):
+    """Like the default fake, but the target stem is 2 s of a 220 Hz tone on
+    the left channel and 440 Hz on the right, so the split has two parts."""
+
+    def separate(self, audio_file_path, custom_output_names=None):
+        from pan_split_helpers import panned_samples
+
+        written = super().separate(audio_file_path, custom_output_names)
+        target = next(name for name in written if "Other" not in name)
+        sf.write(str(self.output_dir / target), panned_samples(), 8000)
+        return written
+
+
+@pytest.fixture()
+def panned_separator(monkeypatch):
+    from audio_separator import separator as separator_module
+
+    monkeypatch.setattr(separator_module, "Separator", _PannedFakeSeparator)
+
+
+def _sidecar_targets(package_dir: Path) -> list[dict]:
+    return json.loads((package_dir / ".bunri-package.json").read_text())["targets"]
+
+
+def _lr_names(safe: str, formats=("wav", "mp3")) -> list[str]:
+    return [f"{safe}.guitar.{side}.{fmt}" for side in ("left", "right") for fmt in formats]
+
+
+def _track_button(html: str, track: str) -> str | None:
+    match = re.search(rf'<button[^>]*data-track="{track}"[^>]*>', html)
+    return match.group(0) if match else None
+
+
+@_NEED_FFMPEG
+def test_build_package_writes_lr_split_for_a_panned_stem(tmp_path, song_input, panned_separator):
+    package_dir = build_package(song_input, tmp_path / "out", title="song")
+
+    for name in _lr_names("song"):
+        f = package_dir / name
+        assert f.exists() and f.stat().st_size > 0, f"missing or empty: {f}"
+    assert _sidecar_targets(package_dir) == [
+        {"target": "guitar", "formats": ["mp3", "wav"], "pan_split": "left_right"}
+    ]
+    html = (package_dir / "song.guitar.player.html").read_text(encoding="utf-8")
+    assert 'src="song.guitar.left.mp3"' in html
+    assert 'src="song.guitar.right.mp3"' in html
+    assert "L/R に分かれていない曲です" not in html
+
+
+@_NEED_FFMPEG
+def test_build_package_center_stem_records_single_with_reason(tmp_path, song_input):
+    package_dir = build_package(song_input, tmp_path / "out", title="song")
+
+    for name in _lr_names("song"):
+        assert not (package_dir / name).exists()
+    assert _sidecar_targets(package_dir)[0]["pan_split"] == "single"
+    html = (package_dir / "song.guitar.player.html").read_text(encoding="utf-8")
+    assert "L/R に分かれていない曲です" in html
+    for track in ("left", "right"):
+        button = _track_button(html, track)
+        assert button is not None and "disabled" in button
+
+
+@_NEED_FFMPEG
+def test_build_package_lr_split_without_mp3_writes_wav_only(tmp_path, song_input, panned_separator):
+    package_dir = build_package(song_input, tmp_path / "out", title="song", mp3=False)
+
+    for name in _lr_names("song", ("wav",)):
+        assert (package_dir / name).stat().st_size > 0
+    for name in _lr_names("song", ("mp3",)):
+        assert not (package_dir / name).exists()
+    html = (package_dir / "song.guitar.player.html").read_text(encoding="utf-8")
+    assert 'src="song.guitar.left.wav"' in html
+    assert 'src="song.guitar.right.wav"' in html
+
+
+@_NEED_FFMPEG
+def test_build_package_second_run_reuses_the_cached_split(
+    tmp_path, song_input, panned_separator, capsys
+):
+    out_dir = tmp_path / "out"
+    package_dir = build_package(song_input, out_dir, title="song")
+    first = {name: (package_dir / name).read_bytes() for name in _lr_names("song", ("wav",))}
+    capsys.readouterr()
+
+    build_package(song_input, out_dir, title="song")
+
+    assert "pan_split: cached" in capsys.readouterr().out
+    for name, content in first.items():
+        assert (package_dir / name).read_bytes() == content
+
+
+@_NEED_FFMPEG
+def test_build_package_adds_lr_to_a_package_made_before_the_split(
+    tmp_path, song_input, panned_separator
+):
+    from pan_split_helpers import strip_pan_split
+
+    out_dir = tmp_path / "out"
+    package_dir = build_package(song_input, out_dir, title="song")
+    strip_pan_split(out_dir, "song")
+    assert "pan_split" not in _sidecar_targets(package_dir)[0]
+    separations = len(_PackageFakeSeparator.instances)
+
+    build_package(song_input, out_dir, title="song")
+
+    assert len(_PackageFakeSeparator.instances) == separations, "separate must stay cached"
+    assert _sidecar_targets(package_dir)[0]["pan_split"] == "left_right"
+    for name in _lr_names("song"):
+        assert (package_dir / name).stat().st_size > 0
+
+
+@_NEED_FFMPEG
+def test_build_package_other_targets_get_no_lr_split(tmp_path, song_input, panned_separator):
+    out_dir = tmp_path / "out"
+    package_dir = build_package(song_input, out_dir, title="song", target="bass")
+
+    assert not list(package_dir.glob("*.left.*")) and not list(package_dir.glob("*.right.*"))
+    assert _sidecar_targets(package_dir) == [{"target": "bass", "formats": ["mp3", "wav"]}]
+    html = (package_dir / "song.bass.player.html").read_text(encoding="utf-8")
+    assert _track_button(html, "left") is None and _track_button(html, "right") is None
+    [cache_dir] = [p for p in (out_dir / ".cache").iterdir() if p.is_dir()]
+    assert not (cache_dir / "pan_split:bass.meta.json").exists()
+
+
+@_NEED_FFMPEG
+def test_build_package_single_removes_stale_lr_files(tmp_path, song_input):
+    out_dir = tmp_path / "out"
+    package_dir = out_dir / "song"
+    package_dir.mkdir(parents=True)
+    for name in _lr_names("song"):
+        (package_dir / name).write_bytes(b"left over from an earlier split")
+
+    build_package(song_input, out_dir, title="song")
+
+    for name in _lr_names("song"):
+        assert not (package_dir / name).exists()

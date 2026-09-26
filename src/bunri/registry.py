@@ -1,6 +1,7 @@
 """Target-instrument registry: maps a ``--target`` name to the separation
 model (and stem name) that extracts it, plus the fallback model and player
-label to use for it.
+label to use for it, and whether its stem is also split by stereo position
+into L/R tracks.
 
 Phase 1 only registers "guitar"; the shape is deliberately generic so future
 targets (bass, drums, vocals, piano -- see the Bunri founding plan) can be
@@ -19,6 +20,11 @@ class TargetSpec:
     default_model: str  # e.g. "mel_band_roformer_guitar_becruily.ckpt"
     fallback_model: str | None  # e.g. "htdemucs_6s.yaml"; None if no fallback
     label_ja: str  # player UI label, e.g. "ギター"
+    # Whether packages for this target also get a stereo-position split of
+    # the separated stem into "L のみ" / "R のみ" tracks (bunri/pan_split.py).
+    # Only guitar sets it: rock/pop mixes often pan two guitar parts hard left
+    # and right, which a single "ギターのみ" stem cannot tell apart.
+    pan_split: bool = False
 
 
 REGISTRY: dict[str, TargetSpec] = {
@@ -40,6 +46,7 @@ REGISTRY: dict[str, TargetSpec] = {
         default_model="mel_band_roformer_guitar_becruily.ckpt",
         fallback_model="htdemucs_6s.yaml",
         label_ja="ギター",
+        pan_split=True,
     ),
     # bass/drums/piano reuse the 6-stem Demucs: no single-instrument
     # specialist for them ships in the catalog with a better measured score,

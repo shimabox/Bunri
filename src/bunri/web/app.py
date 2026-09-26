@@ -159,22 +159,34 @@ def _serialize_song(song: Song, pocket_job: Job | None = None) -> dict:
                 package_name = song.package_name
                 label = _target_label(target.target)
                 downloads = []
-                for track, track_label, suffix, files in (
+                tracks = [
                     ("target", f"{label}のみ", "", dict(artifacts.target_files)),
                     ("backing", f"{label}なし", ".backing", dict(artifacts.backing_files)),
-                ):
+                ]
+                # L/R are listed only when the sidecar says they were made;
+                # a missing file just drops out of the list below, without
+                # touching the song's status.
+                if artifacts.pan_split == "left_right":
+                    tracks += [
+                        ("left", "L のみ", ".left", dict(artifacts.left_files)),
+                        ("right", "R のみ", ".right", dict(artifacts.right_files)),
+                    ]
+                for track, track_label, suffix, files in tracks:
+                    track_files = [
+                        {
+                            "format": audio_format,
+                            "url": f"/packages/{quote(f'{package_name}/{package_name}.{target.target}{suffix}.{audio_format}')}",
+                            "filename": f"{safe_filename(song.title)}_{track_label}.{audio_format}",
+                        }
+                        for audio_format in artifacts.complete_formats
+                        if files[audio_format].present
+                    ]
+                    if track in ("left", "right") and not track_files:
+                        continue
                     downloads.append({
                         "track": track,
                         "label": track_label,
-                        "files": [
-                            {
-                                "format": audio_format,
-                                "url": f"/packages/{quote(f'{package_name}/{package_name}.{target.target}{suffix}.{audio_format}')}",
-                                "filename": f"{safe_filename(song.title)}_{track_label}.{audio_format}",
-                            }
-                            for audio_format in artifacts.complete_formats
-                            if files[audio_format].present
-                        ],
+                        "files": track_files,
                     })
                 serialized["downloads"] = downloads
                 serialized["package_url"] = (

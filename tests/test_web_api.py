@@ -2362,3 +2362,101 @@ def test_mp4_video_upload_is_accepted(client):
     assert resp.status_code == 202
     job_id = resp.json()["job_id"]
     _wait_until(lambda: _job_status(client, job_id) == "done")
+
+
+# ---------------------------------------------------------------------------
+# L/R (stereo position split) downloads
+# ---------------------------------------------------------------------------
+def _write_lr_package(out_dir: Path, pan_split: str | None, *, lr_files: bool) -> Path:
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+
+    package = out_dir / "LR Song"
+    package.mkdir(parents=True)
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "LR Song",
+            "LR Song",
+            SourceIdentity("sha1", "c" * 40, "c" * 12),
+            (TargetMetadata("guitar", ("mp3", "wav"), pan_split),),
+        ),
+    )
+    suffixes = ["", ".backing"] + ([".left", ".right"] if lr_files else [])
+    for suffix in suffixes:
+        for audio_format in ("mp3", "wav"):
+            (package / f"LR Song.guitar{suffix}.{audio_format}").write_bytes(b"artifact")
+    (package / "LR Song.guitar.player.html").write_bytes(b"<html>")
+    (package / "LR Song.original.mp3").write_bytes(b"artifact")
+    return package
+
+
+def _song_target(out_dir: Path) -> dict:
+    app = create_app(out_dir, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        return client.get("/api/songs").json()[0]["targets"][0]
+
+
+def test_left_right_package_lists_four_download_rows(tmp_path):
+    _write_lr_package(tmp_path, "left_right", lr_files=True)
+
+    target = _song_target(tmp_path)
+
+    assert target["status"] == "done" and target["missing_files"] is False
+    assert [(g["track"], g["label"]) for g in target["downloads"]] == [
+        ("target", "ギターのみ"),
+        ("backing", "ギターなし"),
+        ("left", "L のみ"),
+        ("right", "R のみ"),
+    ]
+    left = target["downloads"][2]["files"]
+    assert [f["format"] for f in left] == ["mp3", "wav"]
+    assert left[0]["url"] == "/packages/LR%20Song/LR%20Song.guitar.left.mp3"
+    assert left[0]["filename"] == "LR Song_L のみ.mp3"
+
+
+@pytest.mark.parametrize(
+    ("pan_split", "lr_files"),
+    [("single", False), ("single", True), (None, True), ("left_right", False)],
+)
+def test_lr_rows_need_both_the_record_and_the_files(tmp_path, pan_split, lr_files):
+    _write_lr_package(tmp_path, pan_split, lr_files=lr_files)
+
+    target = _song_target(tmp_path)
+
+    # The split never changes whether the song counts as complete.
+    assert target["status"] == "done" and target["missing_files"] is False
+    assert [g["track"] for g in target["downloads"]] == ["target", "backing"]
+
+
+def test_lr_split_added_later_shows_up_in_the_song_list(tmp_path, monkeypatch):
+    import shutil as _shutil
+
+    if _shutil.which("ffmpeg") is None:
+        pytest.skip("needs ffmpeg")
+    import numpy as np
+    import soundfile as sf
+
+    from bunri.package import add_pan_split, build_package
+    from pan_split_helpers import FakeSeparator, install_fake_separator, strip_pan_split
+
+    install_fake_separator(monkeypatch, FakeSeparator)
+    source = tmp_path / "input.wav"
+    sf.write(str(source), np.zeros((13230, 2), dtype=np.float32), 44100)
+    build_package(source, tmp_path, title="Song")
+    strip_pan_split(tmp_path, "Song")
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        before = client.get("/api/songs").json()[0]["targets"][0]
+        assert [g["track"] for g in before["downloads"]] == ["target", "backing"]
+
+        assert add_pan_split(tmp_path, "Song").status == "done"
+
+        after = client.get("/api/songs").json()[0]["targets"][0]
+        assert [g["track"] for g in after["downloads"]] == ["target", "backing", "left", "right"]
+        assert after["status"] == before["status"] == "done"

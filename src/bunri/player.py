@@ -4,7 +4,8 @@ The output is a single offline HTML file that plays three sibling audio files
 (``<title>.original.mp3`` / ``.<target>.mp3`` / ``.backing.mp3``) in sync so a
 learner can switch between the full mix, the isolated target instrument and
 the minus-one backing while keeping their place, loop an A-B section and slow
-the tempo down without changing pitch.
+the tempo down without changing pitch. When the target stem was split by
+stereo position, two more tracks (``.<target>.left`` / ``.right``) join them.
 
 Only the HTML is emitted here; the audio is *not* embedded. The player refers
 to each track by a plain relative URL on an ``<audio src>`` attribute, which is
@@ -38,6 +39,9 @@ def render_player(
     backing: str | None,
     instrument_label: str,
     generated_at: str | None = None,
+    left: str | None = None,
+    right: str | None = None,
+    pan_split_note: str | None = None,
 ) -> str:
     """Render the standalone practice player HTML.
 
@@ -49,6 +53,14 @@ def render_player(
         instrument_label: Japanese label for the target instrument (e.g. "ギター"),
             used to build the "{label}のみ" / "{label}なし" track names and header.
         generated_at: Footer timestamp; defaults to now if not given.
+        left: Relative filename of the "L のみ" track (the stem's left side
+            of a stereo-position split), or ``None``.
+        right: Relative filename of the "R のみ" track, or ``None``.
+        pan_split_note: Why there are no L/R tracks (e.g. the stem has only
+            one stereo position). When set, the L/R buttons are drawn
+            disabled with this text under them. With ``left``, ``right`` and
+            this all ``None`` the L/R buttons are not drawn at all -- the
+            split does not apply to this target.
 
     Returns:
         A single self-contained HTML document (audio referenced, not embedded).
@@ -71,6 +83,10 @@ def render_player(
         original_src=quote(original) if original is not None else None,
         target_src=quote(target) if target is not None else None,
         backing_src=quote(backing) if backing is not None else None,
+        left_src=quote(left) if left is not None else None,
+        right_src=quote(right) if right is not None else None,
+        show_pan_split=left is not None or right is not None or pan_split_note is not None,
+        pan_split_note=pan_split_note,
         instrument_label=instrument_label,
         generated_at=generated_at,
     )
