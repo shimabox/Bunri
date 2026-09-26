@@ -1642,42 +1642,46 @@ def test_download_toggle_focus_survives_partial_completion_polling_redraw(tmp_pa
         )
 
 
+def _show_left_right_download_groups(page, tmp_path):
+    _upload_from_page(page, tmp_path / "lr-song.mp3")
+    page.wait_for_selector("a.sw-open-link", timeout=10_000)
+
+    def with_left_right_tracks(route):
+        response = route.fetch()
+        songs = response.json()
+        for song in songs:
+            for target in song["targets"]:
+                if not target["downloads"]:
+                    continue
+                for track, label in (("left", "L のみ"), ("right", "R のみ")):
+                    target["downloads"].append({
+                        "track": track,
+                        "label": label,
+                        "files": [
+                            {
+                                "format": audio_format,
+                                "url": f"/packages/lr/lr.guitar.{track}.{audio_format}",
+                                "filename": f"lr_{label}.{audio_format}",
+                            }
+                            for audio_format in ("mp3", "wav")
+                        ],
+                    })
+        route.fulfill(response=response, json=songs)
+
+    page.route("**/api/songs", with_left_right_tracks)
+    page.evaluate("window.__bunriWeb.refresh()")
+    page.wait_for_function(
+        "document.querySelectorAll('.sw-download-group').length === 4",
+        timeout=5_000,
+    )
+    return page.locator(".sw-download-group")
+
+
 @_needs_browser
 def test_download_groups_form_two_aligned_columns_and_stay_inside_the_card(tmp_path):
     app = create_app(tmp_path / "out", runner=PageFakeRunner())
     with _running_server(app) as base_url, _open_page(base_url) as page:
-        _upload_from_page(page, tmp_path / "lr-song.mp3")
-        page.wait_for_selector("a.sw-open-link", timeout=10_000)
-
-        def with_left_right_tracks(route):
-            response = route.fetch()
-            songs = response.json()
-            for song in songs:
-                for target in song["targets"]:
-                    if not target["downloads"]:
-                        continue
-                    for track, label in (("left", "L のみ"), ("right", "R のみ")):
-                        target["downloads"].append({
-                            "track": track,
-                            "label": label,
-                            "files": [
-                                {
-                                    "format": audio_format,
-                                    "url": f"/packages/lr/lr.guitar.{track}.{audio_format}",
-                                    "filename": f"lr_{label}.{audio_format}",
-                                }
-                                for audio_format in ("mp3", "wav")
-                            ],
-                        })
-            route.fulfill(response=response, json=songs)
-
-        page.route("**/api/songs", with_left_right_tracks)
-        page.evaluate("window.__bunriWeb.refresh()")
-        groups = page.locator(".sw-download-group")
-        page.wait_for_function(
-            "document.querySelectorAll('.sw-download-group').length === 4",
-            timeout=5_000,
-        )
+        groups = _show_left_right_download_groups(page, tmp_path)
         assert groups.locator(".sw-download-label").all_text_contents() == [
             "ギターのみ", "ギターなし", "L のみ", "R のみ",
         ]
@@ -1732,6 +1736,60 @@ def test_download_groups_form_two_aligned_columns_and_stay_inside_the_card(tmp_p
             if overflow["groupsOverCard"] > 0 or overflow["pageOverflow"] > 0:
                 overflows.append((width, overflow))
         assert overflows == []
+
+
+@_needs_browser
+def test_download_groups_stay_inside_the_card_when_only_the_text_size_grows(tmp_path):
+    app = create_app(tmp_path / "out", runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        groups = _show_left_right_download_groups(page, tmp_path)
+        page.locator("button.sw-download-toggle").click()
+        assert page.locator(".sw-downloads").is_visible()
+
+        def column_xs():
+            return groups.evaluate_all(
+                "groups => groups.map(group => group.getBoundingClientRect().x)"
+            )
+
+        def clipped():
+            return page.evaluate(
+                "() => {"
+                "  const card = document.querySelector('.sw-download-group').closest('li');"
+                "  const cardRight = card.getBoundingClientRect().right;"
+                "  const clipped = [];"
+                "  for (const group of document.querySelectorAll('.sw-download-group')) {"
+                "    const groupRight = group.getBoundingClientRect().right;"
+                "    const links = group.querySelectorAll('a.sw-download-link');"
+                "    const lastLinkRight = links[links.length - 1].getBoundingClientRect().right;"
+                "    if (groupRight > cardRight || lastLinkRight > groupRight) {"
+                "      clipped.push({"
+                "        track: group.dataset.track,"
+                "        groupOverCard: groupRight - cardRight,"
+                "        linkOverGroup: lastLinkRight - groupRight,"
+                "      });"
+                "    }"
+                "  }"
+                "  return clipped;"
+                "}"
+            )
+
+        page.set_viewport_size({"width": 900, "height": 800})
+        xs = column_xs()
+        assert xs[0] == xs[2] and xs[1] == xs[3] and xs[0] < xs[1]
+
+        failures = []
+        for width in (900, 1200):
+            page.set_viewport_size({"width": width, "height": 800})
+            for font_size in (20, 24, 32):
+                page.evaluate(f"document.documentElement.style.fontSize = '{font_size}px'")
+                found = clipped()
+                if found:
+                    failures.append((width, font_size, found))
+        assert failures == []
+
+        page.set_viewport_size({"width": 900, "height": 800})
+        page.evaluate("document.documentElement.style.fontSize = '32px'")
+        assert len(set(column_xs())) == 1
 
 
 @_needs_browser

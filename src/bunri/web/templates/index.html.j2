@@ -252,7 +252,7 @@
   button.sw-job-toggle[aria-expanded="true"] .sw-job-chevron { transform: rotate(180deg); }
   .sw-job-content { padding: 0 16px 14px; }
   .sw-job-content[hidden] { display: none; }
-  .sw-target-block { min-width: 0; }
+  .sw-target-block { min-width: 0; container-type: inline-size; }
   .sw-target-row {
     display: flex;
     align-items: center;
@@ -365,7 +365,7 @@
     text-transform: uppercase;
   }
   a.sw-download-link:hover { background: #e9f5f2; }
-  @media (max-width: 540px) {
+  @container (max-width: 33em) {
     .sw-downloads {
       grid-template-columns: minmax(0, 1fr);
       padding-left: 0;
