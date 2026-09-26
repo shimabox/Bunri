@@ -1643,7 +1643,7 @@ def test_download_toggle_focus_survives_partial_completion_polling_redraw(tmp_pa
 
 
 @_needs_browser
-def test_download_groups_form_two_aligned_columns_and_stack_on_narrow_screens(tmp_path):
+def test_download_groups_form_two_aligned_columns_and_stay_inside_the_card(tmp_path):
     app = create_app(tmp_path / "out", runner=PageFakeRunner())
     with _running_server(app) as base_url, _open_page(base_url) as page:
         _upload_from_page(page, tmp_path / "lr-song.mp3")
@@ -1711,6 +1711,27 @@ def test_download_groups_form_two_aligned_columns_and_stack_on_narrow_screens(tm
         assert page.evaluate(
             "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
         )
+
+        overflows = []
+        for width in range(320, 901, 8):
+            page.set_viewport_size({"width": width, "height": 800})
+            overflow = page.evaluate(
+                "() => {"
+                "  const card = document.querySelector('.sw-download-group').closest('li');"
+                "  const cardRight = card.getBoundingClientRect().right;"
+                "  const groupsRight = Math.max(..."
+                "    [...document.querySelectorAll('.sw-download-group')]"
+                "      .map(group => group.getBoundingClientRect().right));"
+                "  const root = document.documentElement;"
+                "  return {"
+                "    groupsOverCard: groupsRight - cardRight,"
+                "    pageOverflow: root.scrollWidth - root.clientWidth,"
+                "  };"
+                "}"
+            )
+            if overflow["groupsOverCard"] > 0 or overflow["pageOverflow"] > 0:
+                overflows.append((width, overflow))
+        assert overflows == []
 
 
 @_needs_browser
