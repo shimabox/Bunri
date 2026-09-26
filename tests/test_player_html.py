@@ -456,3 +456,131 @@ def test_play_button_click_starts_playback_as_user_gesture(tmp_path):
         page.wait_for_function("window.__player.state().playing === true", timeout=8_000)
         page.wait_for_function("window.__player.state().currentTime > 0.1", timeout=8_000)
         assert page.evaluate("window.__player.state().playing") is True
+
+
+# --------------------------------------------------------------------------
+# L/R (stereo position split) tracks
+# --------------------------------------------------------------------------
+def _button(html: str, track: str) -> str | None:
+    match = re.search(rf'<button[^>]*data-track="{track}"[^>]*>.*?</button>', html, re.S)
+    return match.group(0) if match else None
+
+
+def _markup(html: str) -> str:
+    """The document without its script, where TRACKS/LABELS mention every
+    track name regardless of what was rendered."""
+    return html.split("<script>")[0]
+
+
+def test_lr_buttons_are_absent_when_the_split_does_not_apply():
+    out = render_player(
+        "s", original="o.mp3", target="t.mp3", backing="b.mp3", instrument_label="ベース"
+    )
+    markup = _markup(out)
+    assert _button(markup, "left") is None and _button(markup, "right") is None
+    assert 'id="tm-audio-left"' not in markup and 'class="tm-pan-note"' not in markup
+    assert "<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> トラック切替" in markup
+    assert "L のみ" not in markup
+
+
+def test_lr_tracks_render_buttons_audio_and_help():
+    out = render_player(
+        "s",
+        original="s.original.mp3",
+        target="s.guitar.mp3",
+        backing="s.guitar.backing.mp3",
+        instrument_label=_LABEL,
+        left="s.guitar.left.mp3",
+        right="s.guitar.right.mp3",
+    )
+    markup = _markup(out)
+    assert 'id="tm-audio-left" data-track="left" preload="auto" src="s.guitar.left.mp3"' in markup
+    assert 'id="tm-audio-right" data-track="right" preload="auto" src="s.guitar.right.mp3"' in markup
+    left, right = _button(markup, "left"), _button(markup, "right")
+    assert left and "L のみ" in left and "disabled" not in left
+    assert right and "R のみ" in right and "disabled" not in right
+    # After the existing three buttons.
+    assert markup.index('data-track="backing"') < markup.index('data-track="left"')
+    assert "<kbd>1</kbd>〜<kbd>5</kbd> トラック切替" in markup
+    assert "/ L のみ / R のみ) は、この HTML と同じフォルダに置いてください" in markup
+    assert 'class="tm-pan-note"' not in markup
+    assert 'case "4": switchTrack("left")' in out
+    assert 'case "5": switchTrack("right")' in out
+
+
+def test_lr_note_renders_disabled_buttons_and_the_reason():
+    out = render_player(
+        "s",
+        original="s.original.mp3",
+        target="s.guitar.mp3",
+        backing="s.guitar.backing.mp3",
+        instrument_label=_LABEL,
+        pan_split_note="L/R に分かれていない曲です",
+    )
+    markup = _markup(out)
+    left, right = _button(markup, "left"), _button(markup, "right")
+    assert left and "disabled" in left and "（無し）" not in left
+    assert right and "disabled" in right and "（無し）" not in right
+    assert '<p class="tm-pan-note">L/R に分かれていない曲です</p>' in markup
+    assert 'id="tm-audio-left"' not in markup and 'id="tm-audio-right"' not in markup
+    assert "/ L のみ / R のみ)" not in markup
+
+
+def _render_lr_dir(tmp_path: Path, *, split: bool = True) -> Path:
+    for name in ("song.original.mp3", "song.guitar.mp3", "song.guitar.backing.mp3"):
+        _make_silence(tmp_path / name)
+    if split:
+        for name in ("song.guitar.left.mp3", "song.guitar.right.mp3"):
+            _make_silence(tmp_path / name)
+    html = render_player(
+        "練習曲",
+        original="song.original.mp3",
+        target="song.guitar.mp3",
+        backing="song.guitar.backing.mp3",
+        instrument_label=_LABEL,
+        left="song.guitar.left.mp3" if split else None,
+        right="song.guitar.right.mp3" if split else None,
+        pan_split_note=None if split else "L/R に分かれていない曲です",
+    )
+    page_path = tmp_path / "player.html"
+    page_path.write_text(html, encoding="utf-8")
+    return page_path
+
+
+@_needs_runtime
+def test_lr_track_switch_keeps_position_and_keys_4_5_select_lr(tmp_path):
+    with _open(_render_lr_dir(tmp_path)) as page:
+        page.wait_for_function("window.__player.state().ready === true", timeout=15_000)
+        page.wait_for_function(
+            "window.__player.state().tracks.left.available"
+            " && window.__player.state().tracks.right.available",
+            timeout=15_000,
+        )
+        page.evaluate("window.__player.play()")
+        page.wait_for_function("window.__player.state().currentTime > 0.3", timeout=8_000)
+
+        page.evaluate("window.__player.switchTrack('left')")
+        after = page.evaluate("window.__player.state()")
+        assert after["activeTrack"] == "left"
+        assert after["lastSwitchDrift"] < 0.05, after["lastSwitchDrift"]
+
+        page.keyboard.press("5")
+        assert page.evaluate("window.__player.state().activeTrack") == "right"
+        page.keyboard.press("4")
+        assert page.evaluate("window.__player.state().activeTrack") == "left"
+
+
+@_needs_runtime
+def test_single_player_has_unavailable_lr_tracks(tmp_path):
+    with _open(_render_lr_dir(tmp_path, split=False)) as page:
+        page.wait_for_function("window.__player.state().ready === true", timeout=15_000)
+        st = page.evaluate("window.__player.state()")
+        assert st["tracks"]["left"]["available"] is False
+        assert st["tracks"]["right"]["available"] is False
+        disabled = page.evaluate(
+            "['left','right'].map(function(t){return document.querySelector("
+            "'button.tm-trk[data-track=\"'+t+'\"]').disabled;})"
+        )
+        assert disabled == [True, True]
+        page.keyboard.press("4")
+        assert page.evaluate("window.__player.state().activeTrack") == "original"

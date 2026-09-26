@@ -128,6 +128,11 @@
     padding: 1px 6px;
     font-size: 0.72rem;
   }
+  .tm-pan-note {
+    margin: -8px 0 18px;
+    color: #8a7f74;
+    font-size: 0.82rem;
+  }
   .tm-offline-note {
     margin: 18px 0 0;
     color: #b3a99c;
@@ -155,13 +160,22 @@
   {% if original_src %}<audio id="tm-audio-original" data-track="original" preload="auto" src="{{ original_src }}"></audio>{% endif %}
   {% if target_src %}<audio id="tm-audio-target" data-track="target" preload="auto" src="{{ target_src }}"></audio>{% endif %}
   {% if backing_src %}<audio id="tm-audio-backing" data-track="backing" preload="auto" src="{{ backing_src }}"></audio>{% endif %}
+  {% if left_src %}<audio id="tm-audio-left" data-track="left" preload="auto" src="{{ left_src }}"></audio>{% endif %}
+  {% if right_src %}<audio id="tm-audio-right" data-track="right" preload="auto" src="{{ right_src }}"></audio>{% endif %}
 
   <div class="tm-row">
     <span class="tm-label">トラック</span>
     <button type="button" class="tm-btn tm-trk" data-track="original"{% if not original_src %} disabled{% endif %}>原曲{% if not original_src %}（無し）{% endif %}</button>
     <button type="button" class="tm-btn tm-trk" data-track="target"{% if not target_src %} disabled{% endif %}>{{ instrument_label }}のみ{% if not target_src %}（無し）{% endif %}</button>
     <button type="button" class="tm-btn tm-trk" data-track="backing"{% if not backing_src %} disabled{% endif %}>{{ instrument_label }}なし{% if not backing_src %}（無し）{% endif %}</button>
+    {% if show_pan_split %}
+    <button type="button" class="tm-btn tm-trk" data-track="left"{% if not left_src %} disabled{% endif %}>L のみ{% if not left_src and not pan_split_note %}（無し）{% endif %}</button>
+    <button type="button" class="tm-btn tm-trk" data-track="right"{% if not right_src %} disabled{% endif %}>R のみ{% if not right_src and not pan_split_note %}（無し）{% endif %}</button>
+    {% endif %}
   </div>
+  {% if pan_split_note %}
+  <p class="tm-pan-note">{{ pan_split_note }}</p>
+  {% endif %}
 
   <div class="tm-row">
     <button type="button" id="tm-play" class="tm-btn tm-play">再生</button>
@@ -192,13 +206,13 @@
     <kbd>A</kbd>/<kbd>B</kbd> A点/B点 &middot;
     <kbd>C</kbd> ループ解除 &middot;
     <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> &plusmn;3秒 &middot;
-    <kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> トラック切替 &middot;
+    {% if show_pan_split %}<kbd>1</kbd>〜<kbd>5</kbd> トラック切替{% else %}<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> トラック切替{% endif %} &middot;
     <kbd>+</kbd>/<kbd>-</kbd> 速度
   </p>
 
   <p class="tm-offline-note">
     このプレイヤーはオフラインで動作します。音声ファイル
-    (原曲 / {{ instrument_label }}のみ / {{ instrument_label }}なし) は、この HTML と同じフォルダに置いてください。
+    (原曲 / {{ instrument_label }}のみ / {{ instrument_label }}なし{% if left_src or right_src %} / L のみ / R のみ{% endif %}) は、この HTML と同じフォルダに置いてください。
   </p>
 </main>
 
@@ -217,8 +231,14 @@
   // ship in production (it only wraps the same actions the buttons trigger).
   window.__player = { state: function () { return { ready: false }; } };
 
-  var TRACKS = ["original", "target", "backing"];
-  var LABELS = { original: "原曲", target: "{{ instrument_label }}のみ", backing: "{{ instrument_label }}なし" };
+  var TRACKS = ["original", "target", "backing", "left", "right"];
+  var LABELS = {
+    original: "原曲",
+    target: "{{ instrument_label }}のみ",
+    backing: "{{ instrument_label }}なし",
+    left: "L のみ",
+    right: "R のみ"
+  };
 
   // Muted background tracks drifting from the active track's clock by more than
   // this (seconds) get nudged back onto it, so switching to one is heard within
@@ -567,6 +587,8 @@
       case "1": switchTrack("original"); break;
       case "2": switchTrack("target"); break;
       case "3": switchTrack("backing"); break;
+      case "4": switchTrack("left"); break;
+      case "5": switchTrack("right"); break;
       case "+": case "=": e.preventDefault(); stepRate(RATE_STEP); break;
       case "-": case "_": e.preventDefault(); stepRate(-RATE_STEP); break;
       default: break;

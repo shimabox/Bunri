@@ -29,6 +29,18 @@ def test_preflight_hashes_assets_in_contract_order(tmp_path):
     assert all(x.descriptor.bytes > 0 and len(x.descriptor.sha256) == 64 for x in package.assets)
 
 
+def test_preflight_ignores_lr_split_files_and_field(tmp_path):
+    out = tmp_path / "out"; directory = out / "Song"; directory.mkdir(parents=True)
+    metadata = PackageMetadata("A title", "Song", SourceIdentity("sha1", "a" * 40, "a" * 12), (TargetMetadata("guitar", ("mp3", "wav"), "left_right"),))
+    write_package_metadata(directory / ".bunri-package.json", metadata)
+    for name in ("Song.original.mp3", "Song.guitar.mp3", "Song.guitar.backing.mp3"): (directory / name).write_bytes(name.encode())
+    for side in ("left", "right"):
+        for audio_format in ("mp3", "wav"): (directory / f"Song.guitar.{side}.{audio_format}").write_bytes(b"lr")
+    package = preflight(out, "Song")
+    assert [x.descriptor.remote_name for x in package.assets] == ["original.mp3", "guitar.mp3", "guitar.backing.mp3"]
+    assert package.metadata.targets[0].pan_split == "left_right"
+
+
 def test_preflight_accepts_nfd_directory_with_nfc_sidecar(tmp_path):
     nfc_name = "ざらめのゆき"
     nfd_name = unicodedata.normalize("NFD", nfc_name)

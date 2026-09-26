@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from bunri.package_metadata import PackageMetadata, SourceIdentity, read_package_metadata
+from bunri.package_metadata import (
+    PAN_SPLIT_VALUES,
+    PackageMetadata,
+    SourceIdentity,
+    read_package_metadata,
+)
 from bunri.safepath import is_real_file_in
 
 
@@ -45,6 +50,13 @@ class TargetArtifactInspection:
     target_files: tuple[tuple[str, ArtifactInspection], ...]
     backing_files: tuple[tuple[str, ArtifactInspection], ...]
     player: ArtifactInspection
+    # The sidecar's pan_split for this target. left_files/right_files are
+    # inspected only for "left_right" and are extras: they never count
+    # toward complete_formats or the package's issues, since a song without
+    # an L/R split is complete as it is.
+    pan_split: str | None = None
+    left_files: tuple[tuple[str, ArtifactInspection], ...] = ()
+    right_files: tuple[tuple[str, ArtifactInspection], ...] = ()
 
     @property
     def complete_formats(self) -> tuple[str, ...]:
@@ -236,6 +248,11 @@ def _metadata_issues(
                 or len(set(formats)) != len(formats)
             ):
                 issues.append(f"invalid formats for package target {target}")
+            pan_split = item.get("pan_split")
+            if "pan_split" in item and (
+                not isinstance(pan_split, str) or pan_split not in PAN_SPLIT_VALUES
+            ):
+                issues.append(f"invalid pan_split for package target {target}")
     return issues, identity, tuple(enumerable), isinstance(raw_targets, list)
 
 
@@ -338,34 +355,38 @@ def inspect_package_artifacts(
     if original.issue:
         issues.append(f"original: {original.issue}")
     targets: list[TargetArtifactInspection] = []
+    pan_splits = (
+        {item.target: item.pan_split for item in identity.metadata.targets}
+        if identity.metadata is not None
+        else {}
+    )
     for target, raw_formats in identity.targets:
         formats = tuple(
             audio_format
             for audio_format in raw_formats
             if isinstance(audio_format, str) and audio_format in {"mp3", "wav"}
         )
-        target_files = tuple(
-            (
-                audio_format,
-                inspect_artifact(
-                    directory / f"{identity.name}.{target}.{audio_format}",
-                    directory,
-                    hash_file=hash_files,
-                ),
+
+        def role_files(suffix: str) -> tuple[tuple[str, ArtifactInspection], ...]:
+            return tuple(
+                (
+                    audio_format,
+                    inspect_artifact(
+                        directory / f"{identity.name}.{target}{suffix}.{audio_format}",
+                        directory,
+                        hash_file=hash_files,
+                    ),
+                )
+                for audio_format in formats
             )
-            for audio_format in formats
-        )
-        backing_files = tuple(
-            (
-                audio_format,
-                inspect_artifact(
-                    directory / f"{identity.name}.{target}.backing.{audio_format}",
-                    directory,
-                    hash_file=hash_files,
-                ),
-            )
-            for audio_format in formats
-        )
+
+        target_files = role_files("")
+        backing_files = role_files(".backing")
+        pan_split = pan_splits.get(target)
+        if pan_split == "left_right":
+            left_files, right_files = role_files(".left"), role_files(".right")
+        else:
+            left_files = right_files = ()
         player = inspect_artifact(
             directory / f"{identity.name}.{target}.player.html",
             directory,
@@ -379,7 +400,14 @@ def inspect_package_artifacts(
             issues.append(f"{target} player: {player.issue}")
         targets.append(
             TargetArtifactInspection(
-                target, formats, target_files, backing_files, player
+                target,
+                formats,
+                target_files,
+                backing_files,
+                player,
+                pan_split,
+                left_files,
+                right_files,
             )
         )
     return PackageArtifactInspection(directory, original, tuple(targets), tuple(issues))

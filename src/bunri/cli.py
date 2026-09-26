@@ -27,6 +27,13 @@ def dispatch() -> None:
 
         sys.argv = [sys.argv[0], *sys.argv[2:]]
         pocket_app(prog_name="bunri pocket")
+    elif len(sys.argv) > 1 and sys.argv[1] == "lr-split":
+        # A second command on `app` would turn it into a group and break
+        # `bunri song.mp3`, so lr-split is dispatched here like pocket.
+        from bunri.lr_split_cli import app as lr_split_app
+
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        lr_split_app(prog_name="bunri lr-split")
     else:
         app()
 

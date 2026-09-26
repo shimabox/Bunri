@@ -37,6 +37,30 @@ def package(tmp_path: Path) -> LocalPackage:
     return LocalPackage(tmp_path,metadata,tuple(assets))
 
 
+def test_manifest_does_not_carry_pan_split(tmp_path):
+    from dataclasses import replace
+
+    clock = lambda: "2026-08-30T00:00:00Z"
+    documents = []
+    for index, pan_split in enumerate((None, "left_right")):
+        directory = tmp_path / str(index)
+        directory.mkdir()
+        local = package(directory)
+        local = replace(
+            local,
+            metadata=replace(
+                local.metadata,
+                targets=(TargetMetadata("guitar", ("mp3", "wav"), pan_split),),
+            ),
+        )
+        client = FakeClient()
+        synchronize(local, client, clock=clock)
+        documents.append({path: doc.value for path, doc in client.docs.items()})
+        assert sorted(client.media) == ["guitar.backing.mp3", "guitar.mp3", "original.mp3"]
+    assert documents[0] == documents[1]
+    assert "pan_split" not in str(documents[1])
+
+
 def test_initial_sync_and_idempotent_rerun(tmp_path):
     client=FakeClient(); local=package(tmp_path); clock=lambda:"2026-08-30T00:00:00Z"
     first=synchronize(local,client,clock=clock)

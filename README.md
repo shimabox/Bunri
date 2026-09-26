@@ -104,8 +104,12 @@ bunri-web --no-open         # 起動時のブラウザ自動オープンを無�
 | `song.guitar.mp3` | ギターだけ | 「ここ何を弾いてる?」を聴き取る |
 | `song.guitar.backing.mp3` | ギター抜き(それ以外全部) | 自分のギターを重ねて練習する |
 | `song.original.mp3` | 原曲 | 聴き比べ |
-| `song.guitar.player.html` | 練習プレイヤー | 上の3つを切り替えながら A-B ループ・スロー再生。ダブルクリックで開ける |
-| `song.guitar.wav` / `song.guitar.backing.wav` | 上の mp3 と同じ音の無圧縮版 | DAW などで編集したいとき用。Web UI のダウンロード欄からも保存可能。練習だけなら不要(消しても OK) |
+| `song.guitar.left.mp3` | ギターの左側に定位した成分(L のみ) | 左右に振り分けられた 2 本のギターを片方ずつ聴き取る |
+| `song.guitar.right.mp3` | ギターの右側に定位した成分(R のみ) | 同上(L のみと R のみを足すと「ギターだけ」と同じ音) |
+| `song.guitar.player.html` | 練習プレイヤー | 上のトラックを切り替えながら A-B ループ・スロー再生。ダブルクリックで開ける |
+| `song.guitar.wav` / `song.guitar.backing.wav` / `song.guitar.left.wav` / `song.guitar.right.wav` | 上の mp3 と同じ音の無圧縮版 | DAW などで編集したいとき用。Web UI のダウンロード欄からも保存可能。練習だけなら不要(消しても OK) |
+
+L のみ / R のみは、ギターの定位(左右の位置)が 2 か所に分かれている曲でだけ作られます。L/R に分かれていない曲では作られず、プレイヤーの「L のみ」「R のみ」ボタンは押せない状態で理由が表示されます。L/R は Bunri Pocket には送信されません。
 
 元の `song.m4a` はそのまま残ります(CLI は読むだけ。Web UI はアップロードした複製を `out/web/uploads/` に保存)。
 
@@ -125,11 +129,15 @@ make separate FILE=song.mp3   # または: uv run bunri song.mp3
 out/song/
 ├── song.guitar.wav / .mp3            # ギターのみ
 ├── song.guitar.backing.wav / .mp3    # ギターなし(それ以外全部)
+├── song.guitar.left.wav / .mp3       # L のみ(ギターの左側の成分)
+├── song.guitar.right.wav / .mp3      # R のみ(ギターの右側の成分)
 ├── song.original.mp3                 # 原曲
 └── song.guitar.player.html           # オフライン練習プレイヤー
-                                      #  (原曲/ギターのみ/ギターなし切替・
+                                      #  (原曲/ギターのみ/ギターなし/L のみ/R のみ切替・
                                       #   ABループ・ピッチ維持スロー再生)
 ```
+
+`song.guitar.left` / `song.guitar.right` は、ギターの定位が左右 2 か所に分かれている曲でだけ作られます(L/R に分かれていない曲では作られません)。
 
 ファイル名に抽出対象(`guitar` など)が入っているのは、同じ曲を別の `--target` で追加ビルドしたとき(例: `--target vocals` でカラオケ音源を作る)に、同じフォルダへ共存できるようにするためです。`song.original.mp3` だけはどの対象でも同一内容なので共有されます。
 
@@ -163,6 +171,21 @@ bunri song.mp3 -o path/to/out               # 出力先ディレクトリ
 `--model` を省略した場合、対象楽器ごとに登録されたデフォルトモデルが失敗したときだけ自動でフォールバックモデルに切り替わります(ギターの場合 `htdemucs_6s.yaml`)。`--model` で明示的に指定した場合はフォールバックせず、失敗はそのままエラーとして報告されます。
 
 上表の登録済みモデルは `--model` で明示した場合も固定 SHA-256 の検証対象です。一方、任意の未登録モデルを `--model` で指定した場合は Bunri の固定検証対象外で、取得と読み込みを audio-separator に委譲します。
+
+### 既存パッケージに L/R を追加する
+
+L のみ / R のみに対応する前に作ったパッケージには、キャッシュに残っている分離済みのギター stem から L/R を追加できます。元の入力音源は不要です。
+
+```bash
+bunri lr-split '曲名' -o out    # 1 曲だけ(曲名は out/ の下のフォルダ名)
+bunri lr-split --all -o out     # 出力先の全パッケージ
+```
+
+- 分離済み stem のキャッシュ(`out/.cache/`)が必要です。キャッシュが無い場合は、元の音源から `bunri 元の音源` で再生成してください(分離済みのキャッシュが残っていれば分離処理は省略されます)。
+- L/R の判定結果が記録済みのパッケージはスキップされます。やり直す場合は `--force` を付けます。
+- Web UI で分離を実行している間は、完了を待ってから実行してください。
+- 分離の実行と重なって、L/R が古い stem から作られた場合は `bunri lr-split '曲名' --force` で作り直せます。
+- Web UI で同じ曲を再アップロードしても、完了済みのパッケージは作り直されないため L/R は追加されません。このコマンドを使ってください。追加した L/R は Web UI のダウンロード欄にも表示されます。
 
 ## Bunri Pocket へ同期する
 
