@@ -14,15 +14,21 @@ from bunri.package_metadata import (
 from bunri.pocket.local import LocalPreflightError, preflight
 
 
+LR_MP3 = {"Song.guitar.left.mp3", "Song.guitar.right.mp3"}
+
+
 @pytest.mark.parametrize(
-    ("include_original", "hashed_names"),
+    ("include_original", "pan_split", "hashed_names"),
     [
-        (True, {"Song.original.mp3", "Song.guitar.mp3", "Song.guitar.backing.mp3"}),
-        (False, {"Song.guitar.mp3", "Song.guitar.backing.mp3"}),
+        (True, None, {"Song.original.mp3", "Song.guitar.mp3", "Song.guitar.backing.mp3"}),
+        (False, None, {"Song.guitar.mp3", "Song.guitar.backing.mp3"}),
+        (True, "single", {"Song.original.mp3", "Song.guitar.mp3", "Song.guitar.backing.mp3"}),
+        (True, "left_right", {"Song.original.mp3", "Song.guitar.mp3", "Song.guitar.backing.mp3"} | LR_MP3),
+        (False, "left_right", {"Song.guitar.mp3", "Song.guitar.backing.mp3"} | LR_MP3),
     ],
 )
 def test_preflight_reads_only_requested_mp3_assets(
-    tmp_path, monkeypatch, include_original, hashed_names
+    tmp_path, monkeypatch, include_original, pan_split, hashed_names
 ):
     out_dir = tmp_path / "out"
     package_dir = out_dir / "Song"
@@ -33,7 +39,7 @@ def test_preflight_reads_only_requested_mp3_assets(
             "Song",
             "Song",
             SourceIdentity("sha1", "a" * 40, "a" * 12),
-            (TargetMetadata("guitar", ("mp3", "wav")),),
+            (TargetMetadata("guitar", ("mp3", "wav"), pan_split),),
         ),
     )
     asset_names = {
@@ -43,7 +49,9 @@ def test_preflight_reads_only_requested_mp3_assets(
         "Song.guitar.wav",
         "Song.guitar.backing.wav",
         "Song.guitar.player.html",
-    }
+        "Song.guitar.left.wav",
+        "Song.guitar.right.wav",
+    } | LR_MP3
     for name in asset_names:
         (package_dir / name).write_bytes(b"asset contents")
 

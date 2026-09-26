@@ -1125,6 +1125,151 @@ def test_single_pocket_upload_button_recovers_after_409(tmp_path):
         assert request_state["posts"] == 2
 
 
+PAN_SPLIT_UNSUPPORTED_NOTICE = (
+    "この音源ポケットは L のみ / R のみに未対応です。音源ポケットを更新して再同期すると送られます"
+)
+
+
+@_needs_browser
+@pytest.mark.parametrize("supported", [False, True])
+def test_pocket_all_result_mentions_an_unsupported_pocket(tmp_path, monkeypatch, supported):
+    import base64
+
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+
+    def finish_sync_all(*_args, progress=None, **_kwargs):
+        batch = BatchResult(
+            total=1, items=[BatchItem("Song", "done")], pan_split_supported=supported
+        )
+        if progress is not None:
+            progress(batch, None)
+        return batch
+
+    monkeypatch.setattr(jobs_module, "sync_all", finish_sync_all)
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        page.wait_for_selector("#sw-pocket-controls:not([hidden])")
+        page.locator("#sw-pocket-all").click()
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-summary').textContent === "
+            "'全曲アップロード完了: 1件'",
+            timeout=10_000,
+        )
+        notice = page.locator("#sw-pocket-notice")
+        if supported:
+            assert notice.is_hidden()
+            assert notice.text_content() == ""
+        else:
+            assert notice.is_visible()
+            assert notice.text_content() == PAN_SPLIT_UNSUPPORTED_NOTICE
+        assert page.locator("#sw-pocket-summary").text_content() == "全曲アップロード完了: 1件"
+
+
+@_needs_browser
+def test_single_pocket_result_mentions_an_unsupported_pocket(tmp_path):
+    import base64
+
+    from bunri.pocket.config import (
+        PocketConfig,
+        connection_fingerprint,
+        read_config,
+        save_config,
+    )
+    from bunri.web.jobs import song_id
+
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    digest = "b" * 40
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": digest,
+        "title": "Split Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": None,
+        "package": "Split Song/Split Song.guitar.player.html",
+        "log": "web/logs/j-separate.log",
+        "upload": "web/uploads/split.mp3",
+    }), encoding="utf-8")
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    finished_job = {
+        "id": "j-pocket-single",
+        "kind": "pocket_single",
+        "song_id": digest[:12],
+        "status": "done",
+        "created_at": "2026-09-05T00:00:03+00:00",
+        "started_at": "2026-09-05T00:00:03+00:00",
+        "finished_at": "2026-09-05T00:00:04+00:00",
+        "elapsed_seconds": 1,
+        "progress": None,
+        "result": {
+            "media_uploaded": 3, "media_skipped": 0,
+            "manifest_updated": 1, "manifest_skipped": 0,
+            "library_updated": 1, "library_skipped": 0,
+            "pan_split_supported": False,
+        },
+        "error": None,
+    }
+
+    def mock_pocket(page):
+        page.route("**/api/pocket/status", lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "connected": True,
+                "connection_fingerprint": connection_fingerprint(read_config(out_dir)),
+                "target_count": 1,
+                "package_count": 1,
+                "songs": [{
+                    "web_song_id": song_id(digest),
+                    "song_id": digest[:12],
+                    "title": "Split Song",
+                    "safe_name": "Split Song",
+                    "state": "not_synced",
+                    "can_sync": True,
+                    "message": None,
+                    "conflict": False,
+                }],
+            }),
+        ))
+        page.route("**/api/pocket/sync/*", lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"job_id": "j-pocket-single"}),
+        ))
+        page.route("**/api/jobs/j-pocket-single", lambda route: route.fulfill(
+            status=200, content_type="application/json", body=json.dumps(finished_job),
+        ))
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=mock_pocket
+    ) as page:
+        page.wait_for_function(
+            "document.querySelector('.sw-pocket-row button') && "
+            "!document.querySelector('.sw-pocket-row button').disabled"
+        )
+        page.locator("button.sw-job-toggle").click()
+        page.locator(".sw-pocket-row button").click()
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-notice').hidden === false",
+            timeout=10_000,
+        )
+        assert page.locator("#sw-pocket-notice").text_content() == PAN_SPLIT_UNSUPPORTED_NOTICE
+        assert page.locator("#sw-pocket-summary").is_hidden()
+
+
 @_needs_browser
 def test_pocket_all_failure_summary_renders_without_song_cards(tmp_path, monkeypatch):
     import base64

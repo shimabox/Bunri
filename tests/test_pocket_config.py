@@ -39,6 +39,23 @@ def test_rejects_short_token_and_capability_mismatch():
     with pytest.raises(ValueError): validate_capabilities(bad)
 
 
+@pytest.mark.parametrize("schema", ["manifest", "library"])
+@pytest.mark.parametrize("latest", ["1.0", "1.1", "1.12"])
+def test_capabilities_accept_any_schema_1x_latest(schema, latest):
+    value = json.loads(json.dumps(CAPABILITIES))
+    value["schemas"][schema]["latest"] = latest
+    validate_capabilities(value)
+
+
+@pytest.mark.parametrize("schema", ["manifest", "library"])
+@pytest.mark.parametrize("latest", ["2.0", "1", "1.", "1.1.0", " 1.1", "1.1\n", 1.1, 1, None, True])
+def test_capabilities_reject_other_schema_latest(schema, latest):
+    value = json.loads(json.dumps(CAPABILITIES))
+    value["schemas"][schema]["latest"] = latest
+    with pytest.raises(ValueError, match="latest"):
+        validate_capabilities(value)
+
+
 def test_read_rejects_symlink(tmp_path):
     (tmp_path / ".pocket").symlink_to(tmp_path / "elsewhere")
     with pytest.raises(ValueError): read_config(tmp_path)

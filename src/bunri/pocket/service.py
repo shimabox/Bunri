@@ -19,7 +19,16 @@ from bunri.pocket.local import (
 )
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.protocol import ProtocolError, merge_library, merge_manifest
-from bunri.pocket.sync import SyncError, SyncResult, _library, _manifest, synchronize
+from bunri.pocket.sync import (
+    RemoteFeatures,
+    SyncError,
+    SyncResult,
+    _library,
+    _manifest,
+    assets_to_send,
+    probe_features,
+    synchronize,
+)
 
 
 class PocketServiceError(RuntimeError):
@@ -90,6 +99,8 @@ class BatchResult:
     total: int
     legacy: list[str] = field(default_factory=list)
     items: list[BatchItem] = field(default_factory=list)
+    # Set once the Pocket's features are read; None until then.
+    pan_split_supported: bool | None = None
 
     @property
     def completed(self) -> int:
@@ -283,9 +294,20 @@ def resolve_package(
     return package
 
 
-def inspect_remote(package: LocalPackage, client: PocketHTTPClient) -> RemoteStatus:
+UNKNOWN_REMOTE = RemoteStatus("unknown", False, "音源ポケットの状態を確認できません。")
+_REMOTE_CHECK_ERRORS = (OSError, PocketHTTPError, ProtocolError, SyncError, ValueError)
+
+
+def inspect_remote(
+    package: LocalPackage,
+    client: PocketHTTPClient,
+    features: RemoteFeatures | None = None,
+) -> RemoteStatus:
     song_id = package.metadata.source.cache_key
     try:
+        if features is None:
+            features = probe_features(client)
+        assets = assets_to_send(package, features)
         manifest_doc = _manifest(client, song_id)
         library_doc = _library(client)
         library_has_song = bool(
@@ -304,14 +326,15 @@ def inspect_remote(package: LocalPackage, client: PocketHTTPClient) -> RemoteSta
             return RemoteStatus("different", False, "song ID が競合しています。", True)
         manifest, manifest_changed = merge_manifest(
             metadata=package.metadata,
-            assets=[asset.descriptor for asset in package.assets],
+            assets=[asset.descriptor for asset in assets],
             remote=manifest_doc.value,
             include_original=True,
+            pan_split_supported=features.pan_split,
         )
         media_match = all(
             client.head_media(song_id, asset.descriptor.remote_name)
             == (asset.descriptor.sha256, asset.descriptor.bytes)
-            for asset in package.assets
+            for asset in assets
         )
         library_changed = True
         if library_doc is not None:
@@ -319,8 +342,8 @@ def inspect_remote(package: LocalPackage, client: PocketHTTPClient) -> RemoteSta
         if not manifest_changed and media_match and library_has_song and not library_changed:
             return RemoteStatus("synced", True)
         return RemoteStatus("different", True)
-    except (OSError, PocketHTTPError, ProtocolError, SyncError, ValueError):
-        return RemoteStatus("unknown", False, "音源ポケットの状態を確認できません。")
+    except _REMOTE_CHECK_ERRORS:
+        return UNKNOWN_REMOTE
 
 
 def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageStatus, ...]:
@@ -346,6 +369,23 @@ def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageSt
         "曲のパッケージ名または identity が競合しているためアップロードできません。",
         True,
     )
+    # One capabilities read serves every package. If it fails, the states
+    # decided locally are still returned and only the remote checks become
+    # unknown, so the status listing keeps working.
+    features: RemoteFeatures | None = None
+    probe_failed = False
+
+    def remote_status(package: LocalPackage) -> RemoteStatus:
+        nonlocal features, probe_failed
+        if features is None and not probe_failed:
+            try:
+                features = probe_features(client)
+            except _REMOTE_CHECK_ERRORS:
+                probe_failed = True
+        if features is None:
+            return UNKNOWN_REMOTE
+        return inspect_remote(package, client, features)
+
     statuses: list[PackageStatus] = []
     for entry in scanned:
         source = entry.identity
@@ -380,7 +420,7 @@ def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageSt
             entry.package.metadata.title,
             source.cache_key,
             source.digest,
-            conflicted if in_conflict else inspect_remote(entry.package, client),
+            conflicted if in_conflict else remote_status(entry.package),
         ))
     return tuple(sorted(statuses, key=lambda item: (item.safe_name.casefold(), item.safe_name)))
 
@@ -595,11 +635,15 @@ def sync_all(
         result = BatchResult(total=len(found.packages), legacy=list(found.legacy))
         result.items = [BatchItem(package.directory.name, "pending") for package in found.packages]
         remote = client or PocketHTTPClient(config.base_url, config.token)
+        # Read once for the whole batch. A failure here stops the batch before
+        # any upload, through the same path as the configuration errors above.
+        features = probe_features(remote)
+        result.pan_split_supported = features.pan_split
         for index, package in enumerate(found.packages):
             if progress:
                 progress(result, package.directory.name)
             try:
-                synced = synchronize(package, remote, include_original=include_original)
+                synced = synchronize(package, remote, include_original=include_original, features=features)
             except Exception as exc:
                 result.items[index] = BatchItem(package.directory.name, "error", error=safe_error(exc))
                 if progress:

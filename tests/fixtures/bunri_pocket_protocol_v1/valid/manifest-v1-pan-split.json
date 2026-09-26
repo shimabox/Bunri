@@ -1,0 +1,97 @@
+{
+  "schema_version": "1.1",
+  "song_id": "0123456789ab",
+  "title": "Pan Split",
+  "source": {
+    "algorithm": "sha1",
+    "digest": "0123456789abcdef0123456789abcdef01234567",
+    "cache_key": "0123456789ab"
+  },
+  "original": {
+    "path": "original.mp3",
+    "content_type": "audio/mpeg",
+    "bytes": 24,
+    "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+  },
+  "instruments": [
+    {
+      "target": "guitar",
+      "label": "Guitar",
+      "pan_split": "left_right",
+      "stems": [
+        {
+          "role": "target",
+          "path": "guitar.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+        },
+        {
+          "role": "backing",
+          "path": "guitar.backing.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+        },
+        {
+          "role": "left",
+          "path": "guitar.left.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b",
+          "future_asset": "kept"
+        },
+        {
+          "role": "right",
+          "path": "guitar.right.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+        }
+      ]
+    },
+    {
+      "target": "bass",
+      "label": "Bass",
+      "pan_split": "single",
+      "stems": [
+        {
+          "role": "target",
+          "path": "bass.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+        },
+        {
+          "role": "backing",
+          "path": "bass.backing.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+        }
+      ]
+    },
+    {
+      "target": "drums",
+      "label": "Drums",
+      "pan_split": "left_right",
+      "stems": [
+        {
+          "role": "target",
+          "path": "drums.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+        },
+        {
+          "role": "backing",
+          "path": "drums.backing.mp3",
+          "content_type": "audio/mpeg",
+          "bytes": 24,
+          "sha256": "01316c8ec960ebe91747508e865d42eef794073d8d6c17eeb87d6f495bcb760b"
+        }
+      ]
+    }
+  ],
+  "updated_at": "2026-09-26T00:00:00.000Z"
+}

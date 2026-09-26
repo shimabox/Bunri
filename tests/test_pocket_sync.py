@@ -8,11 +8,19 @@ from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetada
 from bunri.pocket.http import JSONDocument, PocketHTTPError
 from bunri.pocket.local import LocalAsset, LocalPackage
 from bunri.pocket.protocol import AssetInfo
-from bunri.pocket.sync import SyncError, synchronize
+from bunri.pocket.sync import RemoteFeatures, SyncError, synchronize
+
+SUPPORTED = {"api": {"major": 1}, "features": {"pan_split": True}}
+UNSUPPORTED = {"api": {"major": 1}}
+CLOCK = lambda: "2026-08-30T00:00:00Z"  # noqa: E731
 
 
 class FakeClient:
-    def __init__(self): self.docs = {}; self.media = {}; self.calls = []; self.fail_library_412 = 0; self.fail_manifest_412 = 0; self.manifest_collision = None
+    def __init__(self, capabilities=SUPPORTED): self.docs = {}; self.media = {}; self.calls = []; self.fail_library_412 = 0; self.fail_manifest_412 = 0; self.manifest_collision = None; self.capabilities_value = capabilities
+    def capabilities(self):
+        self.calls.append(("CAPABILITIES",))
+        if isinstance(self.capabilities_value, Exception): raise self.capabilities_value
+        return self.capabilities_value
     def get_json(self, path): self.calls.append(("GET", path)); return self.docs.get(path)
     def head_media(self, song, name): self.calls.append(("HEAD", name)); return self.media.get(name)
     def put_media(self, song, name, path, size, checksum): self.calls.append(("PUT_MEDIA", name)); self.media[name]=(checksum,size); return checksum
@@ -29,36 +37,122 @@ class FakeClient:
         self.docs[path]=JSONDocument(json.loads(data), '"next"'); return '"next"'
 
 
-def package(tmp_path: Path) -> LocalPackage:
-    metadata=PackageMetadata("Song","Song",SourceIdentity("sha1","a"*40,"a"*12),(TargetMetadata("guitar",("mp3","wav")),))
+def package(tmp_path: Path, pan_split: str | None = None) -> LocalPackage:
+    metadata=PackageMetadata("Song","Song",SourceIdentity("sha1","a"*40,"a"*12),(TargetMetadata("guitar",("mp3","wav"),pan_split),))
     assets=[]
-    for name,target,role in (("original.mp3",None,None),("guitar.mp3","guitar","target"),("guitar.backing.mp3","guitar","backing")):
+    entries=[("original.mp3",None,None),("guitar.mp3","guitar","target"),("guitar.backing.mp3","guitar","backing")]
+    if pan_split == "left_right": entries += [("guitar.left.mp3","guitar","left"),("guitar.right.mp3","guitar","right")]
+    for name,target,role in entries:
         path=tmp_path/name; path.write_bytes(name.encode()); info=AssetInfo(name,path.stat().st_size,(name.encode().hex()+"0"*64)[:64],target,role); assets.append(LocalAsset(info,path))
     return LocalPackage(tmp_path,metadata,tuple(assets))
 
 
-def test_manifest_does_not_carry_pan_split(tmp_path):
-    from dataclasses import replace
+def _uploads(client):
+    return [call[1] for call in client.calls if call[0] == "PUT_MEDIA"]
 
-    clock = lambda: "2026-08-30T00:00:00Z"
+
+def _manifest_doc(client):
+    return client.docs["manifest/" + "a" * 12].value
+
+
+def test_unsupported_pocket_gets_the_three_files_without_pan_split(tmp_path):
+    client = FakeClient(UNSUPPORTED)
+    result = synchronize(package(tmp_path, "left_right"), client, clock=CLOCK)
+    assert sorted(_uploads(client)) == ["guitar.backing.mp3", "guitar.mp3", "original.mp3"]
+    manifest = _manifest_doc(client)
+    assert manifest["schema_version"] == "1.0"
+    assert "pan_split" not in str(manifest)
+    assert [stem["role"] for stem in manifest["instruments"][0]["stems"]] == ["target", "backing"]
+    assert result.pan_split_supported is False
+
+
+def test_unsupported_pocket_documents_match_a_package_without_split(tmp_path):
     documents = []
-    for index, pan_split in enumerate((None, "left_right")):
-        directory = tmp_path / str(index)
-        directory.mkdir()
-        local = package(directory)
-        local = replace(
-            local,
-            metadata=replace(
-                local.metadata,
-                targets=(TargetMetadata("guitar", ("mp3", "wav"), pan_split),),
-            ),
-        )
-        client = FakeClient()
-        synchronize(local, client, clock=clock)
+    for index, pan_split in enumerate((None, "left_right", "single")):
+        directory = tmp_path / str(index); directory.mkdir()
+        client = FakeClient(UNSUPPORTED)
+        synchronize(package(directory, pan_split), client, clock=CLOCK)
         documents.append({path: doc.value for path, doc in client.docs.items()})
-        assert sorted(client.media) == ["guitar.backing.mp3", "guitar.mp3", "original.mp3"]
-    assert documents[0] == documents[1]
-    assert "pan_split" not in str(documents[1])
+    assert documents[0] == documents[1] == documents[2]
+
+
+def test_supported_pocket_gets_left_and_right(tmp_path):
+    client = FakeClient()
+    result = synchronize(package(tmp_path, "left_right"), client, clock=CLOCK)
+    assert _uploads(client) == ["original.mp3", "guitar.mp3", "guitar.backing.mp3", "guitar.left.mp3", "guitar.right.mp3"]
+    manifest = _manifest_doc(client)
+    assert manifest["schema_version"] == "1.1"
+    instrument = manifest["instruments"][0]
+    assert instrument["pan_split"] == "left_right"
+    assert [(stem["role"], stem["path"]) for stem in instrument["stems"]] == [
+        ("target", "guitar.mp3"), ("backing", "guitar.backing.mp3"),
+        ("left", "guitar.left.mp3"), ("right", "guitar.right.mp3"),
+    ]
+    assert result.library_updated == 1 and "library" in client.docs
+    assert result.pan_split_supported is True
+    # audio → manifest → library
+    puts = [call[0] if call[0] == "PUT_MEDIA" else call[1] for call in client.calls if call[0].startswith("PUT")]
+    assert puts == ["PUT_MEDIA"] * 5 + ["manifest/" + "a" * 12, "library"]
+
+
+def test_supported_pocket_records_single_without_extra_files(tmp_path):
+    client = FakeClient()
+    result = synchronize(package(tmp_path, "single"), client, clock=CLOCK)
+    assert len(_uploads(client)) == 3
+    manifest = _manifest_doc(client)
+    assert manifest["schema_version"] == "1.1"
+    assert manifest["instruments"][0]["pan_split"] == "single"
+    assert len(manifest["instruments"][0]["stems"]) == 2
+    assert result.pan_split_supported is True
+
+
+def test_supported_pocket_without_recorded_split_is_unchanged(tmp_path):
+    client = FakeClient()
+    synchronize(package(tmp_path), client, clock=CLOCK)
+    manifest = _manifest_doc(client)
+    assert manifest["schema_version"] == "1.0"
+    assert "pan_split" not in str(manifest)
+
+
+def test_resync_after_pocket_update_sends_only_left_and_right(tmp_path):
+    local = package(tmp_path, "left_right")
+    client = FakeClient(UNSUPPORTED)
+    synchronize(local, client, clock=CLOCK)
+    client.calls.clear()
+    client.capabilities_value = SUPPORTED
+    second = synchronize(local, client, clock=lambda: "2026-09-01T00:00:00Z")
+    assert _uploads(client) == ["guitar.left.mp3", "guitar.right.mp3"]
+    assert (second.media_uploaded, second.media_skipped) == (2, 3)
+    assert (second.manifest_updated, second.library_updated) == (1, 1)
+    assert _manifest_doc(client)["schema_version"] == "1.1"
+    assert _manifest_doc(client)["updated_at"] == "2026-09-01T00:00:00Z"
+    client.calls.clear()
+    third = synchronize(local, client, clock=lambda: pytest.fail("clock called"))
+    assert _uploads(client) == []
+    assert (third.media_skipped, third.manifest_skipped, third.library_skipped) == (5, 1, 1)
+
+
+def test_capabilities_are_read_once_before_the_first_manifest(tmp_path):
+    client = FakeClient()
+    synchronize(package(tmp_path, "left_right"), client, clock=CLOCK)
+    assert client.calls.count(("CAPABILITIES",)) == 1
+    assert client.calls.index(("CAPABILITIES",)) < client.calls.index(("GET", "manifest/" + "a" * 12))
+    assert client.calls[0] == ("CAPABILITIES",)
+
+
+def test_given_features_skip_the_capabilities_request(tmp_path):
+    client = FakeClient(PocketHTTPError(500, "UNEXPECTED", "https://safe.invalid"))
+    result = synchronize(package(tmp_path, "left_right"), client, clock=CLOCK, features=RemoteFeatures(pan_split=True))
+    assert ("CAPABILITIES",) not in client.calls
+    assert len(_uploads(client)) == 5 and result.pan_split_supported is True
+
+
+def test_capabilities_failure_stops_before_any_request(tmp_path):
+    client = FakeClient(PocketHTTPError(401, "UNAUTHORIZED", "https://safe.invalid"))
+    with pytest.raises(PocketHTTPError) as caught:
+        synchronize(package(tmp_path, "left_right"), client, clock=CLOCK)
+    assert caught.value.status == 401
+    assert client.calls == [("CAPABILITIES",)]
 
 
 def test_initial_sync_and_idempotent_rerun(tmp_path):

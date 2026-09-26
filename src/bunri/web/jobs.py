@@ -177,6 +177,7 @@ def _pocket_batch_result(batch: BatchResult) -> dict[str, Any]:
         "pending": batch.pending,
         "legacy_count": len(batch.legacy),
         "legacy": _limited_pocket_names(batch.legacy),
+        "pan_split_supported": batch.pan_split_supported,
     }
 
 

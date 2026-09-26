@@ -1,12 +1,13 @@
 # Bunri Pocket protocol v1 snapshot
 
 - Repository: `github.com/shimabox/bunri-pocket`
-- Commit: `a8efc3e20a5009c72c1d5bcdd07db6e046c84ceb`
+- Commit: `6766d7dd95d66023b8a2828a044ee0d88756d509`
 - Sources:
   - `schemas/manifest-v1.schema.json`
   - `schemas/library-v1.schema.json`
   - `fixtures/protocol-v1/valid/library-v1.json`
   - `fixtures/protocol-v1/valid/manifest-v1-no-original.json`
+  - `fixtures/protocol-v1/valid/manifest-v1-pan-split.json`
   - `fixtures/protocol-v1/valid/manifest-v1-unknown-fields.json`
   - `fixtures/protocol-v1/valid/manifest-v1.json`
   - `fixtures/protocol-v1/invalid/library-duplicate-song-id.json`
@@ -20,6 +21,13 @@
   - `fixtures/protocol-v1/invalid/manifest-wav-path.json`
   - `fixtures/protocol-v1/media/sample.mp3`
   - `src/protocol/stable-json.ts`
+
+Between the previous snapshot (`a8efc3e20a5009c72c1d5bcdd07db6e046c84ceb`) and this commit,
+only `schemas/manifest-v1.schema.json` changed and `fixtures/protocol-v1/valid/manifest-v1-pan-split.json`
+was added. The stable golden inputs (`valid/manifest-v1.json`, `valid/library-v1.json`, and
+`src/protocol/stable-json.ts`) are unchanged, so the `stable/` goldens were kept as they are.
+The upstream commit has no invalid fixtures for the L/R stems; Bunri's tests build those cases
+directly.
 
 To regenerate, check out the commit in detached mode, run `npm ci`, and run a temporary
 TypeScript script outside both repositories with the project-local `npx tsx`. The script

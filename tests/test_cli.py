@@ -227,6 +227,114 @@ def test_pocket_sync_all_failure_does_not_recapture_exit(tmp_path, monkeypatch):
     assert "Pocket の同期に失敗しました。後で再実行してください。" not in output
 
 
+PAN_SPLIT_UNSUPPORTED_NOTICE = (
+    "この音源ポケットは L のみ / R のみに未対応です。音源ポケットを更新して再同期すると送られます"
+)
+
+
+class _MemoryPocket:
+    def __init__(self, capabilities):
+        self.capabilities_value = capabilities
+        self.docs = {}
+        self.media = {}
+
+    def capabilities(self):
+        return self.capabilities_value
+
+    def get_json(self, path):
+        return self.docs.get(path)
+
+    def head_media(self, song_id, name):
+        return self.media.get((song_id, name))
+
+    def put_media(self, song_id, name, path, size, checksum):
+        self.media[(song_id, name)] = (checksum, size)
+        return checksum
+
+    def put_json(self, path, data, condition):
+        import json
+
+        from bunri.pocket.http import JSONDocument
+
+        self.docs[path] = JSONDocument(json.loads(data), '"next"')
+        return '"next"'
+
+
+def _pocket_output_with_lr_song(tmp_path, monkeypatch, capabilities):
+    import base64
+
+    import bunri.pocket.service as service_module
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+    from bunri.pocket.config import PocketConfig, save_config
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(tmp_path, PocketConfig("https://example.invalid", token))
+    for name, digest, pan_split in (("Song", "a" * 40, "left_right"), ("Other", "b" * 40, None)):
+        directory = tmp_path / name
+        directory.mkdir()
+        write_package_metadata(
+            directory / ".bunri-package.json",
+            PackageMetadata(
+                name, name, SourceIdentity("sha1", digest, digest[:12]),
+                (TargetMetadata("guitar", ("mp3",), pan_split),),
+            ),
+        )
+        for suffix in ("original", "guitar", "guitar.backing", "guitar.left", "guitar.right"):
+            (directory / f"{name}.{suffix}.mp3").write_bytes(suffix.encode())
+    pocket = _MemoryPocket(capabilities)
+    monkeypatch.setattr(service_module, "PocketHTTPClient", lambda *_args, **_kwargs: pocket)
+    return pocket
+
+
+@pytest.mark.parametrize("arguments", [["Song"], ["Other"], ["--all"]])
+@pytest.mark.parametrize("supported", [False, True])
+def test_pocket_sync_mentions_an_unsupported_pocket_once(tmp_path, monkeypatch, arguments, supported):
+    from bunri.pocket.cli import app as pocket_app
+
+    capabilities = {"api": {"major": 1}, "features": {"pan_split": supported}}
+    pocket = _pocket_output_with_lr_song(tmp_path, monkeypatch, capabilities)
+    result = CliRunner().invoke(
+        pocket_app, ["sync", *arguments, "-o", str(tmp_path)], env=_STABLE_TERMINAL
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _plain(result.output).count(PAN_SPLIT_UNSUPPORTED_NOTICE) == (0 if supported else 1)
+    lr_sent = ("aaaaaaaaaaaa", "guitar.left.mp3") in pocket.media
+    assert lr_sent is (supported and arguments != ["Other"])
+    if not supported:
+        lines = result.output.splitlines()
+        # The notice follows the counts: the library line, or the batch summary.
+        anchor = "集計:" if arguments == ["--all"] else "library:"
+        assert lines.index(PAN_SPLIT_UNSUPPORTED_NOTICE) > next(
+            index for index, line in enumerate(lines) if line.startswith(anchor)
+        )
+
+
+def test_pocket_sync_capabilities_failure_uploads_nothing(tmp_path, monkeypatch):
+    from bunri.pocket.cli import app as pocket_app
+    from bunri.pocket.http import PocketHTTPError
+
+    pocket = _pocket_output_with_lr_song(tmp_path, monkeypatch, None)
+
+    def unauthorized():
+        raise PocketHTTPError(401, "UNAUTHORIZED", "https://example.invalid")
+
+    pocket.capabilities = unauthorized
+    for arguments in (["Song"], ["--all"]):
+        result = CliRunner().invoke(
+            pocket_app, ["sync", *arguments, "-o", str(tmp_path)], env=_STABLE_TERMINAL
+        )
+        assert result.exit_code == 1
+        assert "Pocket の認証に失敗しました。" in _plain(result.output)
+        assert PAN_SPLIT_UNSUPPORTED_NOTICE not in _plain(result.output)
+    assert pocket.media == {} and pocket.docs == {}
+
+
 def test_pocket_delete_song_id_with_yes_needs_no_local_package(tmp_path, monkeypatch):
     import bunri.pocket.cli as pocket_cli
     from bunri.pocket.config import PocketConfig

@@ -54,10 +54,14 @@
         {
           "type": "object",
           "required": ["role"],
-          "properties": { "role": { "enum": ["target", "backing"] } }
+          "properties": { "role": { "enum": ["target", "backing", "left", "right"] } }
         }
       ]
     },
+    "targetStem": { "type": "object", "properties": { "role": { "const": "target" } }, "required": ["role"] },
+    "backingStem": { "type": "object", "properties": { "role": { "const": "backing" } }, "required": ["role"] },
+    "leftStem": { "type": "object", "properties": { "role": { "const": "left" } }, "required": ["role"] },
+    "rightStem": { "type": "object", "properties": { "role": { "const": "right" } }, "required": ["role"] },
     "instrument": {
       "type": "object",
       "required": ["target", "label", "stems"],
@@ -69,16 +73,42 @@
           "not": { "const": "original" }
         },
         "label": { "type": "string", "minLength": 1 },
+        "pan_split": { "enum": ["left_right", "single"] },
         "stems": {
           "type": "array",
-          "minItems": 2,
-          "maxItems": 2,
           "items": { "$ref": "#/definitions/stem" },
-          "allOf": [
-            { "contains": { "type": "object", "properties": { "role": { "const": "target" } }, "required": ["role"] } },
-            { "contains": { "type": "object", "properties": { "role": { "const": "backing" } }, "required": ["role"] } }
+          "oneOf": [
+            {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "allOf": [
+                { "contains": { "$ref": "#/definitions/targetStem" } },
+                { "contains": { "$ref": "#/definitions/backingStem" } }
+              ]
+            },
+            {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "allOf": [
+                { "contains": { "$ref": "#/definitions/targetStem" } },
+                { "contains": { "$ref": "#/definitions/backingStem" } },
+                { "contains": { "$ref": "#/definitions/leftStem" } },
+                { "contains": { "$ref": "#/definitions/rightStem" } }
+              ]
+            }
           ]
         }
+      },
+      "if": {
+        "type": "object",
+        "required": ["pan_split"],
+        "properties": { "pan_split": { "const": "left_right" } }
+      },
+      "else": {
+        "type": "object",
+        "properties": { "stems": { "type": "array", "maxItems": 2 } }
       }
     }
   }

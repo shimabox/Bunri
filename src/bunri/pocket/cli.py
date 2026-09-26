@@ -33,6 +33,8 @@ app = typer.Typer(
 )
 console = Console()
 
+PAN_SPLIT_UNSUPPORTED_NOTICE = "この音源ポケットは L のみ / R のみに未対応です。音源ポケットを更新して再同期すると送られます"
+
 
 def _safe_display(value: str) -> str:
     return re.sub(r"[\x00-\x1f\x7f]", "\ufffd", value)
@@ -106,6 +108,8 @@ def sync(
             )
             if batch.legacy:
                 console.print("旧パッケージは元の入力音源から再生成してください。キャッシュが残っていれば分離処理は省略されます。")
+            if batch.pan_split_supported is False:
+                console.print(PAN_SPLIT_UNSUPPORTED_NOTICE)
             if batch.failed:
                 raise typer.Exit(1)
             return
@@ -136,6 +140,8 @@ def sync(
     console.print(f"media: uploaded={result.media_uploaded} skipped={result.media_skipped}")
     console.print(f"manifest: updated={result.manifest_updated} skipped={result.manifest_skipped}")
     console.print(f"library: updated={result.library_updated} skipped={result.library_skipped}")
+    if not result.pan_split_supported:
+        console.print(PAN_SPLIT_UNSUPPORTED_NOTICE)
 
 
 def _stdin_is_tty() -> bool:
