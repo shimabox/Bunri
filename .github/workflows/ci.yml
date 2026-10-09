@@ -41,8 +41,8 @@ jobs:
       # Needed by tests/test_player_html.py and tests/test_web_page.py's
       # real-browser checks; skipped gracefully if unavailable, but CI should
       # actually exercise them rather than silently skip.
-      - name: Install Playwright Chromium
-        run: uv run playwright install --with-deps chromium
+      - name: Install Google Chrome
+        run: uv run playwright install --with-deps chrome
 
       - name: Run tests
         run: uv run pytest -q -n auto

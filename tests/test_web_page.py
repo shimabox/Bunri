@@ -117,7 +117,7 @@ def _chromium_available() -> bool:
         return False
     try:
         with sync_playwright() as p:
-            p.chromium.launch().close()
+            p.chromium.launch(channel="chrome").close()
         return True
     except Exception:
         return False
@@ -132,7 +132,7 @@ def _open_page(base_url: str, *, before_goto: Callable[[Any], None] | None = Non
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
+        browser = pw.chromium.launch(channel="chrome")
         try:
             page = browser.new_page()
             if before_goto is not None:

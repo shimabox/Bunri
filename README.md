@@ -277,11 +277,13 @@ docker build --platform linux/amd64 --target cuda -t bunri:cuda .
 ### dev イメージ(テスト実行用)
 
 ```bash
-docker build --target dev -t bunri:dev .
-docker run --rm bunri:dev            # pytest -q を実行
+docker build --platform linux/amd64 --target dev -t bunri:dev .
+docker run --rm --platform linux/amd64 bunri:dev            # pytest -q を実行
 ```
 
-pytest・playwright(Chromium 込み)を含む開発用イメージです。CI などでコンテナ内にテストを閉じ込めたい場合に使えます。
+pytest・playwright・Google Chrome を含む開発用イメージです。Google Chrome の Linux インストーラを使うため、dev イメージは linux/amd64 で実行します。CI などでコンテナ内にテストを閉じ込めたい場合に使えます。
+
+ブラウザテストは Chrome 155.0.8059.39 以降を使います。ローカル実行時は Chrome を更新し、`uv run playwright install chrome` で準備してください。
 
 ## Windows で使う
 

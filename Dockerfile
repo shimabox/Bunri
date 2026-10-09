@@ -107,7 +107,7 @@ ENV PATH="/app/.venv/bin:${PATH}"
 # playwright install --with-deps pulls the browser binary plus the apt packages
 # it needs (fonts, libnss3, etc.) — apt is available since we're still on the
 # python:slim (Debian) base.
-RUN playwright install --with-deps chromium
+RUN playwright install --with-deps chrome
 
 ENTRYPOINT ["pytest"]
 CMD ["-q"]

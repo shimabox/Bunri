@@ -185,7 +185,7 @@ def _chromium_available() -> bool:
         return False
     try:
         with sync_playwright() as p:
-            p.chromium.launch().close()
+            p.chromium.launch(channel="chrome").close()
         return True
     except Exception:
         return False
@@ -242,7 +242,7 @@ def _open(page_path: Path):
     with sync_playwright() as pw:
         # Autoplay-policy arg lets evaluate-driven play() run without a gesture,
         # so tests are deterministic (a real user's button click is a gesture).
-        browser = pw.chromium.launch(args=["--autoplay-policy=no-user-gesture-required"])
+        browser = pw.chromium.launch(channel="chrome", args=["--autoplay-policy=no-user-gesture-required"])
         try:
             page = browser.new_page()
             page.goto(page_path.as_uri())
