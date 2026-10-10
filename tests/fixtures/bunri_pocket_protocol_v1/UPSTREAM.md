@@ -2,60 +2,68 @@
 
 - Repository: `github.com/shimabox/bunri-pocket`
 - Commit: `6766d7dd95d66023b8a2828a044ee0d88756d509`
-- Sources:
-  - `schemas/manifest-v1.schema.json`
-  - `schemas/library-v1.schema.json`
-  - `fixtures/protocol-v1/valid/library-v1.json`
-  - `fixtures/protocol-v1/valid/manifest-v1-no-original.json`
-  - `fixtures/protocol-v1/valid/manifest-v1-pan-split.json`
-  - `fixtures/protocol-v1/valid/manifest-v1-unknown-fields.json`
-  - `fixtures/protocol-v1/valid/manifest-v1.json`
-  - `fixtures/protocol-v1/invalid/library-duplicate-song-id.json`
-  - `fixtures/protocol-v1/invalid/library-invalid-manifest-path.json`
-  - `fixtures/protocol-v1/invalid/manifest-bad-cache-key.json`
-  - `fixtures/protocol-v1/invalid/manifest-bad-major.json`
-  - `fixtures/protocol-v1/invalid/manifest-duplicate-target.json`
-  - `fixtures/protocol-v1/invalid/manifest-invalid-path.json`
-  - `fixtures/protocol-v1/invalid/manifest-missing-backing.json`
-  - `fixtures/protocol-v1/invalid/manifest-reserved-target.json`
-  - `fixtures/protocol-v1/invalid/manifest-wav-path.json`
-  - `fixtures/protocol-v1/media/sample.mp3`
-  - `src/protocol/stable-json.ts`
 
-Between the previous snapshot (`a8efc3e20a5009c72c1d5bcdd07db6e046c84ceb`) and this commit,
-only `schemas/manifest-v1.schema.json` changed and `fixtures/protocol-v1/valid/manifest-v1-pan-split.json`
-was added. The stable golden inputs (`valid/manifest-v1.json`, `valid/library-v1.json`, and
-`src/protocol/stable-json.ts`) are unchanged, so the `stable/` goldens were kept as they are.
+This directory is a copy of the contract published by the repository above, taken at the
+commit above. Do not edit the upstream-owned files by hand; regenerate them.
+
+## Regenerating
+
+From the Bunri repository root, with a local checkout of bunri-pocket:
+
+```sh
+uv run python scripts/sync_pocket_protocol_snapshot.py --pocket <bunri-pocket checkout>
+uv run python scripts/sync_pocket_protocol_snapshot.py --pocket <bunri-pocket checkout> --ref v0.3.2
+uv run python scripts/sync_pocket_protocol_snapshot.py --pocket <bunri-pocket checkout> --check
+```
+
+Without `--ref` the script takes the checkout's `HEAD`. It rewrites the upstream-owned files,
+lists what changed, and updates the commit recorded above. `--check` writes nothing and exits
+with 1 when the snapshot differs from the recorded commit (or from `--ref` when given).
+
+The checkout is only read through `git archive`, so its working tree and `HEAD` are left alone
+and `npm ci` is not needed. Node 22.18 or later is required to run the upstream `stableJson()`.
+
+## What is upstream-owned
+
+| Here | Upstream source |
+| --- | --- |
+| `schemas/` | `schemas/` |
+| `valid/` | `fixtures/protocol-v1/valid/` |
+| `invalid/` | `fixtures/protocol-v1/invalid/` |
+| `media/` | `fixtures/protocol-v1/media/` |
+| `stable/*.stable.json` | output of `stableJson()` in `src/protocol/stable-json.ts` |
+
+The four directories are mirrored whole: a file removed upstream is removed here too.
+
+## What Bunri owns
+
+- `stable/*.input.json`: inputs for the stable goldens that upstream has no fixture for. Adding
+  a new `<name>.input.json` and regenerating produces `<name>.stable.json`.
+- `generated/`: documents built by Bunri's own generator. They exercise Bunri's Japanese
+  `"ギター"` label separately from the upstream `"Guitar"` documents, which are protocol
+  acceptance fixtures.
+
 The upstream commit has no invalid fixtures for the L/R stems; Bunri's tests build those cases
 directly.
 
-To regenerate, check out the commit in detached mode, run `npm ci`, and run a temporary
-TypeScript script outside both repositories with the project-local `npx tsx`. The script
-imports `src/protocol/stable-json.ts` and writes one `stableJson(value)` result directly to
-stdout. Remove the temporary script afterward.
+## Stable golden inputs
 
-The exact input for each stable golden is:
+Each golden is `stableJson(value)` written out as is, where `value` is:
 
-- `manifest-v1.stable.json`: `JSON.parse()` the upstream
-  `fixtures/protocol-v1/valid/manifest-v1.json` bytes.
-- `library-v1.stable.json`: `JSON.parse()` the upstream
-  `fixtures/protocol-v1/valid/library-v1.json` bytes.
-- `number-forms.stable.json`: `JSON.parse()` the adjacent
-  `number-forms.input.json` bytes. The source text intentionally retains `1.0` and `-0`.
-- `unicode-keys-nested.stable.json`: `JSON.parse()` the adjacent
-  `unicode-keys-nested.input.json` bytes. This is also the array-index key ordering input.
-- `lone-surrogates.stable.json`: `JSON.parse()` the adjacent
-  `lone-surrogates.input.json` bytes. The input contains lone high and low surrogates in
-  both a string value and object keys, plus ordinary non-ASCII text and a valid pair.
-- `non-finite.stable.json`: use this JavaScript value, which JSON cannot represent:
-  `{ nan: NaN, negative: -Infinity, positive: Infinity }`.
+- `manifest-v1.stable.json`: `JSON.parse()` of the upstream
+  `fixtures/protocol-v1/valid/manifest-v1.json`.
+- `library-v1.stable.json`: `JSON.parse()` of the upstream
+  `fixtures/protocol-v1/valid/library-v1.json`.
+- `number-forms.stable.json`: `JSON.parse()` of the adjacent `number-forms.input.json`. The
+  source text intentionally retains `1.0` and `-0`.
+- `unicode-keys-nested.stable.json`: `JSON.parse()` of the adjacent
+  `unicode-keys-nested.input.json`. This is also the array-index key ordering input.
+- `lone-surrogates.stable.json`: `JSON.parse()` of the adjacent `lone-surrogates.input.json`.
+  The input contains lone high and low surrogates in both a string value and object keys, plus
+  ordinary non-ASCII text and a valid pair.
+- `non-finite.stable.json`: the JavaScript value
+  `{ nan: NaN, negative: -Infinity, positive: Infinity }`, which JSON cannot represent.
+  `JSON.parse()` rejects textual `NaN` and `Infinity`, so this golden records only the
+  serializer rule for JavaScript values that already exist in memory.
 
-`JSON.parse()` rejects textual `NaN` and `Infinity`. The non-finite golden records only
-the serializer rule for JavaScript values that already exist in memory.
-
-For every case, pass that parsed or literal JavaScript value to `stableJson()` and write
-the returned string directly to the corresponding `*.stable.json` file on stdout. Do not
-parse a stable output file as its own regeneration input.
-
-The upstream `"Guitar"` documents are protocol acceptance fixtures. Files under
-`generated/` exercise Bunri's Japanese `"ギター"` label generation separately.
+A stable output file is never used as its own regeneration input.
