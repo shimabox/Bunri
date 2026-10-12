@@ -652,6 +652,215 @@ def test_pocket_connection_and_checking_render_before_status_responds(tmp_path):
         )
 
 
+def _connected_out_dir_with_one_package(tmp_path):
+    """An output directory with one sendable package and a saved connection."""
+    import base64
+
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+    from bunri.pocket.config import (
+        PocketConfig,
+        connection_fingerprint,
+        read_config,
+        save_config,
+    )
+
+    out_dir = tmp_path / "out"
+    jobs_dir = out_dir / "web" / "jobs"
+    jobs_dir.mkdir(parents=True)
+    digest = "c" * 40
+    (jobs_dir / "j-separate.json").write_text(json.dumps({
+        "id": "j-separate",
+        "digest": digest,
+        "title": "Waiting Song",
+        "target": "guitar",
+        "status": "done",
+        "created_at": "2026-09-05T00:00:00+00:00",
+        "started_at": "2026-09-05T00:00:01+00:00",
+        "finished_at": "2026-09-05T00:00:02+00:00",
+        "error": None,
+        "package": "Waiting Song/Waiting Song.guitar.player.html",
+        "log": "web/logs/j-separate.log",
+        "upload": "web/uploads/waiting.mp3",
+    }), encoding="utf-8")
+    package = out_dir / "Waiting Song"
+    package.mkdir()
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Waiting Song",
+            "Waiting Song",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+        (package / f"Waiting Song.{suffix}").write_bytes(b"audio")
+    (package / "Waiting Song.guitar.player.html").write_text(
+        "<html><body>player ok</body></html>", encoding="utf-8"
+    )
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    return out_dir, digest, connection_fingerprint(read_config(out_dir))
+
+
+@_needs_browser
+def test_pocket_upload_and_delete_stay_usable_while_status_is_being_checked(tmp_path):
+    out_dir, digest, fingerprint = _connected_out_dir_with_one_package(tmp_path)
+    posts = []
+
+    def hold_status_and_reject_sync(page):
+        # The remote check never answers; /api/pocket/local is served for real.
+        page.route("**/api/pocket/status", lambda _route: None)
+
+        def reject_sync(route):
+            posts.append(route.request.url)
+            route.fulfill(
+                status=409,
+                content_type="application/json",
+                body=json.dumps({"detail": "別の Pocket 同期が実行中です。"}),
+            )
+
+        page.route("**/api/pocket/sync/*", reject_sync)
+        page.on("dialog", lambda dialog: dialog.dismiss())
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=hold_status_and_reject_sync
+    ) as page:
+        page.wait_for_function(
+            "document.querySelector('.sw-pocket-row button') && "
+            "!document.querySelector('.sw-pocket-row button').disabled"
+        )
+        assert page.locator("#sw-pocket-refresh").get_attribute("aria-busy") == "true"
+        assert page.locator("#sw-pocket-all").is_enabled()
+        page.locator("button.sw-job-toggle").click()
+        assert page.locator(".sw-pocket-row .sw-badge").text_content() == "確認中"
+
+        with page.expect_request("**/api/pocket/sync/*"):
+            page.locator(".sw-pocket-row button").click()
+        assert posts == [
+            f"{base_url}/api/pocket/sync/{digest[:12]}?pocket_fingerprint={fingerprint}"
+        ]
+        assert page.locator("#sw-pocket-refresh").get_attribute("aria-busy") == "true"
+
+        page.click("button.sw-delete-song-btn")
+        assert page.locator("#sw-delete-pocket-option").is_visible()
+
+
+@_needs_browser
+def test_pocket_recheck_drops_what_the_failed_check_said(tmp_path):
+    out_dir, _digest, _fingerprint = _connected_out_dir_with_one_package(tmp_path)
+    unknown = "音源ポケットの状態を確認できません。"
+    calls = []
+
+    def fail_first_status_then_hold(page):
+        def answer(route):
+            calls.append(route)
+            if len(calls) > 1:
+                return
+            local = route.request.frame.page.request.get(
+                route.request.url.replace("/api/pocket/status", "/api/pocket/local")
+            ).json()
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    **local,
+                    "songs": [
+                        {**song, "state": "unknown", "can_sync": False, "message": unknown}
+                        for song in local["songs"]
+                    ],
+                    "remote_only": [],
+                    "state": "unknown",
+                    "message": unknown,
+                }),
+            )
+
+        page.route("**/api/pocket/status", answer)
+
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=fail_first_status_then_hold
+    ) as page:
+        page.wait_for_selector("#sw-pocket-refresh:not([aria-busy])")
+        page.locator("button.sw-job-toggle").click()
+        upload = page.locator(".sw-pocket-row button")
+        assert upload.is_disabled()
+        assert page.locator(".sw-pocket-row .sw-badge").text_content() == "確認できません"
+        assert page.locator(".sw-pocket-message").text_content() == unknown
+
+        page.locator("#sw-pocket-refresh").click()
+        page.wait_for_function(
+            "!document.querySelector('.sw-pocket-row button').disabled"
+        )
+        assert len(calls) == 2
+        assert page.locator("#sw-pocket-refresh").get_attribute("aria-busy") == "true"
+        assert page.locator(".sw-pocket-row .sw-badge").text_content() == "確認中"
+        assert page.locator(".sw-pocket-message").count() == 0
+
+
+@_needs_browser
+@pytest.mark.parametrize("package_count", [3, 123456789012345678901234567890])
+def test_pocket_header_buttons_keep_their_place_when_the_note_changes(
+    tmp_path, package_count
+):
+    import base64
+
+    from bunri.pocket.config import PocketConfig, save_config
+
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(tmp_path, PocketConfig("https://example.invalid", token))
+    held = []
+
+    def hold_status(page):
+        page.route("**/api/pocket/status", lambda route: held.append(route))
+
+    def boxes(page):
+        return {
+            selector: page.locator(selector).bounding_box()
+            for selector in ("#sw-songs-heading", "#sw-pocket-all", "#sw-pocket-refresh")
+        }
+
+    app = create_app(tmp_path, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(
+        base_url, before_goto=hold_status
+    ) as page:
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-count').textContent.startsWith("
+            "'音源ポケットの状態を確認しています')"
+        )
+        while_checking = boxes(page)
+
+        held[0].fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "connected": True,
+                "package_count": package_count,
+                "target_count": 2,
+                "songs": [],
+                "remote_only": [],
+            }),
+        )
+        page.wait_for_function(
+            "document.getElementById('sw-pocket-count').textContent.endsWith('に更新')"
+        )
+        assert page.locator("#sw-pocket-refresh").text_content() == "状態を再読込"
+        assert boxes(page) == while_checking
+
+        # The note stays on the buttons' row, to their right, however long it is.
+        refresh = while_checking["#sw-pocket-refresh"]
+        note = page.locator("#sw-pocket-count").bounding_box()
+        assert note["x"] >= refresh["x"] + refresh["width"]
+        assert note["y"] < refresh["y"] + refresh["height"]
+        assert note["y"] + note["height"] > refresh["y"]
+
+
 @_needs_browser
 def test_pocket_status_success_restores_refresh_button_and_shows_update_time(tmp_path):
     def mock_status(page):
@@ -2441,8 +2650,11 @@ def test_local_delete_ignores_older_pocket_status_response(tmp_path, monkeypatch
     release_first = threading.Event()
     status_calls = 0
 
-    def inspect_with_delayed_first_response(*_args, **_kwargs):
+    def inspect_with_delayed_first_response(_out_dir, client):
         nonlocal status_calls
+        if client is None:
+            # /api/pocket/local: the page's network-free lookup, not a check.
+            return ()
         status_calls += 1
         if status_calls == 1:
             first_started.set()

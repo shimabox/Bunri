@@ -502,8 +502,7 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
             "job": _serialize_job(job) if job is not None else None,
         }
 
-    @app.get("/api/pocket/status")
-    def pocket_status() -> dict:
+    def _pocket_status(*, remote: bool) -> dict:
         try:
             config = read_config(out_dir)
         except (OSError, ValueError):
@@ -522,15 +521,15 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                 "target_count": 0,
                 "songs": [],
             }
-        client = PocketHTTPClient(config.base_url, config.token)
+        client = PocketHTTPClient(config.base_url, config.token) if remote else None
         packages = inspect_packages(out_dir, client)
-        try:
-            library_tracks = list_library_tracks(out_dir, client=client)
-        except (OSError, RuntimeError, ValueError):
-            library_tracks = ()
-            library_error = True
-        else:
-            library_error = False
+        library_tracks = ()
+        library_error = False
+        if remote:
+            try:
+                library_tracks = list_library_tracks(out_dir, client=client)
+            except (OSError, RuntimeError, ValueError):
+                library_error = True
         digest_to_web_id = {
             song.digest: song.id
             for song in store.list_songs()
@@ -577,23 +576,39 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
                 "conflict": item.remote.conflict,
                 "can_delete": can_delete,
             })
-        local_song_ids = {item.song_id for item in packages if item.song_id is not None}
-        remote_only = [
-            {"song_id": item.song_id, "title": item.title}
-            for item in library_tracks
-            if item.song_id not in local_song_ids
-        ]
         response = {
             "connected": True,
             "connection_fingerprint": connection_fingerprint(config),
             "target_count": sum(item.song_id is not None for item in packages),
             "package_count": len(packages),
             "songs": songs,
-            "remote_only": remote_only,
         }
+        if not remote:
+            return response
+        local_song_ids = {item.song_id for item in packages if item.song_id is not None}
+        response["remote_only"] = [
+            {"song_id": item.song_id, "title": item.title}
+            for item in library_tracks
+            if item.song_id not in local_song_ids
+        ]
         if library_error:
             response.update(state="unknown", message="音源ポケットの状態を確認できません。")
         return response
+
+    @app.get("/api/pocket/status")
+    def pocket_status() -> dict:
+        return _pocket_status(remote=True)
+
+    @app.get("/api/pocket/local")
+    def pocket_local() -> dict:
+        """The part of the Pocket status that the output directory decides.
+
+        Nothing is requested from the Pocket, so this answers at once: which
+        songs can be sent or deleted, and under which song ID. The page uses
+        it to keep upload and delete usable while /api/pocket/status is
+        still comparing every package with the Pocket.
+        """
+        return _pocket_status(remote=False)
 
     def _pocket_config_or_409():
         try:
