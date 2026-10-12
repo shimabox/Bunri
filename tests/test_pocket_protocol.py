@@ -7,7 +7,7 @@ import hashlib
 import pytest
 
 from bunri.package_metadata import PackageMetadata, SourceIdentity, TargetMetadata
-from bunri.pocket.protocol import AssetInfo, ProtocolError, merge_library, merge_manifest, pan_split_supported, parse_json, stable_json, validate_library, validate_manifest
+from bunri.pocket.protocol import AssetInfo, ProtocolError, merge_library, merge_manifest, pan_split_supported, parse_json, password_reset_supported, stable_json, validate_library, validate_manifest
 
 FIXTURES = Path(__file__).parent / "fixtures" / "bunri_pocket_protocol_v1"
 
@@ -118,6 +118,30 @@ def test_remote_non_json_constants_are_rejected(constant):
 )
 def test_pan_split_supported_truth_table(capabilities, expected):
     assert pan_split_supported(capabilities) is expected
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "expected"),
+    [
+        ({"api": {"major": 1}, "features": {"password_reset": True}}, True),
+        ({"api": {"major": 1}, "features": {"password_reset": True, "pan_split": False}}, True),
+        ({"api": {"major": 1}, "features": {"password_reset": False}}, False),
+        ({"api": {"major": 1}, "features": {"password_reset": 1}}, False),
+        ({"api": {"major": 1}, "features": {"password_reset": "true"}}, False),
+        ({"api": {"major": 1}, "features": {"pan_split": True}}, False),
+        ({"api": {"major": 1}, "features": ["password_reset"]}, False),
+        ({"api": {"major": 1}}, False),
+        ({"features": {"password_reset": True}}, False),
+        ({"api": {"major": 2}, "features": {"password_reset": True}}, False),
+        ({"api": {"major": True}, "features": {"password_reset": True}}, False),
+        ({"api": {"major": 1.0}, "features": {"password_reset": True}}, False),
+        (["api", "features"], False),
+        ("password_reset", False),
+        (None, False),
+    ],
+)
+def test_password_reset_supported_truth_table(capabilities, expected):
+    assert password_reset_supported(capabilities) is expected
 
 
 def _pan_split_fixture():

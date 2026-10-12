@@ -277,6 +277,19 @@ def pan_split_supported(capabilities: object) -> bool:
     return isinstance(major, int) and not isinstance(major, bool) and major == 1 and features.get("pan_split") is True
 
 
+def password_reset_supported(capabilities: object) -> bool:
+    """Whether a Pocket accepts a viewing-password reset over the upload token.
+
+    Only api.major 1 with features.password_reset exactly true counts; a
+    missing features object or any other value means an older Pocket.
+    """
+    if not isinstance(capabilities, dict): return False
+    api, features = capabilities.get("api"), capabilities.get("features")
+    if not isinstance(api, dict) or not isinstance(features, dict): return False
+    major = api.get("major")
+    return isinstance(major, int) and not isinstance(major, bool) and major == 1 and features.get("password_reset") is True
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
