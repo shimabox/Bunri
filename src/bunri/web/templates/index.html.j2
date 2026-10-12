@@ -848,6 +848,10 @@
   var pocketChecking = false;
   var pocketStatuses = Object.create(null);
   var activePocketJobId = null;
+  // The upload this page started or saw running. Unlike activePocketJobId it
+  // is kept once the job ends, so its result can be told apart from one a
+  // later visit merely finds.
+  var watchedPocketJobId = null;
   var pocketJobGeneration = 0;
   var pocketStatusGeneration = 0;
   var pocketStatusSettledGeneration = 0;
@@ -1046,6 +1050,7 @@
     }).then(function (body) {
       clearPocketSummary();
       activePocketJobId = body.job_id;
+      watchedPocketJobId = body.job_id;
       return refreshSongs();
     });
   }
@@ -1517,9 +1522,14 @@
     pocketNotice.hidden = !unsupported;
   }
 
-  function renderPocketSummary(job) {
+  // `watched` says this page followed the batch to its end. A batch that
+  // finished well is reported only then: found again on a later visit it is
+  // old news, and the states on the songs already say what the Pocket holds.
+  // A batch that failed keeps its line until the next upload starts.
+  function renderPocketSummary(job, watched) {
     renderPocketNotice(job);
     if (job.kind !== "pocket_all" || (job.status !== "done" && job.status !== "error")) return;
+    if (job.status === "done" && !watched) return;
     var completed = pocketJobCount(job, "completed");
     var failed = pocketJobCount(job, "failed");
     var pending = pocketJobCount(job, "pending");
@@ -1631,6 +1641,7 @@
         deleteDialogPocketFingerprint = null;
         if (body && body.job_id) {
           activePocketJobId = body.job_id;
+          watchedPocketJobId = body.job_id;
           return refreshSongs();
         }
         delete songExpandedStates[song.id];
@@ -1990,7 +2001,7 @@
       .then(function (job) {
         renderPocketProgress(job);
         if (job.status === "done" || job.status === "error") {
-          renderPocketSummary(job);
+          renderPocketSummary(job, job.id === watchedPocketJobId);
           activePocketJobId = null;
           return refreshPocketStatus();
         }
@@ -2021,9 +2032,10 @@
         renderPocketProgress(job);
         if (job && (job.status === "queued" || job.status === "running")) {
           activePocketJobId = job.id;
+          watchedPocketJobId = job.id;
         } else if (job && (job.status === "done" || job.status === "error")) {
           activePocketJobId = null;
-          renderPocketSummary(job);
+          renderPocketSummary(job, job.id === watchedPocketJobId);
           if (trackedJobId !== null && job.id === trackedJobId) {
             refreshPocketStatus();
           }

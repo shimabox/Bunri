@@ -1174,10 +1174,21 @@ def test_visibility_refreshes_status_only_when_a_tracked_pocket_job_finishes(
             with page.expect_response("**/api/pocket/job"):
                 page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
 
-        page.wait_for_function(
-            "document.getElementById('sw-pocket-summary').textContent === "
-            "'全曲アップロード完了: 2件'"
-        )
+        summary = page.locator("#sw-pocket-summary")
+        if initial_job_status == "running":
+            page.wait_for_function(
+                "document.getElementById('sw-pocket-summary').textContent === "
+                "'全曲アップロード完了: 2件'"
+            )
+        else:
+            # A batch that had already ended when the page opened is not
+            # announced, however often the page asks about it.
+            deadline = time.time() + 5
+            while state["held_songs"] is None and time.time() < deadline:
+                page.wait_for_timeout(20)
+            assert state["job_calls"] == 2
+            assert summary.is_hidden()
+            assert summary.text_content() == ""
         assert state["held_songs"] is not None
         assert state["status_calls"] == expected_status_calls
         state["held_songs"].continue_()
@@ -1340,6 +1351,64 @@ def test_single_pocket_upload_button_recovers_after_409(tmp_path):
 PAN_SPLIT_UNSUPPORTED_NOTICE = (
     "この音源ポケットは L のみ / R のみに未対応です。音源ポケットを更新して再同期すると送られます"
 )
+
+
+@_needs_browser
+@pytest.mark.parametrize("outcome", ["done", "error"])
+def test_pocket_all_completion_is_reported_only_to_the_page_that_watched_it(
+    tmp_path, monkeypatch, outcome
+):
+    import base64
+
+    import bunri.web.jobs as jobs_module
+    from bunri.pocket.config import PocketConfig, save_config
+    from bunri.pocket.service import BatchItem, BatchResult
+
+    out_dir = tmp_path / "out"
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    save_config(out_dir, PocketConfig("https://example.invalid", token))
+    failure = "Pocket の同期に失敗しました。後で再実行してください。"
+
+    def finish_sync_all(*_args, progress=None, **_kwargs):
+        item = BatchItem("Song", "done") if outcome == "done" else BatchItem("Song", "error", error=failure)
+        batch = BatchResult(total=1, items=[item])
+        if progress is not None:
+            progress(batch, None)
+        return batch
+
+    monkeypatch.setattr(jobs_module, "sync_all", finish_sync_all)
+    shown = (
+        "全曲アップロード完了: 1件"
+        if outcome == "done"
+        else f"全曲アップロード失敗: {failure}（完了 0件 / 失敗 1件 / 未実行 0件）"
+    )
+    app = create_app(out_dir, runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        summary = page.locator("#sw-pocket-summary")
+        page.wait_for_selector("#sw-pocket-controls:not([hidden])")
+        page.locator("#sw-pocket-all").click()
+        page.wait_for_function(
+            "text => document.getElementById('sw-pocket-summary').textContent === text",
+            arg=shown,
+            timeout=10_000,
+        )
+        # Still there on this page after it has asked about the job again.
+        with page.expect_response("**/api/pocket/job"):
+            page.evaluate("void window.__bunriWeb.refresh()")
+        assert summary.text_content() == shown
+
+        with page.expect_response("**/api/pocket/job") as first_answer:
+            page.reload()
+        assert first_answer.value.json()["job"]["status"] == outcome
+        page.wait_for_selector("#sw-pocket-controls:not([hidden])")
+        with page.expect_response("**/api/pocket/job"):
+            page.evaluate("void window.__bunriWeb.refresh()")
+        if outcome == "done":
+            assert summary.is_hidden()
+            assert summary.text_content() == ""
+        else:
+            assert summary.is_visible()
+            assert summary.text_content() == shown
 
 
 @_needs_browser
