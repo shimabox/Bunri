@@ -44,17 +44,18 @@ def test_console_entrypoint_points_to_dispatch():
     assert project["project"]["scripts"]["bunri"] == "bunri.cli:dispatch"
 
 
-def test_pocket_connect_has_no_token_argv_option():
+def test_pocket_connect_has_no_token_option_at_all():
     from bunri.pocket.cli import app as pocket_app
 
     result = CliRunner().invoke(pocket_app, ["connect", "--help"], env=_STABLE_TERMINAL)
     assert result.exit_code == 0
     help_text = _plain(result.output)
-    assert "--token-stdin" in help_text
+    assert "--token-stdin" not in help_text
     assert "--token " not in help_text
+    assert "--token" not in help_text
 
 
-def test_pocket_connect_reads_token_from_stdin_without_displaying_it(tmp_path, monkeypatch):
+def test_pocket_connect_reads_token_from_the_prompt_without_displaying_it(tmp_path, monkeypatch):
     import base64
     import bunri.pocket.cli as pocket_cli
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
@@ -66,10 +67,44 @@ def test_pocket_connect_reads_token_from_stdin_without_displaying_it(tmp_path, m
         def capabilities(self): return capabilities
 
     monkeypatch.setattr(pocket_cli, "PocketHTTPClient", Client)
-    result = CliRunner().invoke(pocket_cli.app, ["connect", "https://example.invalid", "-o", str(tmp_path), "--token-stdin"], input=token + "\n")
+    monkeypatch.setattr(pocket_cli, "_stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(pocket_cli.app, ["connect", "https://example.invalid", "-o", str(tmp_path)], input=token + "\n")
     assert result.exit_code == 0, result.output
-    assert token not in result.output
+    assert token not in "".join(result.output.split())
     assert (tmp_path / ".pocket/config.json").exists()
+
+
+def test_pocket_connect_without_a_terminal_reads_nothing_and_saves_nothing(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+
+    monkeypatch.setattr(pocket_cli, "_stdin_is_tty", lambda: False)
+    monkeypatch.setattr(pocket_cli, "PocketHTTPClient", lambda *a, **k: pytest.fail("HTTP started"))
+    monkeypatch.setattr(pocket_cli.typer, "prompt", lambda *a, **k: pytest.fail("stdin was read"))
+    monkeypatch.setattr(pocket_cli, "validate_base_url", lambda *a: pytest.fail("URL was inspected"))
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["connect", "https://example.invalid", "-o", str(tmp_path)],
+        input="piped-token\n",
+        env=_STABLE_TERMINAL,
+    )
+    assert result.exit_code == 1
+    assert "upload token の入力には TTY が必要です。端末から実行するか、Web UI から接続してください。" in _plain(result.output)
+    assert "piped-token" not in result.output
+    assert not (tmp_path / ".pocket").exists()
+
+
+def test_pocket_connect_rejects_the_removed_token_stdin_option(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+
+    monkeypatch.setattr(pocket_cli, "PocketHTTPClient", lambda *a, **k: pytest.fail("HTTP started"))
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["connect", "https://example.invalid", "-o", str(tmp_path), "--token-stdin"],
+        input="piped-token\n",
+        env=_STABLE_TERMINAL,
+    )
+    assert result.exit_code == 2
+    assert not (tmp_path / ".pocket").exists()
 
 
 def test_pocket_sync_without_config_does_not_create_http_client(tmp_path, monkeypatch):

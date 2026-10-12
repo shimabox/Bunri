@@ -56,11 +56,13 @@ def _fail(message: str) -> None:
 def connect(
     url: str = typer.Argument(..., metavar="URL"),
     output: Path = typer.Option(Path("out"), "--output", "-o", help="Output directory"),
-    token_stdin: bool = typer.Option(False, "--token-stdin", help="Read one token line from stdin"),
 ) -> None:
+    # The token is only ever typed at a terminal, never piped in.
+    if not _stdin_is_tty():
+        _fail("upload token の入力には TTY が必要です。端末から実行するか、Web UI から接続してください。")
     try:
         base_url = validate_base_url(url)
-        raw = sys.stdin.readline() if token_stdin else typer.prompt("Pocket upload token", hide_input=True)
+        raw = typer.prompt("Pocket upload token", hide_input=True)
         token = validate_token(raw)
         client = PocketHTTPClient(base_url, token)
         validate_capabilities(client.capabilities())
