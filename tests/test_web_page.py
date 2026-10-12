@@ -25,6 +25,9 @@ import pytest
 
 from bunri.web.app import create_app
 from bunri.web.jobs import safe_filename
+from pocket_fake import OTHER_TOKEN as _OTHER_FAKE_TOKEN
+from pocket_fake import TOKEN as _FAKE_TOKEN
+from pocket_fake import VECTORS, capabilities, running_fake_pocket
 
 
 def test_pocket_sync_template_binds_requests_and_refreshes_changed_connection():
@@ -2724,3 +2727,461 @@ def test_local_delete_ignores_older_pocket_status_response(tmp_path, monkeypatch
             )
     finally:
         release_first.set()
+
+
+# ---------------------------------------------------------------------------
+# Pocket settings from the page: connect, change, disconnect
+#
+# The Pocket is the loopback fake from tests/pocket_fake.py, reached by the
+# real server with the real HTTP client. That the requests succeed at all also
+# shows the browser attaches Origin to a same-origin POST and DELETE: the
+# endpoints refuse a request without it.
+# ---------------------------------------------------------------------------
+def _is_open(page, selector: str) -> bool:
+    return page.locator(selector).evaluate("dialog => dialog.open")
+
+
+def _open_settings(page) -> None:
+    page.click("#sw-pocket-settings")
+    page.wait_for_selector("#sw-pocket-settings-dialog[open]")
+
+
+def _wait_connected_header(page) -> None:
+    page.wait_for_selector("#sw-pocket-settings", state="visible")
+    assert page.locator("#sw-pocket-banner").is_visible()
+    assert page.locator("#sw-pocket-banner").text_content() == "Bunri Pocket 連携中"
+    assert not page.locator("#sw-pocket-connect").is_visible()
+    assert not page.locator("#sw-pocket-disconnected").is_visible()
+
+
+def _wait_disconnected_header(page) -> None:
+    page.wait_for_selector("#sw-pocket-connect", state="visible")
+    assert page.locator("#sw-pocket-connect").text_content() == "音源ポケットに接続"
+    assert page.locator("#sw-pocket-disconnected").text_content() == "音源ポケットに接続していません"
+    assert page.locator("#sw-pocket-disconnected").is_visible()
+    assert not page.locator("#sw-pocket-settings").is_visible()
+    assert not page.locator("#sw-pocket-banner").is_visible()
+    assert not page.locator("#sw-pocket-controls").is_visible()
+
+
+@contextlib.contextmanager
+def _page_with_fake_pocket(out_dir: Path, *, connected: bool):
+    from bunri.pocket.config import PocketConfig, save_config
+
+    with running_fake_pocket() as pocket:
+        if connected:
+            save_config(out_dir, PocketConfig(pocket.url, _FAKE_TOKEN))
+        app = create_app(out_dir, runner=PageFakeRunner())
+        with _running_server(app) as base_url, _open_page(base_url) as page:
+            yield page, pocket
+
+
+@_needs_browser
+def test_connecting_from_the_page_saves_the_settings_without_showing_the_token(tmp_path):
+    from bunri.pocket.config import PocketConfig, read_config
+    from pocket_fake import error_envelope
+
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=False) as (page, pocket):
+        _wait_disconnected_header(page)
+
+        page.click("#sw-pocket-connect")
+        page.wait_for_selector("#sw-connect-dialog[open]")
+        assert page.locator("#sw-connect-title").text_content() == "音源ポケットに接続"
+        assert page.locator("#sw-connect-submit").text_content() == "接続する"
+        assert page.locator("#sw-connect-token").get_attribute("type") == "password"
+        assert ".pocket ディレクトリを削除" not in page.locator("#sw-connect-dialog").text_content()
+
+        # Nothing is sent while a field is empty.
+        page.click("#sw-connect-submit")
+        assert page.locator("#sw-connect-error").text_content() == "URL と upload token を入力してください。"
+        assert pocket.requests == []
+
+        # A refusal by the Pocket keeps the dialog open for another try.
+        pocket.capabilities_reply = (401, {}, error_envelope("UNAUTHORIZED"))
+        page.fill("#sw-connect-url", pocket.url)
+        page.fill("#sw-connect-token", _FAKE_TOKEN)
+        page.click("#sw-connect-submit")
+        page.wait_for_function(
+            "document.getElementById('sw-connect-error').textContent.includes('upload token が違います')"
+        )
+        assert _is_open(page, "#sw-connect-dialog")
+        assert page.locator("#sw-connect-token").input_value() == ""
+        assert page.locator("#sw-connect-submit").text_content() == "接続する"
+        assert not (out_dir / ".pocket" / "config.json").exists()
+
+        pocket.capabilities_reply = None
+        page.fill("#sw-connect-token", _FAKE_TOKEN)
+        page.click("#sw-connect-submit")
+        _wait_connected_header(page)
+        page.wait_for_selector("#sw-pocket-controls", state="visible")
+        assert not _is_open(page, "#sw-connect-dialog")
+        assert page.locator("#sw-connect-token").input_value() == ""
+        assert read_config(out_dir) == PocketConfig(pocket.url, _FAKE_TOKEN)
+        assert _FAKE_TOKEN not in page.content()
+        assert pocket.recorded("GET", "/api/v1/upload/capabilities")[-1].header(
+            "Authorization"
+        ) == f"Bearer {_FAKE_TOKEN}"
+
+
+@_needs_browser
+def test_pocket_settings_dialog_leads_to_each_of_its_three_dialogs(tmp_path):
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, _pocket):
+        _wait_connected_header(page)
+        config_before = (out_dir / ".pocket" / "config.json").read_bytes()
+
+        _open_settings(page)
+        assert page.locator("#sw-pocket-settings-title").text_content() == "音源ポケットの設定"
+        assert page.locator("#sw-pocket-settings-dialog .sw-settings-list button").all_text_contents() == [
+            "接続先を変更",
+            "閲覧パスワードを再設定",
+            "接続を解除",
+        ]
+        assert page.locator("#sw-pocket-settings-dialog .sw-settings-list p").all_text_contents() == [
+            "URL や upload token を入れ直す",
+            "忘れたときに、新しいパスワードを決め直す",
+            "この出力先に保存した接続設定を消す",
+        ]
+        # Closing changes nothing.
+        page.click("#sw-settings-close")
+        assert not _is_open(page, "#sw-pocket-settings-dialog")
+        assert not _is_open(page, "#sw-connect-dialog")
+        assert not _is_open(page, "#sw-reset-dialog")
+        assert not _is_open(page, "#sw-disconnect-dialog")
+        _wait_connected_header(page)
+
+        _open_settings(page)
+        page.click("#sw-settings-reset")
+        page.wait_for_selector("#sw-reset-dialog[open]")
+        assert not _is_open(page, "#sw-pocket-settings-dialog")
+        assert page.locator("#sw-reset-title").text_content() == "閲覧パスワードを再設定"
+        for selector in ("#sw-reset-password", "#sw-reset-password-confirm"):
+            assert page.locator(selector).get_attribute("type") == "password"
+            assert page.locator(selector).get_attribute("autocomplete") == "new-password"
+        page.click("#sw-reset-cancel")
+        assert not _is_open(page, "#sw-reset-dialog")
+
+        _open_settings(page)
+        page.click("#sw-settings-change")
+        page.wait_for_selector("#sw-connect-dialog[open]")
+        assert not _is_open(page, "#sw-pocket-settings-dialog")
+        assert page.locator("#sw-connect-title").text_content() == "接続先を変更"
+        assert page.locator("#sw-connect-submit").text_content() == "置き換える"
+        assert page.locator("#sw-connect-description").text_content().startswith("現在の接続を置き換えます。")
+        page.click("#sw-connect-cancel")
+        assert not _is_open(page, "#sw-connect-dialog")
+
+        _open_settings(page)
+        page.click("#sw-settings-disconnect")
+        page.wait_for_selector("#sw-disconnect-dialog[open]")
+        assert not _is_open(page, "#sw-pocket-settings-dialog")
+        assert page.locator("#sw-disconnect-title").text_content() == "音源ポケットとの接続を解除しますか？"
+        assert page.locator("#sw-disconnect-dialog li").all_text_contents() == [
+            "この出力先に保存した接続先と upload token を消します。",
+            "音源ポケットにある曲と、手元の曲は消えません。",
+            "もう一度使うには、接続し直してください。",
+        ]
+        # Cancelling changes nothing either.
+        page.click("#sw-disconnect-cancel")
+        assert not _is_open(page, "#sw-disconnect-dialog")
+        _wait_connected_header(page)
+        assert (out_dir / ".pocket" / "config.json").read_bytes() == config_before
+
+        # The song list's own controls gained no button.
+        assert page.locator("#sw-pocket-controls button").all_text_contents() == [
+            "全曲アップロード",
+            "状態を再読込",
+        ]
+
+
+@_needs_browser
+def test_changing_the_connection_from_the_page_replaces_the_saved_settings(tmp_path):
+    from bunri.pocket.config import PocketConfig, read_config
+
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, _first), running_fake_pocket() as second:
+        _wait_connected_header(page)
+        _open_settings(page)
+        page.click("#sw-settings-change")
+        page.wait_for_selector("#sw-connect-dialog[open]")
+        page.fill("#sw-connect-url", second.url)
+        page.fill("#sw-connect-token", _OTHER_FAKE_TOKEN)
+        with page.expect_response("**/api/pocket/connect") as connect_info:
+            page.click("#sw-connect-submit")
+        body = connect_info.value.json()
+        assert body["replaced"] is True
+        assert second.url not in connect_info.value.text() and _OTHER_FAKE_TOKEN not in connect_info.value.text()
+        page.wait_for_function("!document.getElementById('sw-connect-dialog').open")
+        _wait_connected_header(page)
+        assert read_config(out_dir) == PocketConfig(second.url, _OTHER_FAKE_TOKEN)
+        assert _OTHER_FAKE_TOKEN not in page.content() and _FAKE_TOKEN not in page.content()
+        # The page now follows the new connection.
+        assert page.evaluate(
+            "fetch('/api/pocket/job').then(r => r.json()).then(b => b.connection_fingerprint)"
+        ) == body["connection_fingerprint"]
+
+
+@_needs_browser
+def test_disconnecting_from_the_page_removes_the_settings_and_the_pocket_ui(tmp_path):
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, _pocket):
+        _wait_connected_header(page)
+        page.wait_for_selector("#sw-pocket-controls", state="visible")
+
+        _open_settings(page)
+        page.click("#sw-settings-disconnect")
+        page.wait_for_selector("#sw-disconnect-dialog[open]")
+        with page.expect_request(
+            lambda request: request.method == "DELETE" and "/api/pocket/connection" in request.url
+        ) as request_info:
+            page.click("#sw-disconnect-confirm")
+        assert request_info.value.header_value("origin") is not None
+        _wait_disconnected_header(page)
+        assert not _is_open(page, "#sw-disconnect-dialog")
+        assert not (out_dir / ".pocket" / "config.json").exists()
+        assert page.locator("#sw-remote-only").is_hidden()
+        assert page.evaluate("fetch('/api/pocket/job').then(r => r.json()).then(b => b.connected)") is False
+
+
+@_needs_browser
+def test_disconnect_conflict_shows_the_reason_and_rereads_the_connection(tmp_path):
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, _pocket):
+        _wait_connected_header(page)
+        # The settings disappear behind the page's back.
+        (out_dir / ".pocket" / "config.json").unlink()
+
+        _open_settings(page)
+        page.click("#sw-settings-disconnect")
+        page.wait_for_selector("#sw-disconnect-dialog[open]")
+        page.click("#sw-disconnect-confirm")
+        page.wait_for_function(
+            "document.getElementById('sw-disconnect-error').textContent === 'Pocket の接続設定がありません。'"
+        )
+        assert _is_open(page, "#sw-disconnect-dialog")
+        assert page.locator("#sw-disconnect-confirm").text_content() == "解除する"
+        page.click("#sw-disconnect-cancel")
+        assert not _is_open(page, "#sw-disconnect-dialog")
+        _wait_disconnected_header(page)
+
+
+# ---------------------------------------------------------------------------
+# Resetting the viewing password from the page
+#
+# The key is derived in the browser (WebCrypto) and in Python by two separate
+# implementations; both are held against the same published test values, and
+# against each other through what the fake Pocket receives.
+# ---------------------------------------------------------------------------
+_RESET_PATH = "/api/v1/password/reset"
+_PAGE_PASSWORD = "pässwörd 日本語 \U0001f3b8 Zz"
+
+
+def _open_reset_dialog(page) -> None:
+    _wait_connected_header(page)
+    _open_settings(page)
+    page.click("#sw-settings-reset")
+    page.wait_for_selector("#sw-reset-dialog[open]")
+
+
+def _fill_reset(page, password: str, confirmation: str | None = None) -> None:
+    page.fill("#sw-reset-password", password)
+    page.fill("#sw-reset-password-confirm", password if confirmation is None else confirmation)
+
+
+def _reset_result_lines(page) -> list[str]:
+    page.wait_for_selector("#sw-reset-result:not([hidden])")
+    return page.locator("#sw-reset-result p").all_text_contents()
+
+
+@_needs_browser
+def test_page_key_derivation_matches_the_published_test_values(tmp_path):
+    app = create_app(tmp_path / "out", runner=PageFakeRunner())
+    with _running_server(app) as base_url, _open_page(base_url) as page:
+        derived = [
+            page.evaluate(
+                "([password, salt]) => window.__bunriWeb.deriveKey(password, salt)",
+                [vector["password"], vector["salt"]],
+            )
+            for vector in VECTORS
+        ]
+        assert derived[1] == "ZDdrEqwT6KETy2izxW2uK25FVChkKDdx38yVDdttiOI" == VECTORS[1]["derived_key"]
+        assert derived[0] == "amWJtD1HdCn6v6NI81RE6WC_ysbPDCbdF5mMBCbC-Ts" == VECTORS[0]["derived_key"]
+        assert page.evaluate(
+            "window.__bunriWeb.deriveKey('bunri-pocket-reset-passphrase', 'EBESExQVFhcYGRobHB0eHw')"
+        ) == "ZDdrEqwT6KETy2izxW2uK25FVChkKDdx38yVDdttiOI"
+        # Only the canonical, unpadded spelling of a salt is decoded.
+        for bad_salt in ("EBESExQVFhcYGRobHB0eHx", "EBESExQVFhcYGRobHB0eHw==", "EBESExQVFhcYGRobHB0eH+"):
+            assert page.evaluate(
+                "salt => window.__bunriWeb.deriveKey('bunri-pocket-reset-passphrase', salt)"
+                ".then(() => 'derived', () => 'refused')",
+                bad_salt,
+            ) == "refused"
+
+
+@_needs_browser
+def test_reset_dialog_checks_the_password_before_anything_is_sent(tmp_path):
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, pocket):
+        _open_reset_dialog(page)
+        sent_to_bunri: list[str] = []
+        page.on(
+            "request",
+            lambda request: sent_to_bunri.append(request.url)
+            if "/api/pocket/password-reset" in request.url else None,
+        )
+
+        for password, confirmation, message in (
+            ("elevenchars", "elevenchars", "閲覧パスワードは 12 文字以上にしてください。"),
+            # Eleven code points, though twice as many UTF-16 units.
+            ("\U0001f3b8" * 11, "\U0001f3b8" * 11, "閲覧パスワードは 12 文字以上にしてください。"),
+            ("twelve chars", "twelve chars ", "2 回の入力が一致しません。"),
+        ):
+            _fill_reset(page, password, confirmation)
+            page.click("#sw-reset-submit")
+            assert page.locator("#sw-reset-error").text_content() == message
+            assert page.locator("#sw-reset-submit").text_content() == "再設定する"
+            # Typing again clears the message.
+            page.fill("#sw-reset-password", "")
+            assert page.locator("#sw-reset-error").text_content() == ""
+
+        assert _is_open(page, "#sw-reset-dialog")
+        assert sent_to_bunri == []
+        assert pocket.recorded("POST", _RESET_PATH) == []
+
+
+@_needs_browser
+def test_reset_from_the_page_sends_only_a_key_derived_in_the_browser(tmp_path):
+    from bunri.pocket.password import decode_b64url, derive_key
+
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, pocket):
+        config_before = (out_dir / ".pocket" / "config.json").read_bytes()
+        _open_reset_dialog(page)
+        _fill_reset(page, _PAGE_PASSWORD)
+        with page.expect_request(
+            lambda request: "/api/pocket/password-reset" in request.url
+        ) as request_info:
+            page.click("#sw-reset-submit")
+        lines = _reset_result_lines(page)
+
+        # What the browser hands to the Bunri server: the contract document
+        # and nothing typed.
+        to_bunri = request_info.value
+        assert to_bunri.method == "POST"
+        assert to_bunri.header_value("origin") is not None
+        assert to_bunri.header_value("content-type") == "application/json"
+        posted = json.loads(to_bunri.post_data)
+        assert set(posted) == {"kdf", "derived_key"}
+        assert _PAGE_PASSWORD not in to_bunri.post_data
+        assert "pässwörd" not in to_bunri.post_data and "日本語" not in to_bunri.post_data
+
+        # What the Pocket receives from the Bunri server.
+        (reset,) = pocket.recorded("POST", _RESET_PATH)
+        assert reset.header("Authorization") == f"Bearer {_FAKE_TOKEN}"
+        assert reset.header("Content-Type") == "application/json"
+        assert reset.header("Cookie") is None and reset.header("Origin") is None
+        document = json.loads(reset.body)
+        assert document["kdf"] == {
+            "name": "PBKDF2-HMAC-SHA256",
+            "iterations": 600000,
+            "salt": posted["kdf"]["salt"],
+            "dk_len": 32,
+        }
+        salt = decode_b64url(document["kdf"]["salt"], 16)
+        assert len(salt) == 16
+        assert decode_b64url(document["derived_key"], 32) == derive_key(
+            _PAGE_PASSWORD.encode("utf-8"), salt
+        )
+        assert pocket.salt == document["kdf"]["salt"]
+
+        assert lines[0] == "閲覧パスワードを決め直しました。"
+        assert len(lines) == 4
+        assert "is-completed" in page.locator("#sw-reset-result").get_attribute("class")
+        assert page.locator("#sw-reset-password").input_value() == ""
+        assert page.locator("#sw-reset-password-confirm").input_value() == ""
+        assert page.locator("#sw-reset-form").is_hidden()
+        assert page.locator("#sw-reset-submit").is_hidden() and page.locator("#sw-reset-cancel").is_hidden()
+        assert _PAGE_PASSWORD not in page.content()
+        assert document["derived_key"] not in page.content()
+
+        page.click("#sw-reset-close")
+        assert not _is_open(page, "#sw-reset-dialog")
+        # Neither the connection nor its settings changed.
+        _wait_connected_header(page)
+        assert (out_dir / ".pocket" / "config.json").read_bytes() == config_before
+        # A second reset uses another salt.
+        _open_reset_dialog(page)
+        assert page.locator("#sw-reset-form").is_visible()
+        _fill_reset(page, _PAGE_PASSWORD)
+        page.click("#sw-reset-submit")
+        _reset_result_lines(page)
+        first, second = pocket.recorded("POST", _RESET_PATH)
+        assert json.loads(first.body)["kdf"]["salt"] != json.loads(second.body)["kdf"]["salt"]
+
+
+@_needs_browser
+def test_reset_dialog_shows_a_rejection_by_the_pocket_as_unchanged(tmp_path):
+    from pocket_fake import error_envelope
+
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, pocket):
+        pocket.reset_reply = (401, {}, error_envelope("UNAUTHORIZED"))
+        _open_reset_dialog(page)
+        _fill_reset(page, _PAGE_PASSWORD)
+        page.click("#sw-reset-submit")
+        lines = _reset_result_lines(page)
+        assert lines == [
+            "upload token が無効です。音源ポケットで token を再発行した場合は接続し直してください。",
+            "閲覧パスワードは変わっていません。",
+        ]
+        assert "is-failed" in page.locator("#sw-reset-result").get_attribute("class")
+        assert page.locator("#sw-reset-close").is_visible()
+        assert len(pocket.recorded("POST", _RESET_PATH)) == 1
+        assert pocket.recorded("GET", "/api/v1/auth/params") == []
+
+
+@_needs_browser
+def test_reset_dialog_says_so_when_the_result_cannot_be_confirmed(tmp_path, monkeypatch):
+    import bunri.pocket.password as password_module
+    from pocket_fake import error_envelope
+
+    monkeypatch.setattr(password_module, "CONFIRM_INTERVAL_SECONDS", 0)
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, pocket):
+        pocket.reset_reply = (500, {}, error_envelope("INTERNAL"))
+        pocket.auth_params_reply = (503, {}, error_envelope("AUTH_UNAVAILABLE"))
+        _open_reset_dialog(page)
+        _fill_reset(page, _PAGE_PASSWORD)
+        page.click("#sw-reset-submit")
+        lines = _reset_result_lines(page)
+        assert lines[0] == "音源ポケットからの応答を確認できなかったため、結果を問い合わせましたが、確認できませんでした。"
+        assert "is-unknown" in page.locator("#sw-reset-result").get_attribute("class")
+        (params,) = {item.header("Authorization") for item in pocket.recorded("GET", "/api/v1/auth/params")}
+        assert params is None
+        assert len(pocket.recorded("GET", "/api/v1/auth/params")) == 3
+
+
+@_needs_browser
+def test_reset_dialog_keeps_the_form_when_the_pocket_is_too_old(tmp_path):
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, pocket):
+        pocket.capabilities_reply = (200, {}, json.dumps(capabilities(password_reset=False)).encode())
+        _open_reset_dialog(page)
+        _fill_reset(page, _PAGE_PASSWORD)
+        page.click("#sw-reset-submit")
+        page.wait_for_function(
+            "document.getElementById('sw-reset-error').textContent.includes('0.4.0 以降へ更新')"
+        )
+        assert page.locator("#sw-reset-error").text_content() == (
+            "この音源ポケットは閲覧パスワードの再設定に未対応です。音源ポケットを 0.4.0 以降へ更新してください。"
+            "閲覧パスワードは変わっていません。"
+        )
+        assert page.locator("#sw-reset-form").is_visible()
+        assert page.locator("#sw-reset-result").is_hidden()
+        page.wait_for_function("document.getElementById('sw-reset-submit').textContent === '再設定する'")
+        assert page.locator("#sw-reset-password").input_value() == ""
+        assert pocket.recorded("POST", _RESET_PATH) == []
+        # The connection itself is unchanged, so the header stays as it was.
+        page.click("#sw-reset-cancel")
+        _wait_connected_header(page)

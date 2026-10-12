@@ -14,6 +14,13 @@ from rich.console import Console
 from bunri.pocket.config import PocketConfig, connection_fingerprint, read_config, save_config, validate_base_url, validate_capabilities, validate_token
 from bunri.pocket.http import PocketHTTPClient
 from bunri.pocket.lock import SyncLock, SyncLockBusy
+from bunri.pocket.password import (
+    PasswordResetError,
+    check_password_reset_support,
+    outcome_messages,
+    reset_with_password,
+    safe_probe_error,
+)
 from bunri.pocket.service import (
     DeleteTargetIdentity,
     PocketServiceError,
@@ -49,11 +56,13 @@ def _fail(message: str) -> None:
 def connect(
     url: str = typer.Argument(..., metavar="URL"),
     output: Path = typer.Option(Path("out"), "--output", "-o", help="Output directory"),
-    token_stdin: bool = typer.Option(False, "--token-stdin", help="Read one token line from stdin"),
 ) -> None:
+    # The token is only ever typed at a terminal, never piped in.
+    if not _stdin_is_tty():
+        _fail("upload token の入力には TTY が必要です。端末から実行するか、Web UI から接続してください。")
     try:
         base_url = validate_base_url(url)
-        raw = sys.stdin.readline() if token_stdin else typer.prompt("Pocket upload token", hide_input=True)
+        raw = typer.prompt("Pocket upload token", hide_input=True)
         token = validate_token(raw)
         client = PocketHTTPClient(base_url, token)
         validate_capabilities(client.capabilities())
@@ -246,3 +255,65 @@ def delete_command(
     finally:
         mutation_lock.release()
     console.print(f"音源ポケットから削除しました: {result.song_id}")
+
+
+@app.command("reset-password")
+def reset_password_command(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the final confirmation"),
+    output: Path = typer.Option(Path("out"), "--output", "-o", help="Output directory"),
+) -> None:
+    """Decide a new viewing password for Bunri Pocket."""
+    try:
+        config = read_config(output)
+    except (OSError, ValueError):
+        _fail("Pocket の接続設定を確認できません。")
+    if config is None:
+        _fail("Pocket の接続設定がありません。")
+    # The password is only ever typed at a terminal; --yes skips the
+    # confirmation, not this.
+    if not _stdin_is_tty():
+        _fail("閲覧パスワードの入力には TTY が必要です。端末から実行するか、Web UI から再設定してください。")
+
+    # Asked first so an invalid token or an older Pocket is reported before
+    # the password is typed.
+    client = PocketHTTPClient(config.base_url, config.token)
+    try:
+        check_password_reset_support(client.capabilities())
+    except (PasswordResetError, OSError, RuntimeError, ValueError) as exc:
+        _fail(safe_probe_error(exc))
+
+    console.print("Bunri Pocket の閲覧パスワードを決め直します。")
+    console.print(
+        f"  接続先: {_safe_display(config.base_url)}",
+        markup=False,
+        highlight=False,
+    )
+    console.print("  成功すると、音源ポケットにログインしていたすべての端末がログアウトされます。")
+    console.print("  曲と upload token はそのままです。")
+    # Confirmed before the password is typed, so declining leaves no secret
+    # in memory.
+    if not yes and not typer.confirm("この操作を続けますか？", default=False):
+        console.print("閲覧パスワードの再設定を取り消しました。")
+        return
+
+    password = typer.prompt("新しい閲覧パスワード", hide_input=True)
+    confirmation = typer.prompt("新しい閲覧パスワード(確認)", hide_input=True)
+    matched = password == confirmation
+    del confirmation
+    if not matched:
+        del password
+        _fail("2 回の入力が一致しません。閲覧パスワードは変わっていません。")
+
+    def announce_confirmation() -> None:
+        console.print("音源ポケットからの応答を確認できませんでした。音源ポケットに結果を問い合わせています…")
+
+    try:
+        outcome = reset_with_password(client, password, on_confirm=announce_confirmation)
+    except PasswordResetError as exc:
+        _fail(str(exc))
+    finally:
+        del password
+    for line in outcome_messages(outcome):
+        console.print(line, markup=False, highlight=False)
+    if outcome.state != "completed":
+        raise typer.Exit(1)

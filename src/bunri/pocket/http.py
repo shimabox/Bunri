@@ -23,6 +23,7 @@ METADATA_TIMEOUT_SECONDS = 30
 MEDIA_TIMEOUT_SECONDS = 300
 MEDIA_LIMIT_BYTES = 94_371_840
 JSON_LIMIT_BYTES = 1_048_576
+PASSWORD_RESET_LIMIT_BYTES = 4096
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -82,9 +83,10 @@ class PocketHTTPClient:
     def _url(self, path: str) -> str:
         return self._upload_url(path)
 
-    def _request(self, method: str, path: str, *, data: Any = None, headers: dict[str, str] | None = None, timeout: float | None = None, limit: int = JSON_LIMIT_BYTES, upload_route: bool = True) -> tuple[int, Any, bytes]:
+    def _request(self, method: str, path: str, *, data: Any = None, headers: dict[str, str] | None = None, timeout: float | None = None, limit: int = JSON_LIMIT_BYTES, upload_route: bool = True, authenticated: bool = True) -> tuple[int, Any, bytes]:
         url = self._upload_url(path) if upload_route else self._api_url(path)
-        request_headers = {"Authorization": f"Bearer {self._token}", "User-Agent": USER_AGENT, **(headers or {})}
+        # A route that needs no authentication is never handed the token.
+        request_headers = {**({"Authorization": f"Bearer {self._token}"} if authenticated else {}), "User-Agent": USER_AGENT, **(headers or {})}
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         try:
             try:
@@ -171,3 +173,29 @@ class PocketHTTPClient:
         )
         if status != 204 or body:
             raise PocketHTTPError(status, "UNEXPECTED_RESPONSE", self._api_url(path))
+
+    def reset_password(self, body: bytes) -> None:
+        """Send a prepared password-reset document; only 204 counts as done."""
+        path = "password/reset"
+        if len(body) > PASSWORD_RESET_LIMIT_BYTES:
+            raise PocketHTTPError(413, "PAYLOAD_TOO_LARGE", self._api_url(path))
+        # Content-Type is spelled out because urllib would otherwise label a
+        # bytes body as application/x-www-form-urlencoded.
+        status, _, response_body = self._request(
+            "POST", path, data=body,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+            timeout=self.metadata_timeout, limit=JSON_LIMIT_BYTES, upload_route=False,
+        )
+        if status != 204 or response_body:
+            raise PocketHTTPError(status, "UNEXPECTED_RESPONSE", self._api_url(path))
+
+    def auth_params(self) -> object:
+        """Read the public KDF parameters, without sending the upload token."""
+        path = "auth/params"
+        status, _, body = self._request(
+            "GET", path, authenticated=False, upload_route=False,
+            timeout=self.metadata_timeout,
+        )
+        if status != 200: raise PocketHTTPError(status, "UNEXPECTED_STATUS", self._api_url(path))
+        try: return json.loads(body)
+        except (ValueError, RecursionError) as exc: raise PocketHTTPError(422, "INVALID_DOCUMENT", self._api_url(path)) from exc

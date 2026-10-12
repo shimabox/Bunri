@@ -12,6 +12,7 @@ import pytest
 
 from bunri import __version__ as bunri_version
 from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
+from pocket_fake import error_envelope, running_fake_pocket
 
 
 def _clear_proxy_environment(monkeypatch):
@@ -263,3 +264,142 @@ def test_delete_track_rejects_every_non_204_without_disclosing_secret(server, mo
     assert "http://" not in str(caught.value)
     if status == 429:
         assert caught.value.retry_after is None
+
+
+# --------------------------------------------------------------------------
+# Viewing-password reset and the public KDF parameters
+# --------------------------------------------------------------------------
+
+RESET_BODY = b'{"kdf":{"name":"PBKDF2-HMAC-SHA256","iterations":600000,"salt":"EBESExQVFhcYGRobHB0eHw","dk_len":32},"derived_key":"ZDdrEqwT6KETy2izxW2uK25FVChkKDdx38yVDdttiOI"}'
+
+
+@pytest.fixture
+def pocket():
+    with running_fake_pocket() as fake:
+        yield fake
+
+
+def test_reset_password_sends_the_contract_request_and_accepts_204(pocket):
+    client = PocketHTTPClient(pocket.url, "reset-secret", metadata_timeout=5)
+    assert client.reset_password(RESET_BODY) is None
+    (request,) = pocket.requests
+    assert (request.method, request.path, request.body) == ("POST", "/api/v1/password/reset", RESET_BODY)
+    assert request.header("Authorization") == "Bearer reset-secret"
+    assert request.header("User-Agent") == f"bunri/{bunri_version}"
+    assert request.header("Content-Type") == "application/json"
+    assert request.header("Content-Length") == str(len(RESET_BODY))
+    assert request.header("Origin") is None and request.header("Cookie") is None
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [(200, b""), (200, b'{"ok":true}'), (201, b"")],
+)
+def test_reset_password_treats_any_other_2xx_as_unexpected(pocket, status, body):
+    pocket.reset_reply = (status, {}, body)
+    with pytest.raises(PocketHTTPError) as caught:
+        PocketHTTPClient(pocket.url, "reset-secret").reset_password(RESET_BODY)
+    assert (caught.value.status, caught.value.code) == (status, "UNEXPECTED_RESPONSE")
+    assert "reset-secret" not in str(caught.value) and "http://" not in str(caught.value)
+
+
+def test_reset_password_reports_an_oversized_response(pocket, monkeypatch):
+    import bunri.pocket.http as http_module
+
+    monkeypatch.setattr(http_module, "JSON_LIMIT_BYTES", 16)
+    pocket.reset_reply = (200, {}, b"x" * 17)
+    with pytest.raises(PocketHTTPError) as caught:
+        PocketHTTPClient(pocket.url, "reset-secret").reset_password(RESET_BODY)
+    assert (caught.value.status, caught.value.code) == (413, "RESPONSE_TOO_LARGE")
+    assert len(pocket.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "headers", "retry_after"),
+    [
+        (401, "UNAUTHORIZED", {}, None),
+        (403, "ORIGIN_MISMATCH", {}, None),
+        (404, "NOT_FOUND", {}, None),
+        (422, "UNSUPPORTED_KDF", {}, None),
+        (503, "AUTH_UNAVAILABLE", {}, None),
+        (429, "RATE_LIMITED", {"Retry-After": "42"}, "42"),
+    ],
+)
+def test_reset_password_maps_the_error_envelope(pocket, status, code, headers, retry_after):
+    pocket.reset_reply = (status, headers, error_envelope(code))
+    with pytest.raises(PocketHTTPError) as caught:
+        PocketHTTPClient(pocket.url, "reset-secret").reset_password(RESET_BODY)
+    assert (caught.value.status, caught.value.code, caught.value.retry_after) == (status, code, retry_after)
+    assert "reset-secret" not in str(caught.value)
+
+
+def test_reset_password_does_not_follow_a_redirect(pocket):
+    pocket.reset_reply = (302, {"Location": "/api/v1/auth/params"}, b"")
+    with pytest.raises(PocketHTTPError) as caught:
+        PocketHTTPClient(pocket.url, "reset-secret").reset_password(RESET_BODY)
+    assert caught.value.status == 302
+    assert [(item.method, item.path) for item in pocket.requests] == [("POST", "/api/v1/password/reset")]
+
+
+def test_reset_password_timeout_is_an_os_error(pocket):
+    pocket.hold_reset = threading.Event()
+    client = PocketHTTPClient(pocket.url, "reset-secret", metadata_timeout=0.3)
+    with pytest.raises(OSError) as caught:
+        client.reset_password(RESET_BODY)
+    assert not isinstance(caught.value, PocketHTTPError)
+    assert "reset-secret" not in str(caught.value)
+
+
+def test_reset_password_refuses_an_oversized_body_before_sending():
+    sent = []
+
+    class Recording:
+        def open(self, request, timeout):
+            sent.append(len(request.data))
+            raise OSError("stopped by the test")
+
+    client = PocketHTTPClient("https://example.invalid", "reset-secret", opener=Recording())
+    with pytest.raises(PocketHTTPError) as caught:
+        client.reset_password(b"x" * 4097)
+    assert (caught.value.status, caught.value.code) == (413, "PAYLOAD_TOO_LARGE")
+    assert sent == []
+    with pytest.raises(OSError):
+        client.reset_password(b"x" * 4096)
+    assert sent == [4096]
+
+
+def test_auth_params_is_read_without_the_upload_token(pocket):
+    client = PocketHTTPClient(pocket.url, "reset-secret", metadata_timeout=5)
+    value = client.auth_params()
+    assert value == {
+        "schema_version": 1,
+        "kdf": {"name": "PBKDF2-HMAC-SHA256", "iterations": 600000, "salt": pocket.salt, "dk_len": 32},
+    }
+    (request,) = pocket.requests
+    assert (request.method, request.path) == ("GET", "/api/v1/auth/params")
+    assert request.header("User-Agent") == f"bunri/{bunri_version}"
+    assert request.header("Authorization") is None
+    assert b"reset-secret" not in json.dumps(request.headers).encode()
+
+
+@pytest.mark.parametrize(("status", "code"), [(405, "METHOD_NOT_ALLOWED"), (503, "AUTH_UNAVAILABLE")])
+def test_auth_params_reports_http_errors(pocket, status, code):
+    pocket.auth_params_reply = (status, {}, error_envelope(code))
+    with pytest.raises(PocketHTTPError) as caught:
+        PocketHTTPClient(pocket.url, "reset-secret").auth_params()
+    assert (caught.value.status, caught.value.code) == (status, code)
+
+
+@pytest.mark.parametrize("body", [b"<html>not json</html>", b"\xff\xfe", b""])
+def test_auth_params_rejects_a_body_that_is_not_json(pocket, body):
+    pocket.auth_params_reply = (200, {}, body)
+    with pytest.raises(PocketHTTPError) as caught:
+        PocketHTTPClient(pocket.url, "reset-secret").auth_params()
+    assert (caught.value.status, caught.value.code) == (422, "INVALID_DOCUMENT")
+
+
+def test_capabilities_still_carry_the_upload_token(pocket):
+    PocketHTTPClient(pocket.url, "reset-secret").capabilities()
+    (request,) = pocket.requests
+    assert request.path == "/api/v1/upload/capabilities"
+    assert request.header("Authorization") == "Bearer reset-secret"

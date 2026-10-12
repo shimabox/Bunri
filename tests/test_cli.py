@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from bunri.cli import app
+from pocket_fake import FakePocketClient as _ResetPocket
 
 
 @pytest.mark.parametrize("argument", ["pocket-song.mp3", "./pocket"])
@@ -44,17 +45,18 @@ def test_console_entrypoint_points_to_dispatch():
     assert project["project"]["scripts"]["bunri"] == "bunri.cli:dispatch"
 
 
-def test_pocket_connect_has_no_token_argv_option():
+def test_pocket_connect_has_no_token_option_at_all():
     from bunri.pocket.cli import app as pocket_app
 
     result = CliRunner().invoke(pocket_app, ["connect", "--help"], env=_STABLE_TERMINAL)
     assert result.exit_code == 0
     help_text = _plain(result.output)
-    assert "--token-stdin" in help_text
+    assert "--token-stdin" not in help_text
     assert "--token " not in help_text
+    assert "--token" not in help_text
 
 
-def test_pocket_connect_reads_token_from_stdin_without_displaying_it(tmp_path, monkeypatch):
+def test_pocket_connect_reads_token_from_the_prompt_without_displaying_it(tmp_path, monkeypatch):
     import base64
     import bunri.pocket.cli as pocket_cli
     token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
@@ -66,10 +68,44 @@ def test_pocket_connect_reads_token_from_stdin_without_displaying_it(tmp_path, m
         def capabilities(self): return capabilities
 
     monkeypatch.setattr(pocket_cli, "PocketHTTPClient", Client)
-    result = CliRunner().invoke(pocket_cli.app, ["connect", "https://example.invalid", "-o", str(tmp_path), "--token-stdin"], input=token + "\n")
+    monkeypatch.setattr(pocket_cli, "_stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(pocket_cli.app, ["connect", "https://example.invalid", "-o", str(tmp_path)], input=token + "\n")
     assert result.exit_code == 0, result.output
-    assert token not in result.output
+    assert token not in "".join(result.output.split())
     assert (tmp_path / ".pocket/config.json").exists()
+
+
+def test_pocket_connect_without_a_terminal_reads_nothing_and_saves_nothing(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+
+    monkeypatch.setattr(pocket_cli, "_stdin_is_tty", lambda: False)
+    monkeypatch.setattr(pocket_cli, "PocketHTTPClient", lambda *a, **k: pytest.fail("HTTP started"))
+    monkeypatch.setattr(pocket_cli.typer, "prompt", lambda *a, **k: pytest.fail("stdin was read"))
+    monkeypatch.setattr(pocket_cli, "validate_base_url", lambda *a: pytest.fail("URL was inspected"))
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["connect", "https://example.invalid", "-o", str(tmp_path)],
+        input="piped-token\n",
+        env=_STABLE_TERMINAL,
+    )
+    assert result.exit_code == 1
+    assert "upload token の入力には TTY が必要です。端末から実行するか、Web UI から接続してください。" in _plain(result.output)
+    assert "piped-token" not in result.output
+    assert not (tmp_path / ".pocket").exists()
+
+
+def test_pocket_connect_rejects_the_removed_token_stdin_option(tmp_path, monkeypatch):
+    import bunri.pocket.cli as pocket_cli
+
+    monkeypatch.setattr(pocket_cli, "PocketHTTPClient", lambda *a, **k: pytest.fail("HTTP started"))
+    result = CliRunner().invoke(
+        pocket_cli.app,
+        ["connect", "https://example.invalid", "-o", str(tmp_path), "--token-stdin"],
+        input="piped-token\n",
+        env=_STABLE_TERMINAL,
+    )
+    assert result.exit_code == 2
+    assert not (tmp_path / ".pocket").exists()
 
 
 def test_pocket_sync_without_config_does_not_create_http_client(tmp_path, monkeypatch):
@@ -555,3 +591,352 @@ def test_whitespace_title_uses_input_stem_in_banner_and_build(
 def test_missing_input_file_is_rejected(tmp_path):
     result = _run(tmp_path / "does-not-exist.mp3")
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# bunri pocket reset-password
+# ---------------------------------------------------------------------------
+_RESET_URL = "https://reset-pocket.invalid/shelf"
+_RESET_PASSWORD = "new-viewing-password-01"
+_RESET_COMPLETED = (
+    "音源ポケットにログインしていたすべての端末はログアウトされました。新しいパスワードで入り直してください。",
+    "直前にログインに失敗していた場合は、待ち時間(最大 60 秒)が明けるまでログインできないことがあります。",
+    "曲と upload token、Bunri の接続設定はそのままです。",
+)
+
+
+def _squash(text: str) -> str:
+    """Output with every space and line break removed.
+
+    The long Japanese lines wrap at the console width, which puts a line
+    break in the middle of a sentence; comparing without whitespace keeps the
+    assertions independent of where that happens, and keeps a wrapped secret
+    from slipping past a "not in" check.
+    """
+    return re.sub(r"\s+", "", _ANSI_ESCAPE.sub("", text))
+
+
+def _shown(result, text: str) -> bool:
+    return _squash(text) in _squash(result.output)
+
+
+def _reset_token() -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(b"\x7e" * 33).decode().rstrip("=")
+
+
+def _reset_setup(tmp_path, monkeypatch, pocket=None, *, tty=True, connected=True):
+    import bunri.pocket.cli as pocket_cli
+    import bunri.pocket.password as password_module
+    from bunri.pocket.config import PocketConfig, save_config
+
+    pocket = pocket or _ResetPocket()
+    if connected:
+        save_config(tmp_path, PocketConfig(_RESET_URL, _reset_token()))
+    monkeypatch.setattr(pocket_cli, "PocketHTTPClient", pocket)
+    monkeypatch.setattr(pocket_cli, "_stdin_is_tty", lambda: tty)
+    monkeypatch.setattr(password_module, "CONFIRM_INTERVAL_SECONDS", 0)
+    return pocket
+
+
+def _reset_run(tmp_path, *arguments, answers=("y", _RESET_PASSWORD, _RESET_PASSWORD)):
+    import bunri.pocket.cli as pocket_cli
+
+    return CliRunner().invoke(
+        pocket_cli.app,
+        ["reset-password", "-o", str(tmp_path), *arguments],
+        input="".join(answer + "\n" for answer in answers),
+        env=_STABLE_TERMINAL,
+    )
+
+
+def _assert_no_reset_secrets(result, pocket, *passwords):
+    """Nothing typed, derived or stored may be echoed, whatever the outcome."""
+    import base64
+    import json
+
+    output = _squash(result.output)
+    assert _reset_token() not in output
+    for password in passwords or (_RESET_PASSWORD,):
+        raw = password.encode("utf-8", "surrogatepass")
+        assert _squash(password) not in output
+        for encoded in (base64.b64encode(raw), base64.urlsafe_b64encode(raw)):
+            assert encoded.decode().rstrip("=") not in output
+    for body in pocket.bodies:
+        assert json.loads(body)["derived_key"] not in output
+        assert body.decode() not in output
+
+
+def test_pocket_reset_password_help_offers_no_password_option():
+    from bunri.pocket.cli import app as pocket_app
+
+    result = CliRunner().invoke(pocket_app, ["reset-password", "--help"], env=_STABLE_TERMINAL)
+    assert result.exit_code == 0
+    help_text = _plain(result.output)
+    assert "--yes" in help_text and "--output" in help_text
+    assert "--password" not in help_text
+
+
+@pytest.mark.parametrize(
+    ("config_text", "message"),
+    [
+        (None, "Pocket の接続設定がありません。"),
+        ("not json", "Pocket の接続設定を確認できません。"),
+        ('{"schema_version": 1}', "Pocket の接続設定を確認できません。"),
+    ],
+)
+def test_pocket_reset_password_without_usable_config_starts_no_http(tmp_path, monkeypatch, config_text, message):
+    pocket = _reset_setup(tmp_path, monkeypatch, connected=False)
+    if config_text is not None:
+        (tmp_path / ".pocket").mkdir()
+        (tmp_path / ".pocket" / "config.json").write_text(config_text, encoding="utf-8")
+    result = _reset_run(tmp_path)
+    assert result.exit_code == 1
+    assert _shown(result, message)
+    assert pocket.created == [] and pocket.bodies == []
+    _assert_no_reset_secrets(result, pocket)
+
+
+@pytest.mark.parametrize("arguments", [[], ["--yes"]])
+def test_pocket_reset_password_needs_a_terminal_even_with_yes(tmp_path, monkeypatch, arguments):
+    import bunri.pocket.cli as pocket_cli
+
+    pocket = _reset_setup(tmp_path, monkeypatch, tty=False)
+    monkeypatch.setattr(pocket_cli.typer, "prompt", lambda *a, **k: pytest.fail("stdin was read"))
+    monkeypatch.setattr(pocket_cli.typer, "confirm", lambda *a, **k: pytest.fail("stdin was read"))
+    result = _reset_run(tmp_path, *arguments)
+    assert result.exit_code == 1
+    assert _shown(result, "閲覧パスワードの入力には TTY が必要です。端末から実行するか、Web UI から再設定してください。")
+    assert pocket.created == [] and pocket.bodies == []
+    _assert_no_reset_secrets(result, pocket)
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        {"api": {"major": 1}, "features": {"pan_split": True}},
+        {"api": {"major": 1}, "features": {"password_reset": False}},
+        {"api": {"major": 1}},
+    ],
+)
+def test_pocket_reset_password_points_an_older_pocket_to_the_update(tmp_path, monkeypatch, capabilities):
+    pocket = _reset_setup(tmp_path, monkeypatch, _ResetPocket(capabilities))
+    result = _reset_run(tmp_path)
+    assert result.exit_code == 1
+    assert _shown(result, "この音源ポケットは閲覧パスワードの再設定に未対応です。音源ポケットを 0.4.0 以降へ更新してください。閲覧パスワードは変わっていません。")
+    assert not _shown(result, "新しい閲覧パスワード")
+    assert pocket.bodies == []
+    _assert_no_reset_secrets(result, pocket)
+
+
+@pytest.mark.parametrize("capabilities", [["features"], "password_reset"])
+def test_pocket_reset_password_does_not_call_unreadable_capabilities_unsupported(tmp_path, monkeypatch, capabilities):
+    pocket = _reset_setup(tmp_path, monkeypatch, _ResetPocket(capabilities))
+    result = _reset_run(tmp_path)
+    assert result.exit_code == 1
+    assert _shown(result, "音源ポケットの対応状況を確認できませんでした。閲覧パスワードは変わっていません。")
+    assert not _shown(result, "未対応")
+    assert pocket.bodies == []
+    _assert_no_reset_secrets(result, pocket)
+
+
+def test_pocket_reset_password_reports_a_failed_capabilities_read(tmp_path, monkeypatch):
+    from bunri.pocket.http import PocketHTTPError
+
+    for failure, message in (
+        (PocketHTTPError(401, "UNAUTHORIZED", _RESET_URL), "upload token が無効です。音源ポケットで token を再発行した場合は接続し直してください。"),
+        (OSError(f"cannot reach {_RESET_URL}"), "音源ポケットに接続できませんでした。"),
+    ):
+        pocket = _reset_setup(tmp_path, monkeypatch, _ResetPocket(failure))
+        result = _reset_run(tmp_path)
+        assert result.exit_code == 1
+        assert _shown(result, message + "閲覧パスワードは変わっていません。")
+        assert not _shown(result, "reset-pocket.invalid")
+        assert pocket.bodies == []
+        _assert_no_reset_secrets(result, pocket)
+
+
+def test_pocket_reset_password_declined_asks_for_no_password(tmp_path, monkeypatch):
+    pocket = _reset_setup(tmp_path, monkeypatch)
+    result = _reset_run(tmp_path, answers=("n",))
+    assert result.exit_code == 0, result.output
+    assert _shown(result, "閲覧パスワードの再設定を取り消しました。")
+    assert not _shown(result, "新しい閲覧パスワード")
+    assert pocket.bodies == []
+    _assert_no_reset_secrets(result, pocket)
+
+
+def test_pocket_reset_password_sends_a_key_derived_from_a_fresh_salt(tmp_path, monkeypatch):
+    import json
+
+    from bunri.pocket.password import derive_key, parse_reset_request
+
+    pocket = _reset_setup(tmp_path, monkeypatch)
+    result = _reset_run(tmp_path)
+    assert result.exit_code == 0, result.output
+    assert pocket.created == [(_RESET_URL, _reset_token())]
+    # The confirmation names the destination and what success does.
+    assert _shown(result, f"接続先: {_RESET_URL}")
+    assert _shown(result, "成功すると、音源ポケットにログインしていたすべての端末がログアウトされます。")
+    assert _shown(result, "この操作を続けますか？")
+    (body,) = pocket.bodies
+    salt, derived_key = parse_reset_request(json.loads(body))
+    assert len(salt) == 16
+    assert derived_key == derive_key(_RESET_PASSWORD.encode("utf-8"), salt)
+    assert _shown(result, "閲覧パスワードを決め直しました。")
+    for line in _RESET_COMPLETED:
+        assert _shown(result, line)
+    assert pocket.auth_calls == 0
+    _assert_no_reset_secrets(result, pocket)
+
+
+def test_pocket_reset_password_yes_skips_only_the_confirmation(tmp_path, monkeypatch):
+    pocket = _reset_setup(tmp_path, monkeypatch)
+    result = _reset_run(tmp_path, "--yes", answers=(_RESET_PASSWORD, _RESET_PASSWORD))
+    assert result.exit_code == 0, result.output
+    assert not _shown(result, "この操作を続けますか？")
+    assert _shown(result, f"接続先: {_RESET_URL}")
+    assert len(pocket.bodies) == 1
+    _assert_no_reset_secrets(result, pocket)
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "message"),
+    [
+        (_RESET_PASSWORD, _RESET_PASSWORD + "x", "2 回の入力が一致しません。閲覧パスワードは変わっていません。"),
+        ("elevenchars", "elevenchars", "閲覧パスワードは 12 文字(Unicode コードポイント)以上にしてください。"),
+    ],
+)
+def test_pocket_reset_password_rejects_bad_input_before_sending(tmp_path, monkeypatch, first, second, message):
+    pocket = _reset_setup(tmp_path, monkeypatch)
+    result = _reset_run(tmp_path, answers=("y", first, second))
+    assert result.exit_code == 1
+    assert _shown(result, message)
+    assert pocket.bodies == [] and pocket.auth_calls == 0
+    _assert_no_reset_secrets(result, pocket, first, second)
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "retry_after", "message"),
+    [
+        (401, "UNAUTHORIZED", None, "upload token が無効です。音源ポケットで token を再発行した場合は接続し直してください。"),
+        (403, "ORIGIN_MISMATCH", None, "音源ポケットが Origin の不一致として拒否しました。接続先 URL と音源ポケットの設定を確認してください。"),
+        (404, "NOT_FOUND", None, "音源ポケットに再設定の経路がありません。音源ポケットを 0.4.0 以降へ更新するか、接続先 URL を確認してください。"),
+        (422, "UNSUPPORTED_KDF", None, "この Bunri の鍵導出方式を音源ポケットが受け付けません。Bunri を更新してください。"),
+        (400, "INVALID_REQUEST", None, "音源ポケットが要求の形式を拒否しました(HTTP 400 INVALID_REQUEST)。Bunri と音源ポケットの版の組み合わせを確認してください。"),
+        (429, "RATE_LIMITED", "30", "音源ポケットが要求を制限しました。しばらく待って再実行してください。(目安: 30 秒後)"),
+    ],
+)
+def test_pocket_reset_password_reports_a_rejection_as_unchanged(tmp_path, monkeypatch, status, code, retry_after, message):
+    from bunri.pocket.http import PocketHTTPError
+
+    failure = PocketHTTPError(status, code, _RESET_URL, retry_after=retry_after)
+    pocket = _reset_setup(tmp_path, monkeypatch, _ResetPocket(reset=failure))
+    result = _reset_run(tmp_path)
+    assert result.exit_code == 1
+    assert _shown(result, message)
+    assert _shown(result, "閲覧パスワードは変わっていません。")
+    assert not _shown(result, "決め直しました")
+    assert len(pocket.bodies) == 1 and pocket.auth_calls == 0
+    _assert_no_reset_secrets(result, pocket)
+
+
+def test_pocket_reset_password_503_only_asks_for_a_retry(tmp_path, monkeypatch):
+    from bunri.pocket.http import PocketHTTPError
+
+    failure = PocketHTTPError(503, "AUTH_UNAVAILABLE", _RESET_URL)
+    pocket = _reset_setup(tmp_path, monkeypatch, _ResetPocket(reset=failure))
+    result = _reset_run(tmp_path)
+    assert result.exit_code == 1
+    assert _shown(result, "音源ポケットの認証情報または保存領域を利用できませんでした。時間をおいて同じ操作を再実行してください。")
+    assert not _shown(result, "変わっていません") and not _shown(result, "決め直しました")
+    assert pocket.auth_calls == 0
+    _assert_no_reset_secrets(result, pocket)
+
+
+def _lost_responses():
+    from bunri.pocket.http import PocketHTTPError
+
+    return {
+        "os_error": OSError(f"timed out talking to {_RESET_URL}"),
+        "502": PocketHTTPError(502, None, _RESET_URL),
+        "response_too_large": PocketHTTPError(413, "RESPONSE_TOO_LARGE", _RESET_URL),
+    }
+
+
+@pytest.mark.parametrize("failure", ["os_error", "502", "response_too_large"])
+def test_pocket_reset_password_confirms_a_lost_response_as_completed(tmp_path, monkeypatch, failure):
+    pocket = _reset_setup(
+        tmp_path, monkeypatch,
+        _ResetPocket(reset=_lost_responses()[failure], params=[_ResetPocket.MATCH]),
+    )
+    result = _reset_run(tmp_path)
+    assert result.exit_code == 0, result.output
+    assert _shown(result, "音源ポケットからの応答を確認できませんでした。音源ポケットに結果を問い合わせています…")
+    assert _shown(result, "音源ポケットからの応答を確認できなかったため、結果を問い合わせました。再設定は完了していました。")
+    for line in _RESET_COMPLETED:
+        assert _shown(result, line)
+    assert not _shown(result, "変わっていません") and not _shown(result, "reset-pocket.invalid/shelf/api")
+    assert pocket.auth_calls == 1
+    _assert_no_reset_secrets(result, pocket)
+
+
+def test_pocket_reset_password_reports_not_applied_when_the_salt_stays_different(tmp_path, monkeypatch):
+    pocket = _reset_setup(
+        tmp_path, monkeypatch,
+        _ResetPocket(reset=_lost_responses()["os_error"], params=["AAECAwQFBgcICQoLDA0ODw"] * 3),
+    )
+    result = _reset_run(tmp_path)
+    assert result.exit_code == 1
+    assert _shown(result, "再設定は反映されていません。閲覧パスワードは以前のままです。")
+    assert _shown(result, "再実行では今回と同じパスワードを使ってください")
+    assert not _shown(result, "決め直しました")
+    assert pocket.auth_calls == 3
+    _assert_no_reset_secrets(result, pocket)
+
+
+def test_pocket_reset_password_says_so_when_the_result_cannot_be_read(tmp_path, monkeypatch):
+    from bunri.pocket.http import PocketHTTPError
+
+    pocket = _reset_setup(
+        tmp_path, monkeypatch,
+        _ResetPocket(
+            reset=_lost_responses()["502"],
+            params=[OSError("down"), PocketHTTPError(503, "AUTH_UNAVAILABLE", _RESET_URL), OSError("down")],
+        ),
+    )
+    result = _reset_run(tmp_path)
+    assert result.exit_code == 1
+    assert _shown(result, "結果を問い合わせましたが、確認できませんでした。")
+    assert _shown(result, "同じ操作をもう一度実行しても安全です。再実行では今回と同じパスワードを使ってください。")
+    assert not _shown(result, "変わっていません") and not _shown(result, "決め直しました")
+    assert pocket.auth_calls == 3
+    _assert_no_reset_secrets(result, pocket)
+
+
+def test_pocket_reset_password_keeps_typed_whitespace(tmp_path, monkeypatch):
+    import json
+
+    from bunri.pocket.password import derive_key, parse_reset_request
+
+    spaced = "  spaced out password  "
+    pocket = _reset_setup(tmp_path, monkeypatch)
+    result = _reset_run(tmp_path, answers=("y", spaced, spaced))
+    assert result.exit_code == 0, result.output
+    salt, derived_key = parse_reset_request(json.loads(pocket.bodies[0]))
+    assert derived_key == derive_key(spaced.encode("utf-8"), salt)
+    assert derived_key != derive_key(spaced.strip().encode("utf-8"), salt)
+    _assert_no_reset_secrets(result, pocket, spaced)
+
+
+def test_pocket_reset_password_runs_while_the_mutation_lock_is_held(tmp_path, monkeypatch):
+    from bunri.pocket.lock import SyncLock
+
+    pocket = _reset_setup(tmp_path, monkeypatch)
+    with SyncLock(tmp_path):
+        result = _reset_run(tmp_path)
+    assert result.exit_code == 0, result.output
+    assert _shown(result, "閲覧パスワードを決め直しました。")
+    assert len(pocket.bodies) == 1
+    _assert_no_reset_secrets(result, pocket)

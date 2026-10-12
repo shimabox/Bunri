@@ -149,16 +149,31 @@ def garbage_server():
 
 
 @pytest.mark.parametrize("command", ["connect", "delete"])
-def test_poc_cli_transport_garbage_is_reported_without_traceback(tmp_path, garbage_server, command):
+def test_poc_cli_transport_garbage_is_reported_without_traceback(tmp_path, garbage_server, command, monkeypatch):
     out = tmp_path / "out"
     out.mkdir()
     url = f"http://127.0.0.1:{garbage_server.port}"
     if command == "connect":
-        result = _run_bunri_pocket(["connect", url, "-o", str(out), "--token-stdin"], cwd=tmp_path, stdin=TOKEN + "\n")
+        # connect takes the token only from a terminal prompt, which a child
+        # process does not have, so this case runs in-process.
+        import bunri.pocket.cli as pocket_cli
+
+        monkeypatch.setattr(pocket_cli, "_stdin_is_tty", lambda: True)
+        result = CliRunner().invoke(
+            pocket_cli.app,
+            ["connect", url, "-o", str(out)],
+            input=TOKEN + "\n",
+            env={"COLUMNS": "300", "NO_COLOR": "1", "TERM": "dumb"},
+        )
+        combined = result.output
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit), (
+            f"transport error escaped the CLI's error handling: {result.exception!r}"
+        )
     else:
         save_config(out, PocketConfig(url, TOKEN))
         result = _run_bunri_pocket(["delete", "--song-id", SONG_ID, "--yes", "-o", str(out)], cwd=tmp_path)
-    combined = result.stdout + result.stderr
+        combined = result.stdout + result.stderr
     assert TOKEN not in combined, "upload token printed to the terminal:\n" + combined[-3000:]
     assert "Traceback" not in combined, (
         "transport error escaped the CLI's error handling as a raw traceback:\n" + combined[-1500:]
