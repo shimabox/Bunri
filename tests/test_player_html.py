@@ -146,6 +146,17 @@ def test_output_is_fully_offline_no_external_resources():
     assert "//fonts." not in lowered
 
 
+def test_player_embeds_the_favicon_once():
+    from bunri.favicon import FAVICON_HREF
+
+    out = render_player(
+        "s", original="a.mp3", target="b.mp3", backing="c.mp3", instrument_label=_LABEL
+    )
+
+    assert out.count('rel="icon"') == 1
+    assert f'<link rel="icon" type="image/svg+xml" href="{FAVICON_HREF}">' in out
+
+
 def test_audio_src_percent_encodes_spaces_and_hash():
     # A filename passed straight to render_player (e.g. an existing on-disk
     # file that predates the sanitizer's #/% stripping, or a title with a
@@ -265,6 +276,20 @@ def test_player_loads_all_tracks_under_file_url(tmp_path):
         assert st["duration"] > 0
         for name in ("original", "target", "backing"):
             assert st["tracks"][name]["available"] is True, name
+
+
+@_needs_runtime
+def test_player_favicon_is_an_image_the_browser_can_draw(tmp_path):
+    with _open(_render_dir(tmp_path)) as page:
+        size = page.evaluate(
+            """async () => {
+              const image = new Image();
+              image.src = document.querySelector('link[rel="icon"]').href;
+              await image.decode();
+              return [image.naturalWidth, image.naturalHeight];
+            }"""
+        )
+        assert size[0] > 0 and size[0] == size[1]
 
 
 @_needs_runtime

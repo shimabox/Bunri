@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from bunri.favicon import FAVICON_HREF
 from bunri.registry import REGISTRY
 from bunri.pocket.config import connection_fingerprint, read_config
 from bunri.pocket.http import PocketHTTPClient
@@ -372,7 +373,9 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request) -> HTMLResponse:
-        return templates.TemplateResponse(request, "index.html.j2", {})
+        return templates.TemplateResponse(
+            request, "index.html.j2", {"favicon_href": FAVICON_HREF}
+        )
 
     @app.post("/api/jobs")
     async def create_job(
