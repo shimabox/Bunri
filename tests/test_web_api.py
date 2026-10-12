@@ -2090,6 +2090,15 @@ def test_index_page_serves_html(client):
     assert "Bunri" in res.text
 
 
+def test_index_page_embeds_the_favicon_once(client):
+    from bunri.favicon import FAVICON_HREF
+
+    html = client.get("/").text
+
+    assert html.count('rel="icon"') == 1
+    assert f'<link rel="icon" type="image/svg+xml" href="{FAVICON_HREF}">' in html
+
+
 def test_failed_job_reports_log_tail_as_error(client):
     failing_client_runner = ApiFakeRunner(returncode=1)
     app = create_app(client.out_dir / "other", runner=failing_client_runner)

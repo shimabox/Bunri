@@ -22,6 +22,8 @@ from urllib.parse import quote
 
 from jinja2 import Environment, PackageLoader, select_autoescape
 
+from bunri.favicon import FAVICON_HREF
+
 # Matches render/html.py in tab-maker: autoescaping on for html/j2/xml so the
 # title and the audio filenames are escaped into inert attribute/text content
 # by Jinja.
@@ -72,6 +74,7 @@ def render_player(
 
     return template.render(
         title=title or "Untitled",
+        favicon_href=FAVICON_HREF,
         # Percent-encoded here (not just left to Jinja's autoescaping, which
         # only escapes HTML syntax, not URL-reserved characters) so a
         # filename containing a space or "#" still resolves as a single
