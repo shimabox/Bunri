@@ -11,8 +11,8 @@ from typing import Optional
 import typer
 from rich.console import Console
 
-from bunri.pocket.config import PocketConfig, connection_fingerprint, read_config, save_config, validate_base_url, validate_capabilities, validate_token
-from bunri.pocket.http import PocketHTTPClient
+from bunri.pocket.config import TOKEN_REJECTED_MESSAGE, PocketConfig, connection_fingerprint, read_config, save_config, validate_base_url, validate_capabilities, validate_token
+from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
 from bunri.pocket.lock import SyncLock, SyncLockBusy
 from bunri.pocket.password import (
     PasswordResetError,
@@ -67,6 +67,9 @@ def connect(
         client = PocketHTTPClient(base_url, token)
         validate_capabilities(client.capabilities())
         warnings = save_config(output, PocketConfig(base_url, token))
+    except PocketHTTPError as exc:
+        # A token the Pocket refuses reads the same as a malformed one.
+        _fail(TOKEN_REJECTED_MESSAGE if exc.status == 401 else str(exc))
     except (OSError, RuntimeError, ValueError) as exc: _fail(str(exc))
     for warning in warnings: console.print(warning, stderr=True)
     config_path = output / ".pocket" / "config.json"

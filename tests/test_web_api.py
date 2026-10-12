@@ -2844,8 +2844,8 @@ def test_pocket_connect_rejects_any_other_body(settings, content):
         ("ftp://settings-pocket.invalid", POCKET_TOKEN, "Pocket URL には https と host が必要です"),
         ("https://user:pass@settings-pocket.invalid", POCKET_TOKEN, "Pocket URL に userinfo、query、fragment は指定できません"),
         ("http://example.com", POCKET_TOKEN, "http は localhost または loopback address だけで使用できます"),
-        (_SHELF_URL, "c2hvcnQ", "upload token が短すぎます"),
-        (_SHELF_URL, "not a token!", "upload token の形式が不正です"),
+        (_SHELF_URL, "c2hvcnQ", "upload token が違います。音源ポケットの設定画面で確認してください。"),
+        (_SHELF_URL, "not a token!", "upload token が違います。音源ポケットの設定画面で確認してください。"),
     ],
 )
 def test_pocket_connect_reports_bad_input_without_asking_the_pocket(settings, url, token, detail):

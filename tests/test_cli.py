@@ -75,6 +75,35 @@ def test_pocket_connect_reads_token_from_the_prompt_without_displaying_it(tmp_pa
     assert (tmp_path / ".pocket/config.json").exists()
 
 
+@pytest.mark.parametrize("case", ["short", "alphabet", "refused"])
+def test_pocket_connect_reports_every_wrong_token_with_the_same_words(tmp_path, monkeypatch, case):
+    import base64
+    import bunri.pocket.cli as pocket_cli
+    from bunri.pocket.http import PocketHTTPError
+
+    well_formed = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    typed = {"short": "c2hvcnQ", "alphabet": "not a token!", "refused": well_formed}[case]
+
+    class Client:
+        def __init__(self, base_url, supplied_token):
+            assert case == "refused", "the Pocket was asked about a malformed token"
+        def capabilities(self):
+            raise PocketHTTPError(401, "UNAUTHENTICATED", "https://example.invalid/api/v1/upload/capabilities")
+
+    monkeypatch.setattr(pocket_cli, "PocketHTTPClient", Client)
+    monkeypatch.setattr(pocket_cli, "_stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(
+        pocket_cli.app, ["connect", "https://example.invalid", "-o", str(tmp_path)], input=typed + "\n", env=_STABLE_TERMINAL
+    )
+    assert result.exit_code == 1
+    shown = _squash(_plain(result.output))
+    assert _squash("error: upload token が違います。音源ポケットの設定画面で確認してください。") in shown
+    for hint in ("短すぎ", "形式", "無効", "connect を再実行"):
+        assert hint not in shown
+    assert typed not in shown
+    assert not (tmp_path / ".pocket" / "config.json").exists()
+
+
 def test_pocket_connect_without_a_terminal_reads_nothing_and_saves_nothing(tmp_path, monkeypatch):
     import bunri.pocket.cli as pocket_cli
 

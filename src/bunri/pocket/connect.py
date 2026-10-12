@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config, validate_base_url, validate_capabilities, validate_token
+from bunri.pocket.config import TOKEN_REJECTED_MESSAGE, PocketConfig, connection_fingerprint, save_config, validate_base_url, validate_capabilities, validate_token
 from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
 
 
@@ -35,7 +35,7 @@ class ConnectResult:
 def _pocket_failure(exc: BaseException) -> str:
     if isinstance(exc, PocketHTTPError):
         messages = {
-            401: "upload token が違います。音源ポケットの設定画面で確認してください。",
+            401: TOKEN_REJECTED_MESSAGE,
             404: "接続先に音源ポケットの API が見つかりません。URL を確認してください。",
         }
         return messages.get(exc.status, f"音源ポケットとの通信に失敗しました(HTTP {exc.status})。")
@@ -68,7 +68,8 @@ def connect_pocket(
         base_url = validate_base_url(url)
         token = validate_token(token)
     except ValueError as exc:
-        # These messages describe the rule that failed, not the input.
+        # These messages hold none of the input. A URL's says which rule
+        # failed; a token's says only that it is wrong.
         raise ConnectError("input", str(exc)) from None
     try:
         capabilities = client_factory(base_url, token).capabilities()

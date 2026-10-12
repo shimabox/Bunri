@@ -32,6 +32,27 @@ def test_token_config_roundtrip_modes_and_repr(tmp_path):
     assert stat.S_IMODE((tmp_path / ".pocket/config.json").stat().st_mode) == 0o600
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "not a token!",
+        base64.urlsafe_b64encode(b"short").decode().rstrip("="),
+        TOKEN + "=",
+        # 43 characters whose spare bits are not zero: not the canonical spelling.
+        base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")[:-1] + "B",
+    ],
+    ids=["empty", "alphabet", "short", "padded", "non-canonical"],
+)
+def test_every_refused_token_is_reported_with_the_same_words(raw):
+    from bunri.pocket.config import TOKEN_REJECTED_MESSAGE
+
+    with pytest.raises(ValueError) as refused:
+        validate_token(raw)
+    assert str(refused.value) == TOKEN_REJECTED_MESSAGE
+    assert TOKEN_REJECTED_MESSAGE == "upload token が違います。音源ポケットの設定画面で確認してください。"
+
+
 def test_rejects_short_token_and_capability_mismatch():
     with pytest.raises(ValueError): validate_token(base64.urlsafe_b64encode(b"short").decode().rstrip("="))
     validate_capabilities(CAPABILITIES)

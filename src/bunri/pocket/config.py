@@ -50,14 +50,21 @@ def validate_base_url(raw: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
+# One message for every reason a token is not accepted. Naming the rule that
+# failed (its alphabet, its encoding, its length) would describe what a real
+# token looks like, so a token that is malformed and a token the Pocket
+# refuses are reported with the same words.
+TOKEN_REJECTED_MESSAGE = "upload token が違います。音源ポケットの設定画面で確認してください。"
+
+
 def validate_token(raw: str) -> str:
     token = raw.strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", token): raise ValueError("upload token の形式が不正です")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", token): raise ValueError(TOKEN_REJECTED_MESSAGE)
     try: decoded = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
-    except Exception as exc: raise ValueError("upload token の形式が不正です") from exc
+    except Exception as exc: raise ValueError(TOKEN_REJECTED_MESSAGE) from exc
     if base64.urlsafe_b64encode(decoded).decode().rstrip("=") != token:
-        raise ValueError("upload token の形式が不正です")
-    if len(decoded) < 32: raise ValueError("upload token が短すぎます")
+        raise ValueError(TOKEN_REJECTED_MESSAGE)
+    if len(decoded) < 32: raise ValueError(TOKEN_REJECTED_MESSAGE)
     return token
 
 
