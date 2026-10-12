@@ -8,7 +8,7 @@
 def test_bunri_version() -> None:
     import bunri
 
-    assert bunri.__version__ == "0.8.1"
+    assert bunri.__version__ == "0.9.0"
 
 
 def test_import_audio_separator() -> None:
