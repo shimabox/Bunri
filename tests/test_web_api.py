@@ -509,6 +509,84 @@ def test_pocket_status_is_hidden_when_not_connected(client):
     assert "Bunri Pocket 連携中" in client.get("/").text
 
 
+def test_pocket_local_status_is_hidden_when_not_connected(client):
+    response = client.get("/api/pocket/local")
+    assert response.status_code == 200
+    assert response.json() == {
+        "connected": False,
+        "connection_fingerprint": None,
+        "target_count": 0,
+        "songs": [],
+    }
+
+
+def test_pocket_local_status_answers_without_asking_the_pocket(tmp_path, monkeypatch):
+    import base64
+
+    from bunri.package_metadata import (
+        PackageMetadata,
+        SourceIdentity,
+        TargetMetadata,
+        write_package_metadata,
+    )
+    from bunri.pocket.config import PocketConfig, connection_fingerprint, save_config
+
+    digest = "a" * 40
+    _write_job_file(tmp_path, "j-local", digest=digest, title="Local Song")
+    package = tmp_path / "Local Song"
+    package.mkdir(exist_ok=True)
+    write_package_metadata(
+        package / ".bunri-package.json",
+        PackageMetadata(
+            "Local Song",
+            "Local Song",
+            SourceIdentity("sha1", digest, digest[:12]),
+            (TargetMetadata("guitar", ("mp3",)),),
+        ),
+    )
+    for suffix in ("original.mp3", "guitar.mp3", "guitar.backing.mp3"):
+        (package / f"Local Song.{suffix}").write_bytes(b"audio")
+    (tmp_path / "Legacy Song").mkdir()
+    token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    config = PocketConfig("https://example.invalid", token)
+    save_config(tmp_path, config)
+
+    def refuse(*_args, **_kwargs):
+        pytest.fail("the local status must not reach the Pocket")
+
+    monkeypatch.setattr(app_module, "PocketHTTPClient", refuse)
+    monkeypatch.setattr(app_module, "list_library_tracks", refuse)
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as client:
+        web_song_id = client.get("/api/songs").json()[0]["id"]
+        response = client.get("/api/pocket/local")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "example.invalid" not in response.text and token not in response.text
+    assert body["connected"] is True
+    assert body["connection_fingerprint"] == connection_fingerprint(config)
+    assert (body["package_count"], body["target_count"]) == (2, 1)
+    # Which tracks exist only on the Pocket is not known without asking it.
+    assert "remote_only" not in body
+    songs = {song["safe_name"]: song for song in body["songs"]}
+    assert songs["Local Song"] == {
+        "web_song_id": web_song_id,
+        "song_id": digest[:12],
+        "title": "Local Song",
+        "safe_name": "Local Song",
+        "state": "unchecked",
+        "can_sync": True,
+        "message": None,
+        "conflict": False,
+        "can_delete": True,
+    }
+    assert songs["Legacy Song"]["state"] == "legacy"
+    assert songs["Legacy Song"]["can_sync"] is False
+    assert songs["Legacy Song"]["can_delete"] is False
+
+
 def test_pocket_status_matches_web_song_id_across_unicode_normalization(
     tmp_path, monkeypatch
 ):

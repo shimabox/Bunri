@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Literal
 
 from bunri.package_metadata import SourceIdentity
 from bunri.pocket.config import connection_fingerprint, read_config
-from bunri.pocket.http import PocketHTTPClient, PocketHTTPError
+from bunri.pocket.http import JSONDocument, PocketHTTPClient, PocketHTTPError
 from bunri.pocket.local import (
     LocalPackage,
     LocalPreflightError,
@@ -295,21 +296,34 @@ def resolve_package(
 
 
 UNKNOWN_REMOTE = RemoteStatus("unknown", False, "音源ポケットの状態を確認できません。")
+# The package is fine locally and the Pocket was not asked about it.
+UNCHECKED_REMOTE = RemoteStatus("unchecked", True)
 _REMOTE_CHECK_ERRORS = (OSError, PocketHTTPError, ProtocolError, SyncError, ValueError)
+_READ_LIBRARY = object()
+# How many packages are compared with the Pocket at the same time. Each one
+# costs a manifest read and a HEAD per media file, so a serial listing grows
+# to minutes with the library.
+STATUS_WORKERS = 8
 
 
 def inspect_remote(
     package: LocalPackage,
     client: PocketHTTPClient,
     features: RemoteFeatures | None = None,
+    library: JSONDocument | None | object = _READ_LIBRARY,
 ) -> RemoteStatus:
+    """Compare one package with the Pocket.
+
+    `library` is the library document a caller has already read (None when
+    the Pocket has none yet); left out, it is read here.
+    """
     song_id = package.metadata.source.cache_key
     try:
         if features is None:
             features = probe_features(client)
         assets = assets_to_send(package, features)
         manifest_doc = _manifest(client, song_id)
-        library_doc = _library(client)
+        library_doc = _library(client) if library is _READ_LIBRARY else library
         library_has_song = bool(
             library_doc
             and any(item.get("song_id") == song_id for item in library_doc.value.get("songs", []))
@@ -346,7 +360,36 @@ def inspect_remote(
         return UNKNOWN_REMOTE
 
 
-def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageStatus, ...]:
+def _remote_statuses(
+    packages: list[LocalPackage], client: PocketHTTPClient | None
+) -> list[RemoteStatus]:
+    if not packages:
+        return []
+    if client is None:
+        return [UNCHECKED_REMOTE] * len(packages)
+    # One capabilities read and one library read serve every package. If
+    # either fails, the states decided locally are still returned and only
+    # the remote checks become unknown, so the status listing keeps working.
+    try:
+        features = probe_features(client)
+        library = _library(client)
+    except _REMOTE_CHECK_ERRORS:
+        return [UNKNOWN_REMOTE] * len(packages)
+    with ThreadPoolExecutor(max_workers=min(STATUS_WORKERS, len(packages))) as pool:
+        return list(pool.map(
+            lambda package: inspect_remote(package, client, features, library),
+            packages,
+        ))
+
+
+def inspect_packages(
+    out_dir: Path, client: PocketHTTPClient | None
+) -> tuple[PackageStatus, ...]:
+    """List every package with its state on the Pocket.
+
+    Without a client nothing is requested: a package that is fine locally is
+    reported as unchecked, and the states decided locally stay as they are.
+    """
     scanned = _scan_packages(out_dir, include_original=True)
     conflict_names = {
         key for key, entries in _package_name_groups(scanned).items() if len(entries) > 1
@@ -369,24 +412,9 @@ def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageSt
         "曲のパッケージ名または identity が競合しているためアップロードできません。",
         True,
     )
-    # One capabilities read serves every package. If it fails, the states
-    # decided locally are still returned and only the remote checks become
-    # unknown, so the status listing keeps working.
-    features: RemoteFeatures | None = None
-    probe_failed = False
-
-    def remote_status(package: LocalPackage) -> RemoteStatus:
-        nonlocal features, probe_failed
-        if features is None and not probe_failed:
-            try:
-                features = probe_features(client)
-            except _REMOTE_CHECK_ERRORS:
-                probe_failed = True
-        if features is None:
-            return UNKNOWN_REMOTE
-        return inspect_remote(package, client, features)
-
     statuses: list[PackageStatus] = []
+    # Packages still to be compared with the Pocket, by position in `statuses`.
+    remote_checks: dict[int, LocalPackage] = {}
     for entry in scanned:
         source = entry.identity
         in_conflict = package_name_key(entry.safe_name) in conflict_names or (
@@ -415,13 +443,22 @@ def inspect_packages(out_dir: Path, client: PocketHTTPClient) -> tuple[PackageSt
             ))
             continue
         assert source is not None
+        if not in_conflict:
+            remote_checks[len(statuses)] = entry.package
         statuses.append(PackageStatus(
             entry.safe_name,
             entry.package.metadata.title,
             source.cache_key,
             source.digest,
-            conflicted if in_conflict else remote_status(entry.package),
+            conflicted,
         ))
+    for index, remote in zip(
+        remote_checks, _remote_statuses(list(remote_checks.values()), client)
+    ):
+        item = statuses[index]
+        statuses[index] = PackageStatus(
+            item.safe_name, item.title, item.song_id, item.digest, remote
+        )
     return tuple(sorted(statuses, key=lambda item: (item.safe_name.casefold(), item.safe_name)))
 
 

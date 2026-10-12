@@ -625,3 +625,85 @@ def test_status_listing_keeps_local_states_when_capabilities_fail(tmp_path):
         assert statuses[name].state == "unknown"
         assert statuses[name].can_sync is False
         assert statuses[name].message == "音源ポケットの状態を確認できません。"
+
+
+def test_status_listing_reads_the_library_once(tmp_path):
+    from bunri.pocket.sync import synchronize
+
+    for name, digest in (("A", "a" * 40), ("B", "b" * 40), ("C", "c" * 40)):
+        make_package(tmp_path, name, digest)
+    client = MemoryClient()
+    for package in inventory(tmp_path).packages:
+        synchronize(package, client)
+    client.calls.clear()
+
+    statuses = inspect_packages(tmp_path, client)
+
+    assert [status.remote.state for status in statuses] == ["synced"] * 3
+    assert client.calls[:2] == [("CAPABILITIES",), ("GET", "library")]
+    assert client.calls.count(("GET", "library")) == 1
+    assert sorted(call[1] for call in client.calls if call[0] == "GET")[1:] == [
+        f"manifest/{letter * 12}" for letter in "abc"
+    ]
+
+
+def test_status_listing_compares_packages_at_the_same_time(tmp_path):
+    import threading
+
+    digests = [letter * 40 for letter in "abcd"]
+    for index, digest in enumerate(digests):
+        make_package(tmp_path, f"Song{index}", digest)
+    # Every manifest read waits for the others, so a listing that compared
+    # one package after another would never get past the first.
+    together = threading.Barrier(len(digests), timeout=10)
+
+    class GatedClient(EmptyRemoteClient):
+        def get_json(self, path):
+            if path.startswith("manifest/"):
+                together.wait()
+            return None
+
+    statuses = inspect_packages(tmp_path, GatedClient())
+
+    assert [status.safe_name for status in statuses] == [f"Song{index}" for index in range(4)]
+    assert [status.remote.state for status in statuses] == ["not_synced"] * 4
+
+
+def test_status_listing_is_unknown_when_the_library_cannot_be_read(tmp_path):
+    make_package(tmp_path, "Good", "a" * 40)
+    make_package(tmp_path, "Other", "b" * 40)
+    (tmp_path / "Legacy").mkdir()
+
+    class BrokenLibraryClient(MemoryClient):
+        def get_json(self, path):
+            self.calls.append(("GET", path))
+            raise PocketHTTPError(503, "UNAVAILABLE", "https://example.invalid")
+
+    client = BrokenLibraryClient()
+    statuses = {item.safe_name: item.remote for item in inspect_packages(tmp_path, client)}
+
+    assert client.calls == [("CAPABILITIES",), ("GET", "library")]
+    assert statuses["Legacy"].state == "legacy"
+    for name in ("Good", "Other"):
+        assert (statuses[name].state, statuses[name].can_sync) == ("unknown", False)
+
+
+def test_status_listing_without_a_client_decides_only_what_is_local(tmp_path):
+    make_package(tmp_path, "Good", "a" * 40)
+    make_package(tmp_path, "Dup1", "c" * 40)
+    shutil.copytree(tmp_path / "Dup1", tmp_path / "Dup2")
+    (tmp_path / "Legacy").mkdir()
+
+    statuses = {item.safe_name: item for item in inspect_packages(tmp_path, None)}
+
+    good = statuses["Good"]
+    assert good.song_id == "a" * 12
+    assert (good.remote.state, good.remote.can_sync, good.remote.message) == (
+        "unchecked", True, None,
+    )
+    assert good.remote.conflict is False
+    assert statuses["Legacy"].remote.state == "legacy"
+    assert statuses["Legacy"].remote.can_sync is False
+    for name in ("Dup1", "Dup2"):
+        assert statuses[name].remote.conflict is True
+        assert statuses[name].remote.can_sync is False

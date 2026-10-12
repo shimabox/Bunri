@@ -54,9 +54,12 @@
     color: #6f665c;
     margin: 0 0 12px;
   }
-  .sw-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .sw-section-heading { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
   .sw-section-heading .sw-h2 { margin: 0; }
-  .sw-pocket-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  /* The controls start right after the heading and the note takes what is
+     left of the row, so a longer or shorter note never moves the buttons. */
+  .sw-pocket-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; flex: 1 1 0; min-width: 0; }
+  .sw-pocket-controls > .sw-pocket-note { flex: 1 1 12em; min-width: 0; }
   .sw-pocket-controls[hidden] { display: none; }
   .sw-pocket-note { color: #8a7f74; font-size: 0.76rem; font-variant-numeric: tabular-nums; }
   .sw-pocket-summary {
@@ -166,13 +169,19 @@
   button.sw-btn:hover:not(:disabled) { background: #fff7ee; border-color: #e2674e; }
   button.sw-btn:disabled { opacity: 0.45; cursor: not-allowed; }
   button.sw-btn.is-checking {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
     opacity: 1;
     color: #8a7f74;
     cursor: progress;
   }
+  /* Both labels are always laid out, the unused ones with no height, so the
+     button keeps one width whether or not a check is running. The busy
+     label's padding stands in for the spinner (18px) and its gap (7px). */
+  button.sw-refresh-btn { display: inline-grid; justify-items: center; }
+  button.sw-refresh-btn::before,
+  button.sw-refresh-btn::after { height: 0; overflow: hidden; visibility: hidden; }
+  button.sw-refresh-btn::before { content: attr(data-idle-label); }
+  button.sw-refresh-btn::after { content: attr(data-busy-label); padding-left: 25px; }
+  .sw-refresh-busy { display: inline-flex; align-items: center; gap: 7px; }
   .sw-refresh-spinner {
     width: 14px;
     height: 14px;
@@ -509,7 +518,7 @@
       <h2 id="sw-songs-heading" class="sw-h2" tabindex="-1">曲一覧</h2>
       <div id="sw-pocket-controls" class="sw-pocket-controls" hidden>
         <button type="button" id="sw-pocket-all" class="sw-btn sw-btn-primary">全曲アップロード</button>
-        <button type="button" id="sw-pocket-refresh" class="sw-btn">状態を再読込</button>
+        <button type="button" id="sw-pocket-refresh" class="sw-btn sw-refresh-btn" data-idle-label="状態を再読込" data-busy-label="再読込中…">状態を再読込</button>
         <span id="sw-pocket-count" class="sw-pocket-note"></span>
         <p id="sw-pocket-summary" class="sw-pocket-summary" role="status" aria-live="polite" hidden></p>
         <p id="sw-pocket-notice" class="sw-pocket-summary sw-pocket-notice" role="status" aria-live="polite" hidden></p>
@@ -567,6 +576,7 @@
   var API_SONGS = "/api/songs";
   var API_SONGS_LEGACY = "/api/songs-legacy";
   var API_POCKET_STATUS = "/api/pocket/status";
+  var API_POCKET_LOCAL = "/api/pocket/local";
   var API_POCKET_JOB = "/api/pocket/job";
   var API_POCKET_SYNC = "/api/pocket/sync";
   var POLL_INTERVAL_MS = 2000;
@@ -626,6 +636,7 @@
   var activePocketJobId = null;
   var pocketJobGeneration = 0;
   var pocketStatusGeneration = 0;
+  var pocketStatusSettledGeneration = 0;
   var pocketStatusRefreshPending = false;
   var pocketStatusTimer = null;
   var pocketStatusStartedAt = 0;
@@ -862,11 +873,14 @@
     pocketRefresh.classList.add("is-checking");
     pocketRefresh.setAttribute("aria-busy", "true");
     pocketRefresh.textContent = "";
+    var busy = document.createElement("span");
+    busy.className = "sw-refresh-busy";
     var spinner = document.createElement("span");
     spinner.className = "sw-refresh-spinner";
     spinner.setAttribute("aria-hidden", "true");
-    pocketRefresh.appendChild(spinner);
-    pocketRefresh.appendChild(document.createTextNode("再読込中…"));
+    busy.appendChild(spinner);
+    busy.appendChild(document.createTextNode(pocketRefresh.dataset.busyLabel));
+    pocketRefresh.appendChild(busy);
     renderPocketCount();
     pocketStatusTimer = setInterval(function () {
       renderPocketCount();
@@ -1082,7 +1096,7 @@
     }
 
     songsCache = songs;
-    pocketAll.disabled = pocketChecking || hasActivePocketJobs(songs) || activePocketJobId !== null;
+    pocketAll.disabled = hasActivePocketJobs(songs) || activePocketJobId !== null;
     updateUploadEnabled();
     jobListEl.innerHTML = "";
     emptyMsg.hidden = songs.length !== 0;
@@ -1161,7 +1175,7 @@
         pocketButton.type = "button";
         pocketButton.className = "sw-btn";
         pocketButton.textContent = "⬆ アップロード";
-        pocketButton.disabled = pocketChecking || activePocketJobId !== null
+        pocketButton.disabled = activePocketJobId !== null
           || hasActivePocketJobs(songs) || song.conflict
           || !pocketStatus || !pocketStatus.can_sync;
         if (pocketStatus && pocketStatus.song_id) {
@@ -1451,6 +1465,33 @@
       .catch(function () { return undefined; });
   }
 
+  // The remote check costs a request per media file, so the page first asks
+  // for what the output directory alone decides: the song ID, and whether a
+  // package can be sent or deleted. That keeps upload and delete usable
+  // while the states on the Pocket are still on their way. What the previous
+  // check said is dropped here, so its verdicts and messages do not decide
+  // what can be done during this one.
+  function loadLocalPocketStatus(generation) {
+    return fetch(API_POCKET_LOCAL)
+      .then(function (res) {
+        if (!res.ok) throw new Error("Pocket local status request failed");
+        return res.json();
+      })
+      .then(function (status) {
+        if (generation !== pocketStatusGeneration
+          || generation === pocketStatusSettledGeneration) return;
+        if (status.connected !== true) return;
+        pocketStatuses = Object.create(null);
+        (status.songs || []).forEach(function (item) {
+          if (!item.web_song_id) return;
+          item.connection_fingerprint = status.connection_fingerprint;
+          pocketStatuses[item.web_song_id] = item;
+        });
+        renderSongs(songsCache);
+      })
+      .catch(function () { return undefined; });
+  }
+
   function refreshPocketStatus() {
     if (pocketChecking) {
       pocketStatusRefreshPending = true;
@@ -1460,6 +1501,7 @@
     var generation = ++pocketStatusGeneration;
     startPocketStatusCheck();
     if (songsCache.length) renderSongs(songsCache);
+    loadLocalPocketStatus(generation);
     return fetch(API_POCKET_STATUS)
       .then(function (res) {
         if (!res.ok) throw new Error("Pocket status request failed");
@@ -1467,6 +1509,7 @@
       })
       .then(function (status) {
         if (generation !== pocketStatusGeneration) return;
+        pocketStatusSettledGeneration = generation;
         var preserveRemoteOnly = status.connected === true && status.state === "unknown";
         setPocketConnected(status.connected, status.connection_fingerprint);
         pocketStatuses = Object.create(null);
