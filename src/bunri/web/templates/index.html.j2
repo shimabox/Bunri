@@ -43,6 +43,24 @@
     font-weight: 700;
   }
   .sw-pocket-banner[hidden] { display: none; }
+  /* Each item carries the top margin itself, so the row takes no space while
+     the connection state is still unknown and everything in it is hidden.
+     On a narrow screen the settings button wraps below the banner. */
+  .sw-pocket-bar { display: flex; align-items: center; gap: 0 12px; flex-wrap: wrap; }
+  .sw-pocket-disconnected { margin-top: 12px; color: #8a7f74; font-size: 0.82rem; }
+  button.sw-pocket-connect { margin-top: 12px; font-size: 0.82rem; padding: 6px 14px; }
+  button.sw-link-btn {
+    margin-top: 12px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: #6f665c;
+    font: inherit;
+    font-size: 0.78rem;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  button.sw-link-btn:hover { color: #c9502f; }
   main.sw-main {
     padding: 22px 24px 40px;
     max-width: 760px;
@@ -451,6 +469,49 @@
   }
   button.sw-btn-danger:hover:not(:disabled) { background: #8f2e24; border-color: #8f2e24; }
   .sw-delete-error { min-height: 1.3em; margin: 12px 0 0; color: #c0392b; font-size: 0.82rem; }
+  /* The Pocket settings dialogs: the delete dialog's shape, in the neutral
+     border unless the action is a destructive one. */
+  dialog.sw-dialog {
+    width: min(480px, calc(100% - 32px));
+    border: 1px solid #e6d9c4;
+    border-radius: 18px;
+    padding: 0;
+    color: #3a322c;
+    background: #fffdfa;
+    box-shadow: 0 20px 60px rgba(85, 44, 32, 0.24);
+  }
+  dialog.sw-dialog.sw-dialog-danger { border-color: #e8b8af; }
+  dialog.sw-dialog::backdrop { background: rgba(58, 50, 44, 0.38); }
+  .sw-dialog-inner { padding: 22px; }
+  .sw-dialog h2 { margin: 0 0 10px; font-size: 1.15rem; }
+  .sw-dialog-text { margin: 0 0 14px; font-size: 0.85rem; line-height: 1.65; }
+  .sw-dialog-note { margin: 0 0 14px; color: #8a7f74; font-size: 0.78rem; line-height: 1.6; }
+  .sw-dialog-field { display: grid; gap: 4px; margin: 0 0 12px; }
+  .sw-dialog-field label { color: #6f665c; font-size: 0.82rem; font-weight: 600; }
+  .sw-dialog-field input {
+    width: 100%;
+    font: inherit;
+    font-size: 0.9rem;
+    padding: 8px 12px;
+    border: 1px solid #e6d9c4;
+    border-radius: 10px;
+    background: #ffffff;
+    color: inherit;
+  }
+  .sw-dialog-field input:disabled { opacity: 0.6; }
+  .sw-dialog-summary {
+    margin: 0 0 16px;
+    padding: 14px 16px 14px 34px;
+    border-left: 4px solid #c9502f;
+    background: #fbe9e6;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    line-height: 1.65;
+  }
+  .sw-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .sw-dialog-error { min-height: 1.3em; margin: 12px 0 0; color: #c0392b; font-size: 0.82rem; }
+  .sw-settings-list { list-style: none; margin: 0 0 18px; padding: 0; display: grid; gap: 14px; }
+  .sw-settings-list p { margin: 5px 0 0 6px; color: #8a7f74; font-size: 0.78rem; }
   p.sw-empty { color: #b3a99c; font-size: 0.85rem; }
 
   footer.sw-footer {
@@ -476,7 +537,12 @@
   <div class="sw-header-inner">
     <h1 class="sw-title">Bunri</h1>
     <p class="sw-sub">音源から楽器別の練習パッケージを作る</p>
-    <div id="sw-pocket-banner" class="sw-pocket-banner" hidden>Bunri Pocket 連携中</div>
+    <div class="sw-pocket-bar">
+      <div id="sw-pocket-banner" class="sw-pocket-banner" hidden>Bunri Pocket 連携中</div>
+      <button type="button" id="sw-pocket-settings" class="sw-link-btn" hidden>音源ポケットの設定</button>
+      <span id="sw-pocket-disconnected" class="sw-pocket-disconnected" hidden>音源ポケットに接続していません</span>
+      <button type="button" id="sw-pocket-connect" class="sw-btn sw-pocket-connect" hidden>音源ポケットに接続</button>
+    </div>
   </div>
 </header>
 
@@ -565,6 +631,64 @@
   </div>
 </dialog>
 
+<dialog id="sw-pocket-settings-dialog" class="sw-dialog" aria-labelledby="sw-pocket-settings-title">
+  <div class="sw-dialog-inner">
+    <h2 id="sw-pocket-settings-title">音源ポケットの設定</h2>
+    <ul class="sw-settings-list">
+      <li>
+        <button type="button" id="sw-settings-change" class="sw-btn">接続先を変更</button>
+        <p>URL や upload token を入れ直す</p>
+      </li>
+      <li>
+        <button type="button" id="sw-settings-disconnect" class="sw-btn">接続を解除</button>
+        <p>この出力先に保存した接続設定を消す</p>
+      </li>
+    </ul>
+    <div class="sw-dialog-actions">
+      <button type="button" id="sw-settings-close" class="sw-btn">閉じる</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- These dialogs use no form element: nothing here is submitted by the
+     browser, and a form is what makes it offer to save what was typed. -->
+<dialog id="sw-connect-dialog" class="sw-dialog" aria-labelledby="sw-connect-title">
+  <div class="sw-dialog-inner">
+    <h2 id="sw-connect-title">音源ポケットに接続</h2>
+    <p id="sw-connect-description" class="sw-dialog-text"></p>
+    <div class="sw-dialog-field">
+      <label for="sw-connect-url">音源ポケットの URL</label>
+      <input id="sw-connect-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://your-pocket.example">
+    </div>
+    <div class="sw-dialog-field">
+      <label for="sw-connect-token">upload token</label>
+      <input id="sw-connect-token" type="password" autocomplete="off">
+    </div>
+    <p class="sw-dialog-note">接続すると、この出力先に設定が保存されます(コマンドの bunri pocket connect と同じ設定です)。</p>
+    <div class="sw-dialog-actions">
+      <button type="button" id="sw-connect-cancel" class="sw-btn">キャンセル</button>
+      <button type="button" id="sw-connect-submit" class="sw-btn sw-btn-primary">接続する</button>
+    </div>
+    <p id="sw-connect-error" class="sw-dialog-error" role="alert"></p>
+  </div>
+</dialog>
+
+<dialog id="sw-disconnect-dialog" class="sw-dialog sw-dialog-danger" aria-labelledby="sw-disconnect-title">
+  <div class="sw-dialog-inner">
+    <h2 id="sw-disconnect-title">音源ポケットとの接続を解除しますか？</h2>
+    <ul class="sw-dialog-summary">
+      <li>この出力先に保存した接続先と upload token を消します。</li>
+      <li>音源ポケットにある曲と、手元の曲は消えません。</li>
+      <li>もう一度使うには、接続し直してください。</li>
+    </ul>
+    <div class="sw-dialog-actions">
+      <button type="button" id="sw-disconnect-cancel" class="sw-btn">キャンセル</button>
+      <button type="button" id="sw-disconnect-confirm" class="sw-btn sw-btn-danger">解除する</button>
+    </div>
+    <p id="sw-disconnect-error" class="sw-dialog-error" role="alert"></p>
+  </div>
+</dialog>
+
 <footer class="sw-footer">
   Bunri はローカル専用です(127.0.0.1 でのみ待ち受け)。
 </footer>
@@ -580,6 +704,8 @@
   var API_POCKET_LOCAL = "/api/pocket/local";
   var API_POCKET_JOB = "/api/pocket/job";
   var API_POCKET_SYNC = "/api/pocket/sync";
+  var API_POCKET_CONNECT = "/api/pocket/connect";
+  var API_POCKET_CONNECTION = "/api/pocket/connection";
   var POLL_INTERVAL_MS = 2000;
   var PAN_SPLIT_UNSUPPORTED_NOTICE = "この音源ポケットは L のみ / R のみに未対応です。音源ポケットを更新して再同期すると送られます";
 
@@ -621,6 +747,25 @@
   var remoteOnlyTracks = [];
   var legacyPackagesSection = document.getElementById("sw-legacy-packages");
   var legacyPackagesList = document.getElementById("sw-legacy-package-list");
+  var pocketSettings = document.getElementById("sw-pocket-settings");
+  var pocketDisconnected = document.getElementById("sw-pocket-disconnected");
+  var pocketConnect = document.getElementById("sw-pocket-connect");
+  var settingsDialog = document.getElementById("sw-pocket-settings-dialog");
+  var settingsChange = document.getElementById("sw-settings-change");
+  var settingsDisconnect = document.getElementById("sw-settings-disconnect");
+  var settingsClose = document.getElementById("sw-settings-close");
+  var connectDialog = document.getElementById("sw-connect-dialog");
+  var connectTitle = document.getElementById("sw-connect-title");
+  var connectDescription = document.getElementById("sw-connect-description");
+  var connectUrl = document.getElementById("sw-connect-url");
+  var connectToken = document.getElementById("sw-connect-token");
+  var connectCancel = document.getElementById("sw-connect-cancel");
+  var connectSubmit = document.getElementById("sw-connect-submit");
+  var connectError = document.getElementById("sw-connect-error");
+  var disconnectDialog = document.getElementById("sw-disconnect-dialog");
+  var disconnectCancel = document.getElementById("sw-disconnect-cancel");
+  var disconnectConfirm = document.getElementById("sw-disconnect-confirm");
+  var disconnectError = document.getElementById("sw-disconnect-error");
 
   var pendingFile = null;
   var pollTimer = null;
@@ -630,6 +775,10 @@
   var deleteDialogSong = null;
   var deleteDialogPocketFingerprint = null;
   var deleteSubmitting = false;
+  var connectSubmitting = false;
+  var connectSubmitLabel = "";
+  var disconnectSubmitting = false;
+  var disconnectDialogFingerprint = null;
   var pocketConnected = false;
   var pocketConnectionFingerprint = null;
   var pocketChecking = false;
@@ -918,6 +1067,186 @@
       ? fingerprint : null;
     pocketBanner.hidden = !pocketConnected;
     pocketControls.hidden = !pocketConnected;
+    // Until this is first called, neither state is shown in the header.
+    pocketSettings.hidden = !pocketConnected;
+    pocketDisconnected.hidden = pocketConnected;
+    pocketConnect.hidden = pocketConnected;
+  }
+
+  // What the page knew about the previous connection says nothing about
+  // the next one, or about having none.
+  function forgetPocketState() {
+    pocketStatuses = Object.create(null);
+    remoteOnlyTracks = [];
+    remoteOnlyError.textContent = "";
+    remoteOnlyError.hidden = true;
+    pocketCountText = "";
+    pocketCountIsError = false;
+    clearPocketSummary();
+    renderPocketCount();
+    renderRemoteOnly();
+    renderSongs(songsCache);
+  }
+
+  // Turns a refused settings request into an Error that carries the status
+  // and the server's fixed message.
+  function settingsFailure(res, fallback) {
+    return res.json().catch(function () { return {}; }).then(function (body) {
+      var err = new Error(
+        typeof body.detail === "string" ? body.detail : fallback + " (" + res.status + ")"
+      );
+      err.status = res.status;
+      throw err;
+    });
+  }
+
+  // A fetch that failed outright has no status: its own message is the
+  // browser's, so the page's wording is used instead.
+  function settingsErrorText(err, fallback) {
+    return typeof err.status === "number" && err.message ? err.message : fallback;
+  }
+
+  // A 409 means the page and the saved settings disagree, whatever the
+  // reason, so the connection state is read again.
+  function resyncPocketAfterConflict(err) {
+    if (err.status !== 409) return;
+    refreshPocketJob();
+    refreshPocketStatus();
+  }
+
+  function setConnectBusy(busy) {
+    connectUrl.disabled = busy;
+    connectToken.disabled = busy;
+    connectCancel.disabled = busy;
+    connectSubmit.disabled = busy;
+    connectSubmit.textContent = busy ? "接続中…" : connectSubmitLabel;
+  }
+
+  function openConnectDialog() {
+    if (connectSubmitting) return;
+    var replacing = pocketConnected;
+    connectTitle.textContent = replacing ? "接続先を変更" : "音源ポケットに接続";
+    connectDescription.textContent = replacing
+      ? "現在の接続を置き換えます。保存済みの upload token は新しいものに置き換わります。曲の状態は接続後に確認し直します。"
+      : "音源ポケットの URL と upload token を入力してください。upload token は音源ポケットの設定画面で確認できます。";
+    connectSubmitLabel = replacing ? "置き換える" : "接続する";
+    connectUrl.value = "";
+    connectToken.value = "";
+    connectError.textContent = "";
+    setConnectBusy(false);
+    connectDialog.showModal();
+  }
+
+  function closeConnectDialog() {
+    connectUrl.value = "";
+    connectToken.value = "";
+    connectDialog.close();
+    (pocketConnected ? pocketSettings : pocketConnect).focus({ preventScroll: true });
+  }
+
+  function submitConnect() {
+    if (connectSubmitting) return;
+    var url = connectUrl.value.trim();
+    var token = connectToken.value.trim();
+    if (!url || !token) {
+      connectError.textContent = "URL と upload token を入力してください。";
+      return;
+    }
+    connectSubmitting = true;
+    connectError.textContent = "";
+    var payload = JSON.stringify({ url: url, token: token });
+    // The token leaves the field as soon as it is on its way.
+    connectToken.value = "";
+    setConnectBusy(true);
+    fetch(API_POCKET_CONNECT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload
+    })
+      .then(function (res) {
+        if (!res.ok) return settingsFailure(res, "接続できませんでした");
+        return res.json();
+      })
+      .then(function (body) {
+        // Answers about the connection that was just replaced are ignored.
+        ++pocketJobGeneration;
+        setPocketConnected(true, body.connection_fingerprint);
+        forgetPocketState();
+        if (Array.isArray(body.warnings) && body.warnings.length) {
+          pocketNotice.textContent = body.warnings.join(" ");
+          pocketNotice.hidden = false;
+        }
+        connectSubmitting = false;
+        closeConnectDialog();
+        refreshPocketStatus();
+      })
+      .catch(function (err) {
+        connectError.textContent = settingsErrorText(
+          err, "Bunri のサーバーから応答を受け取れませんでした。"
+        );
+      })
+      .finally(function () {
+        connectSubmitting = false;
+        setConnectBusy(false);
+      });
+  }
+
+  function openDisconnectDialog() {
+    if (disconnectSubmitting) return;
+    disconnectDialogFingerprint = pocketConnectionFingerprint;
+    disconnectError.textContent = "";
+    disconnectCancel.disabled = false;
+    disconnectConfirm.disabled = false;
+    disconnectConfirm.textContent = "解除する";
+    disconnectDialog.showModal();
+  }
+
+  function closeDisconnectDialog() {
+    disconnectDialog.close();
+    disconnectDialogFingerprint = null;
+    (pocketConnected ? pocketSettings : pocketConnect).focus({ preventScroll: true });
+  }
+
+  function submitDisconnect() {
+    if (disconnectSubmitting) return;
+    if (!disconnectDialogFingerprint) {
+      disconnectError.textContent = "Pocket の接続先を確認できません。状態を再読込してください。";
+      return;
+    }
+    disconnectSubmitting = true;
+    disconnectError.textContent = "";
+    disconnectCancel.disabled = true;
+    disconnectConfirm.disabled = true;
+    disconnectConfirm.textContent = "解除中…";
+    fetch(
+      API_POCKET_CONNECTION + "?pocket_fingerprint="
+        + encodeURIComponent(disconnectDialogFingerprint),
+      { method: "DELETE" }
+    )
+      .then(function (res) {
+        if (!res.ok) return settingsFailure(res, "解除できませんでした");
+      })
+      .then(function () {
+        // Answers about the connection that was just removed are ignored.
+        ++pocketJobGeneration;
+        ++pocketStatusGeneration;
+        setPocketConnected(false, null);
+        forgetPocketState();
+        disconnectSubmitting = false;
+        closeDisconnectDialog();
+      })
+      .catch(function (err) {
+        disconnectError.textContent = settingsErrorText(
+          err, "Bunri のサーバーから応答を受け取れませんでした。"
+        );
+        resyncPocketAfterConflict(err);
+      })
+      .finally(function () {
+        disconnectSubmitting = false;
+        disconnectCancel.disabled = false;
+        disconnectConfirm.disabled = false;
+        disconnectConfirm.textContent = "解除する";
+      });
   }
 
   function renderPocketProgress(job) {
@@ -1588,6 +1917,43 @@
   pocketRefresh.addEventListener("click", function () {
     clearPocketSummary();
     refreshPocketStatus();
+  });
+
+  pocketConnect.addEventListener("click", openConnectDialog);
+  pocketSettings.addEventListener("click", function () { settingsDialog.showModal(); });
+  settingsClose.addEventListener("click", function () { settingsDialog.close(); });
+  // Each choice closes the settings dialog before its own dialog opens.
+  settingsChange.addEventListener("click", function () {
+    settingsDialog.close();
+    openConnectDialog();
+  });
+  settingsDisconnect.addEventListener("click", function () {
+    settingsDialog.close();
+    openDisconnectDialog();
+  });
+
+  connectSubmit.addEventListener("click", submitConnect);
+  connectCancel.addEventListener("click", function () {
+    if (!connectSubmitting) closeConnectDialog();
+  });
+  connectDialog.addEventListener("cancel", function (event) {
+    event.preventDefault();
+    if (!connectSubmitting) closeConnectDialog();
+  });
+  [connectUrl, connectToken].forEach(function (input) {
+    input.addEventListener("input", function () { connectError.textContent = ""; });
+    input.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" && !event.isComposing) submitConnect();
+    });
+  });
+
+  disconnectConfirm.addEventListener("click", submitDisconnect);
+  disconnectCancel.addEventListener("click", function () {
+    if (!disconnectSubmitting) closeDisconnectDialog();
+  });
+  disconnectDialog.addEventListener("cancel", function (event) {
+    event.preventDefault();
+    if (!disconnectSubmitting) closeDisconnectDialog();
   });
 
   document.addEventListener("visibilitychange", function () {

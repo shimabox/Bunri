@@ -25,6 +25,9 @@ import pytest
 
 from bunri.web.app import create_app
 from bunri.web.jobs import safe_filename
+from pocket_fake import OTHER_TOKEN as _OTHER_FAKE_TOKEN
+from pocket_fake import TOKEN as _FAKE_TOKEN
+from pocket_fake import running_fake_pocket
 
 
 def test_pocket_sync_template_binds_requests_and_refreshes_changed_connection():
@@ -2724,3 +2727,226 @@ def test_local_delete_ignores_older_pocket_status_response(tmp_path, monkeypatch
             )
     finally:
         release_first.set()
+
+
+# ---------------------------------------------------------------------------
+# Pocket settings from the page: connect, change, disconnect
+#
+# The Pocket is the loopback fake from tests/pocket_fake.py, reached by the
+# real server with the real HTTP client. That the requests succeed at all also
+# shows the browser attaches Origin to a same-origin POST and DELETE: the
+# endpoints refuse a request without it.
+# ---------------------------------------------------------------------------
+def _is_open(page, selector: str) -> bool:
+    return page.locator(selector).evaluate("dialog => dialog.open")
+
+
+def _open_settings(page) -> None:
+    page.click("#sw-pocket-settings")
+    page.wait_for_selector("#sw-pocket-settings-dialog[open]")
+
+
+def _wait_connected_header(page) -> None:
+    page.wait_for_selector("#sw-pocket-settings", state="visible")
+    assert page.locator("#sw-pocket-banner").is_visible()
+    assert page.locator("#sw-pocket-banner").text_content() == "Bunri Pocket 連携中"
+    assert not page.locator("#sw-pocket-connect").is_visible()
+    assert not page.locator("#sw-pocket-disconnected").is_visible()
+
+
+def _wait_disconnected_header(page) -> None:
+    page.wait_for_selector("#sw-pocket-connect", state="visible")
+    assert page.locator("#sw-pocket-connect").text_content() == "音源ポケットに接続"
+    assert page.locator("#sw-pocket-disconnected").text_content() == "音源ポケットに接続していません"
+    assert page.locator("#sw-pocket-disconnected").is_visible()
+    assert not page.locator("#sw-pocket-settings").is_visible()
+    assert not page.locator("#sw-pocket-banner").is_visible()
+    assert not page.locator("#sw-pocket-controls").is_visible()
+
+
+@contextlib.contextmanager
+def _page_with_fake_pocket(out_dir: Path, *, connected: bool):
+    from bunri.pocket.config import PocketConfig, save_config
+
+    with running_fake_pocket() as pocket:
+        if connected:
+            save_config(out_dir, PocketConfig(pocket.url, _FAKE_TOKEN))
+        app = create_app(out_dir, runner=PageFakeRunner())
+        with _running_server(app) as base_url, _open_page(base_url) as page:
+            yield page, pocket
+
+
+@_needs_browser
+def test_connecting_from_the_page_saves_the_settings_without_showing_the_token(tmp_path):
+    from bunri.pocket.config import PocketConfig, read_config
+    from pocket_fake import error_envelope
+
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=False) as (page, pocket):
+        _wait_disconnected_header(page)
+
+        page.click("#sw-pocket-connect")
+        page.wait_for_selector("#sw-connect-dialog[open]")
+        assert page.locator("#sw-connect-title").text_content() == "音源ポケットに接続"
+        assert page.locator("#sw-connect-submit").text_content() == "接続する"
+        assert page.locator("#sw-connect-token").get_attribute("type") == "password"
+        assert ".pocket ディレクトリを削除" not in page.locator("#sw-connect-dialog").text_content()
+
+        # Nothing is sent while a field is empty.
+        page.click("#sw-connect-submit")
+        assert page.locator("#sw-connect-error").text_content() == "URL と upload token を入力してください。"
+        assert pocket.requests == []
+
+        # A refusal by the Pocket keeps the dialog open for another try.
+        pocket.capabilities_reply = (401, {}, error_envelope("UNAUTHORIZED"))
+        page.fill("#sw-connect-url", pocket.url)
+        page.fill("#sw-connect-token", _FAKE_TOKEN)
+        page.click("#sw-connect-submit")
+        page.wait_for_function(
+            "document.getElementById('sw-connect-error').textContent.includes('upload token が違います')"
+        )
+        assert _is_open(page, "#sw-connect-dialog")
+        assert page.locator("#sw-connect-token").input_value() == ""
+        assert page.locator("#sw-connect-submit").text_content() == "接続する"
+        assert not (out_dir / ".pocket" / "config.json").exists()
+
+        pocket.capabilities_reply = None
+        page.fill("#sw-connect-token", _FAKE_TOKEN)
+        page.click("#sw-connect-submit")
+        _wait_connected_header(page)
+        page.wait_for_selector("#sw-pocket-controls", state="visible")
+        assert not _is_open(page, "#sw-connect-dialog")
+        assert page.locator("#sw-connect-token").input_value() == ""
+        assert read_config(out_dir) == PocketConfig(pocket.url, _FAKE_TOKEN)
+        assert _FAKE_TOKEN not in page.content()
+        assert pocket.recorded("GET", "/api/v1/upload/capabilities")[-1].header(
+            "Authorization"
+        ) == f"Bearer {_FAKE_TOKEN}"
+
+
+@_needs_browser
+def test_pocket_settings_dialog_leads_to_the_change_and_disconnect_dialogs(tmp_path):
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, _pocket):
+        _wait_connected_header(page)
+        config_before = (out_dir / ".pocket" / "config.json").read_bytes()
+
+        _open_settings(page)
+        assert page.locator("#sw-pocket-settings-title").text_content() == "音源ポケットの設定"
+        assert page.locator("#sw-pocket-settings-dialog .sw-settings-list button").all_text_contents() == [
+            "接続先を変更",
+            "接続を解除",
+        ]
+        assert page.locator("#sw-pocket-settings-dialog .sw-settings-list p").all_text_contents() == [
+            "URL や upload token を入れ直す",
+            "この出力先に保存した接続設定を消す",
+        ]
+        # Closing changes nothing.
+        page.click("#sw-settings-close")
+        assert not _is_open(page, "#sw-pocket-settings-dialog")
+        assert not _is_open(page, "#sw-connect-dialog")
+        assert not _is_open(page, "#sw-disconnect-dialog")
+        _wait_connected_header(page)
+
+        _open_settings(page)
+        page.click("#sw-settings-change")
+        page.wait_for_selector("#sw-connect-dialog[open]")
+        assert not _is_open(page, "#sw-pocket-settings-dialog")
+        assert page.locator("#sw-connect-title").text_content() == "接続先を変更"
+        assert page.locator("#sw-connect-submit").text_content() == "置き換える"
+        assert page.locator("#sw-connect-description").text_content().startswith("現在の接続を置き換えます。")
+        page.click("#sw-connect-cancel")
+        assert not _is_open(page, "#sw-connect-dialog")
+
+        _open_settings(page)
+        page.click("#sw-settings-disconnect")
+        page.wait_for_selector("#sw-disconnect-dialog[open]")
+        assert not _is_open(page, "#sw-pocket-settings-dialog")
+        assert page.locator("#sw-disconnect-title").text_content() == "音源ポケットとの接続を解除しますか？"
+        assert page.locator("#sw-disconnect-dialog li").all_text_contents() == [
+            "この出力先に保存した接続先と upload token を消します。",
+            "音源ポケットにある曲と、手元の曲は消えません。",
+            "もう一度使うには、接続し直してください。",
+        ]
+        # Cancelling changes nothing either.
+        page.click("#sw-disconnect-cancel")
+        assert not _is_open(page, "#sw-disconnect-dialog")
+        _wait_connected_header(page)
+        assert (out_dir / ".pocket" / "config.json").read_bytes() == config_before
+
+        # The song list's own controls gained no button.
+        assert page.locator("#sw-pocket-controls button").all_text_contents() == [
+            "全曲アップロード",
+            "状態を再読込",
+        ]
+
+
+@_needs_browser
+def test_changing_the_connection_from_the_page_replaces_the_saved_settings(tmp_path):
+    from bunri.pocket.config import PocketConfig, read_config
+
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, _first), running_fake_pocket() as second:
+        _wait_connected_header(page)
+        _open_settings(page)
+        page.click("#sw-settings-change")
+        page.wait_for_selector("#sw-connect-dialog[open]")
+        page.fill("#sw-connect-url", second.url)
+        page.fill("#sw-connect-token", _OTHER_FAKE_TOKEN)
+        with page.expect_response("**/api/pocket/connect") as connect_info:
+            page.click("#sw-connect-submit")
+        body = connect_info.value.json()
+        assert body["replaced"] is True
+        assert second.url not in connect_info.value.text() and _OTHER_FAKE_TOKEN not in connect_info.value.text()
+        page.wait_for_function("!document.getElementById('sw-connect-dialog').open")
+        _wait_connected_header(page)
+        assert read_config(out_dir) == PocketConfig(second.url, _OTHER_FAKE_TOKEN)
+        assert _OTHER_FAKE_TOKEN not in page.content() and _FAKE_TOKEN not in page.content()
+        # The page now follows the new connection.
+        assert page.evaluate(
+            "fetch('/api/pocket/job').then(r => r.json()).then(b => b.connection_fingerprint)"
+        ) == body["connection_fingerprint"]
+
+
+@_needs_browser
+def test_disconnecting_from_the_page_removes_the_settings_and_the_pocket_ui(tmp_path):
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, _pocket):
+        _wait_connected_header(page)
+        page.wait_for_selector("#sw-pocket-controls", state="visible")
+
+        _open_settings(page)
+        page.click("#sw-settings-disconnect")
+        page.wait_for_selector("#sw-disconnect-dialog[open]")
+        with page.expect_request(
+            lambda request: request.method == "DELETE" and "/api/pocket/connection" in request.url
+        ) as request_info:
+            page.click("#sw-disconnect-confirm")
+        assert request_info.value.header_value("origin") is not None
+        _wait_disconnected_header(page)
+        assert not _is_open(page, "#sw-disconnect-dialog")
+        assert not (out_dir / ".pocket" / "config.json").exists()
+        assert page.locator("#sw-remote-only").is_hidden()
+        assert page.evaluate("fetch('/api/pocket/job').then(r => r.json()).then(b => b.connected)") is False
+
+
+@_needs_browser
+def test_disconnect_conflict_shows_the_reason_and_rereads_the_connection(tmp_path):
+    out_dir = tmp_path / "out"
+    with _page_with_fake_pocket(out_dir, connected=True) as (page, _pocket):
+        _wait_connected_header(page)
+        # The settings disappear behind the page's back.
+        (out_dir / ".pocket" / "config.json").unlink()
+
+        _open_settings(page)
+        page.click("#sw-settings-disconnect")
+        page.wait_for_selector("#sw-disconnect-dialog[open]")
+        page.click("#sw-disconnect-confirm")
+        page.wait_for_function(
+            "document.getElementById('sw-disconnect-error').textContent === 'Pocket の接続設定がありません。'"
+        )
+        assert _is_open(page, "#sw-disconnect-dialog")
+        assert page.locator("#sw-disconnect-confirm").text_content() == "解除する"
+        page.click("#sw-disconnect-cancel")
+        assert not _is_open(page, "#sw-disconnect-dialog")
+        _wait_disconnected_header(page)
