@@ -6,7 +6,7 @@ import stat
 
 import pytest
 
-from bunri.pocket.config import PocketConfig, read_config, save_config, validate_base_url, validate_capabilities, validate_token
+from bunri.pocket.config import PocketConfig, delete_config, read_config, save_config, validate_base_url, validate_capabilities, validate_token
 
 
 TOKEN = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
@@ -77,3 +77,63 @@ def test_read_reports_typed_config_fields_as_corrupt(tmp_path, changes):
     with pytest.raises(ValueError, match="設定ファイルが壊れています") as exc:
         read_config(tmp_path)
     assert TOKEN not in str(exc.value)
+
+
+def test_delete_config_without_settings_changes_nothing(tmp_path):
+    assert delete_config(tmp_path) is False
+    assert list(tmp_path.iterdir()) == []
+    (tmp_path / ".pocket").mkdir()
+    (tmp_path / ".pocket" / "sync.lock").write_bytes(b"")
+    assert delete_config(tmp_path) is False
+    assert [path.name for path in (tmp_path / ".pocket").iterdir()] == ["sync.lock"]
+
+
+def test_delete_config_removes_only_the_settings_file(tmp_path):
+    save_config(tmp_path, PocketConfig("https://example.invalid", TOKEN))
+    (tmp_path / ".pocket" / "sync.lock").write_bytes(b"")
+    assert delete_config(tmp_path) is True
+    assert not (tmp_path / ".pocket" / "config.json").exists()
+    assert (tmp_path / ".pocket").is_dir()
+    assert (tmp_path / ".pocket" / "sync.lock").exists()
+    assert read_config(tmp_path) is None
+    assert delete_config(tmp_path) is False
+
+
+def test_delete_config_removes_settings_it_cannot_read(tmp_path):
+    (tmp_path / ".pocket").mkdir()
+    (tmp_path / ".pocket" / "config.json").write_text("{ not json")
+    assert delete_config(tmp_path) is True
+    assert read_config(tmp_path) is None
+
+
+def test_delete_config_refuses_a_symlinked_directory(tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    save_config(elsewhere, PocketConfig("https://example.invalid", TOKEN))
+    out = tmp_path / "out"; out.mkdir()
+    (out / ".pocket").symlink_to(elsewhere / ".pocket", target_is_directory=True)
+    with pytest.raises(ValueError, match="Pocket 設定 directory が安全ではありません"):
+        delete_config(out)
+    assert (elsewhere / ".pocket" / "config.json").exists()
+    assert (out / ".pocket").is_symlink()
+
+
+def test_delete_config_refuses_a_symlinked_file(tmp_path):
+    target = tmp_path / "target.json"; target.write_text("keep me")
+    (tmp_path / ".pocket").mkdir()
+    (tmp_path / ".pocket" / "config.json").symlink_to(target)
+    with pytest.raises(ValueError, match="Pocket 設定 file が安全ではありません"):
+        delete_config(tmp_path)
+    assert target.read_text() == "keep me"
+    assert (tmp_path / ".pocket" / "config.json").is_symlink()
+
+
+def test_delete_config_refuses_a_dangling_symlink_and_a_directory(tmp_path):
+    (tmp_path / ".pocket").mkdir()
+    (tmp_path / ".pocket" / "config.json").symlink_to(tmp_path / "missing.json")
+    with pytest.raises(ValueError, match="Pocket 設定 file が安全ではありません"):
+        delete_config(tmp_path)
+    (tmp_path / ".pocket" / "config.json").unlink()
+    (tmp_path / ".pocket" / "config.json").mkdir()
+    with pytest.raises(ValueError, match="Pocket 設定 file が安全ではありません"):
+        delete_config(tmp_path)
+    assert (tmp_path / ".pocket" / "config.json").is_dir()

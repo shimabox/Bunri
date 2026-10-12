@@ -140,3 +140,23 @@ def read_config(out_dir: Path) -> PocketConfig | None:
         return PocketConfig(validate_base_url(value["base_url"]), validate_token(value["token"]))
     except ValueError as exc:
         raise ValueError("設定ファイルが壊れています。`bunri pocket connect` をやり直してください") from exc
+
+
+def delete_config(out_dir: Path) -> bool:
+    """Remove the saved connection; False when there was none to remove.
+
+    Only config.json goes: the .pocket directory and its lock file stay.
+    """
+    directory, path = out_dir / ".pocket", _path(out_dir)
+    if not directory.exists() and not directory.is_symlink(): return False
+    if directory.is_symlink() or not directory.is_dir(): raise ValueError(f"Pocket 設定 directory が安全ではありません: {directory}")
+    if not path.exists() and not path.is_symlink(): return False
+    if not is_real_file_in(path, directory.resolve()): raise ValueError(f"Pocket 設定 file が安全ではありません: {path}")
+    path.unlink()
+    dir_fd: int | None = None
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY); os.fsync(dir_fd)
+    except OSError: pass
+    finally:
+        if dir_fd is not None: os.close(dir_fd)
+    return True

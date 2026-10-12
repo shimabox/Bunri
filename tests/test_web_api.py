@@ -22,6 +22,9 @@ from fastapi.testclient import TestClient
 import bunri.web.app as app_module
 from bunri.web.app import create_app
 from bunri.web.jobs import safe_filename
+from pocket_fake import OTHER_TOKEN as OTHER_POCKET_TOKEN
+from pocket_fake import TOKEN as POCKET_TOKEN
+from pocket_fake import FakePocketClient, running_fake_pocket
 
 
 class ApiFakeRunner:
@@ -2593,3 +2596,656 @@ def test_lr_split_added_later_shows_up_in_the_song_list(tmp_path, monkeypatch):
         after = client.get("/api/songs").json()[0]["targets"][0]
         assert [g["track"] for g in after["downloads"]] == ["target", "backing", "left", "right"]
         assert after["status"] == before["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Pocket connection settings: connect, reset the viewing password, disconnect
+# ---------------------------------------------------------------------------
+_SAME_ORIGIN = {"Origin": "http://testserver"}
+_JSON = {**_SAME_ORIGIN, "Content-Type": "application/json"}
+_SHELF_URL = "https://settings-pocket.invalid/shelf"
+_OTHER_SHELF_URL = "https://other-pocket.invalid"
+_RESET_SALT = bytes(range(16, 32))
+_RESET_KEY = bytes(range(100, 132))
+_BUSY_DETAIL = "別の Pocket 操作が実行中です。完了後に再実行してください。"
+_UNCHANGED = "閲覧パスワードは変わっていません。"
+
+
+def _fingerprint(url: str) -> str:
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def _save_shelf(out_dir: Path, url: str = _SHELF_URL, token: str = POCKET_TOKEN) -> str:
+    from bunri.pocket.config import PocketConfig, save_config
+
+    save_config(out_dir, PocketConfig(url, token))
+    return _fingerprint(url)
+
+
+def _config_bytes(out_dir: Path) -> bytes | None:
+    path = out_dir / ".pocket" / "config.json"
+    return path.read_bytes() if path.exists() else None
+
+
+def _reset_document() -> dict:
+    from bunri.pocket.password import build_reset_body
+
+    return json.loads(build_reset_body(_RESET_SALT, _RESET_KEY))
+
+
+@pytest.fixture()
+def settings(tmp_path, monkeypatch):
+    """A TestClient whose Pocket is a fake; `settings.pocket` can be replaced
+    before a request to choose how that Pocket answers."""
+    import bunri.pocket.password as password_module
+    import bunri.web.pocket_settings as pocket_settings
+
+    class Holder:
+        pocket = FakePocketClient()
+
+    holder = Holder()
+    monkeypatch.setattr(
+        pocket_settings, "PocketHTTPClient", lambda *args: holder.pocket(*args)
+    )
+    monkeypatch.setattr(password_module, "CONFIRM_INTERVAL_SECONDS", 0)
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with TestClient(app) as c:
+        holder.client = c
+        holder.out_dir = tmp_path
+        yield holder
+
+
+def _settings_request(settings, endpoint: str, *, headers: dict, fingerprint: str | None = None, content: bytes | None = None):
+    if endpoint == "connect":
+        body = content if content is not None else json.dumps({"url": _OTHER_SHELF_URL, "token": OTHER_POCKET_TOKEN}).encode()
+        return settings.client.post("/api/pocket/connect", content=body, headers=headers)
+    query = f"?pocket_fingerprint={fingerprint}" if fingerprint is not None else ""
+    if endpoint == "password-reset":
+        body = content if content is not None else json.dumps(_reset_document()).encode()
+        return settings.client.post(f"/api/pocket/password-reset{query}", content=body, headers=headers)
+    assert endpoint == "disconnect"
+    return settings.client.delete(f"/api/pocket/connection{query}", headers=headers)
+
+
+def _assert_no_pocket_secrets(response) -> None:
+    from bunri.pocket.password import b64url
+
+    text = response.text
+    for secret in (
+        POCKET_TOKEN,
+        OTHER_POCKET_TOKEN,
+        "settings-pocket.invalid",
+        "other-pocket.invalid",
+        b64url(_RESET_SALT),
+        b64url(_RESET_KEY),
+    ):
+        assert secret not in text
+    assert "127.0.0.1:" not in text
+
+
+_SETTINGS_ENDPOINTS = ["connect", "password-reset", "disconnect"]
+_BODY_ENDPOINTS = ["connect", "password-reset"]
+
+
+@pytest.mark.parametrize("endpoint", _SETTINGS_ENDPOINTS)
+@pytest.mark.parametrize(
+    "origin",
+    [None, "http://evil.example.com", "http://testserver:9999", "http://testserver:not-a-port", "null"],
+)
+def test_pocket_settings_need_this_origin(settings, endpoint, origin):
+    fingerprint = _save_shelf(settings.out_dir)
+    before = _config_bytes(settings.out_dir)
+    headers = {"Content-Type": "application/json"}
+    if origin is not None:
+        headers["Origin"] = origin
+    response = _settings_request(settings, endpoint, headers=headers, fingerprint=fingerprint)
+    assert response.status_code == 403
+    if origin is None:
+        assert response.json()["detail"] == "この操作はブラウザの Bunri 画面からだけ実行できます。"
+    assert settings.pocket.created == [] and settings.pocket.bodies == []
+    assert _config_bytes(settings.out_dir) == before
+    _assert_no_pocket_secrets(response)
+
+
+@pytest.mark.parametrize("endpoint", _BODY_ENDPOINTS)
+@pytest.mark.parametrize(
+    "content_type",
+    ["text/plain", "multipart/form-data; boundary=x", "application/x-www-form-urlencoded", None],
+)
+def test_pocket_settings_with_a_body_need_json(settings, endpoint, content_type):
+    fingerprint = _save_shelf(settings.out_dir)
+    before = _config_bytes(settings.out_dir)
+    headers = dict(_SAME_ORIGIN)
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    response = _settings_request(settings, endpoint, headers=headers, fingerprint=fingerprint)
+    assert response.status_code == 415
+    assert response.json()["detail"] == "Content-Type は application/json にしてください。"
+    assert settings.pocket.created == []
+    assert _config_bytes(settings.out_dir) == before
+
+
+@pytest.mark.parametrize("endpoint", _BODY_ENDPOINTS)
+@pytest.mark.parametrize("content_type", ["application/json", "application/json; charset=utf-8", "Application/JSON"])
+def test_pocket_settings_json_passes_the_guard(settings, endpoint, content_type):
+    fingerprint = _save_shelf(settings.out_dir)
+    response = _settings_request(
+        settings, endpoint, headers={**_SAME_ORIGIN, "Content-Type": content_type}, fingerprint=fingerprint
+    )
+    assert response.status_code == 200, response.text
+    _assert_no_pocket_secrets(response)
+
+
+def test_pocket_disconnect_passes_the_guard_without_a_content_type(settings):
+    fingerprint = _save_shelf(settings.out_dir)
+    response = _settings_request(settings, "disconnect", headers=_SAME_ORIGIN, fingerprint=fingerprint)
+    assert response.status_code == 204
+
+
+@pytest.mark.parametrize("endpoint", _BODY_ENDPOINTS)
+@pytest.mark.parametrize("declare_length", [True, False])
+def test_pocket_settings_refuse_a_body_over_4096_bytes(settings, endpoint, declare_length):
+    fingerprint = _save_shelf(settings.out_dir)
+    before = _config_bytes(settings.out_dir)
+    document = {"url": _OTHER_SHELF_URL, "token": OTHER_POCKET_TOKEN} if endpoint == "connect" else _reset_document()
+    body = json.dumps(document).encode()
+    oversized = body + b" " * (4097 - len(body))
+    assert len(oversized) == 4097
+    # Without a declared length the body arrives chunked and is counted as read.
+    content = oversized if declare_length else iter([oversized[:2000], oversized[2000:]])
+    response = _settings_request(settings, endpoint, headers=_JSON, fingerprint=fingerprint, content=content)
+    assert response.status_code == 413
+    assert settings.pocket.created == []
+    assert _config_bytes(settings.out_dir) == before
+    # One byte less is read and handled.
+    accepted = _settings_request(settings, endpoint, headers=_JSON, fingerprint=fingerprint, content=oversized[:-1])
+    assert accepted.status_code == 200, accepted.text
+
+
+# -- connect ----------------------------------------------------------------
+
+
+def _post_connect(settings, document=None, *, content: bytes | None = None):
+    body = content if content is not None else json.dumps(document).encode()
+    return settings.client.post("/api/pocket/connect", content=body, headers=_JSON)
+
+
+def test_pocket_connect_saves_the_settings_and_returns_only_the_fingerprint(settings):
+    import stat
+
+    from bunri.pocket.config import PocketConfig, read_config
+
+    response = _post_connect(settings, {"url": _SHELF_URL + "/", "token": POCKET_TOKEN})
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "connection_fingerprint": _fingerprint(_SHELF_URL),
+        "replaced": False,
+        "warnings": [],
+    }
+    assert settings.pocket.created == [(_SHELF_URL, POCKET_TOKEN)]
+    assert read_config(settings.out_dir) == PocketConfig(_SHELF_URL, POCKET_TOKEN)
+    assert stat.S_IMODE((settings.out_dir / ".pocket").stat().st_mode) == 0o700
+    assert stat.S_IMODE((settings.out_dir / ".pocket" / "config.json").stat().st_mode) == 0o600
+    assert settings.client.get("/api/pocket/job").json()["connection_fingerprint"] == _fingerprint(_SHELF_URL)
+    _assert_no_pocket_secrets(response)
+
+
+def test_pocket_connect_replaces_an_existing_connection(settings):
+    from bunri.pocket.config import PocketConfig, read_config
+
+    _save_shelf(settings.out_dir)
+    response = _post_connect(settings, {"url": _OTHER_SHELF_URL, "token": OTHER_POCKET_TOKEN})
+    assert response.status_code == 200, response.text
+    assert response.json()["replaced"] is True
+    assert response.json()["connection_fingerprint"] == _fingerprint(_OTHER_SHELF_URL)
+    assert read_config(settings.out_dir) == PocketConfig(_OTHER_SHELF_URL, OTHER_POCKET_TOKEN)
+    assert POCKET_TOKEN.encode() not in _config_bytes(settings.out_dir)
+    _assert_no_pocket_secrets(response)
+
+
+def test_pocket_connect_overwrites_unreadable_settings(settings):
+    from bunri.pocket.config import PocketConfig, read_config
+
+    (settings.out_dir / ".pocket").mkdir()
+    (settings.out_dir / ".pocket" / "config.json").write_text("{ not json", encoding="utf-8")
+    response = _post_connect(settings, {"url": _SHELF_URL, "token": POCKET_TOKEN})
+    assert response.status_code == 200, response.text
+    assert response.json()["replaced"] is False
+    assert read_config(settings.out_dir) == PocketConfig(_SHELF_URL, POCKET_TOKEN)
+    _assert_no_pocket_secrets(response)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        json.dumps({"url": _SHELF_URL, "token": POCKET_TOKEN, "output": "elsewhere"}).encode(),
+        json.dumps({"url": _SHELF_URL}).encode(),
+        json.dumps({"token": POCKET_TOKEN}).encode(),
+        json.dumps({"url": [_SHELF_URL], "token": POCKET_TOKEN}).encode(),
+        json.dumps({"url": _SHELF_URL, "token": 12345}).encode(),
+        json.dumps([_SHELF_URL, POCKET_TOKEN]).encode(),
+        b"url=" + _SHELF_URL.encode(),
+        b"\xff\xfe",
+        b"",
+    ],
+)
+def test_pocket_connect_rejects_any_other_body(settings, content):
+    response = _post_connect(settings, content=content)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "要求の形式が不正です。"
+    assert settings.pocket.created == []
+    assert not (settings.out_dir / ".pocket").exists()
+    _assert_no_pocket_secrets(response)
+
+
+@pytest.mark.parametrize(
+    ("url", "token", "detail"),
+    [
+        ("ftp://settings-pocket.invalid", POCKET_TOKEN, "Pocket URL には https と host が必要です"),
+        ("https://user:pass@settings-pocket.invalid", POCKET_TOKEN, "Pocket URL に userinfo、query、fragment は指定できません"),
+        ("http://example.com", POCKET_TOKEN, "http は localhost または loopback address だけで使用できます"),
+        (_SHELF_URL, "c2hvcnQ", "upload token が短すぎます"),
+        (_SHELF_URL, "not a token!", "upload token の形式が不正です"),
+    ],
+)
+def test_pocket_connect_reports_bad_input_without_asking_the_pocket(settings, url, token, detail):
+    response = _post_connect(settings, {"url": url, "token": token})
+    assert response.status_code == 400
+    assert response.json()["detail"] == detail
+    assert settings.pocket.created == []
+    assert _config_bytes(settings.out_dir) is None
+    assert "user:pass" not in response.text and "not a token!" not in response.text
+    _assert_no_pocket_secrets(response)
+
+
+def _connect_failures():
+    from bunri.pocket.http import PocketHTTPError
+
+    return {
+        "401": (PocketHTTPError(401, "UNAUTHORIZED", _SHELF_URL), "upload token が違います。音源ポケットの設定画面で確認してください。"),
+        "404": (PocketHTTPError(404, None, _SHELF_URL), "接続先に音源ポケットの API が見つかりません。URL を確認してください。"),
+        "500": (PocketHTTPError(500, "INTERNAL", _SHELF_URL), "音源ポケットとの通信に失敗しました(HTTP 500)。"),
+        "os_error": (OSError("getaddrinfo failed for settings-pocket.invalid"), "音源ポケットに接続できませんでした。URL を確認してください。"),
+        "incompatible": ({"api": {"major": 2}}, "Pocket capabilities の api.major が対応していません"),
+        "not_an_object": (["api"], "Pocket capabilities に api.major がありません"),
+    }
+
+
+@pytest.mark.parametrize("name", ["401", "404", "500", "os_error", "incompatible", "not_an_object"])
+def test_pocket_connect_saves_nothing_when_the_pocket_does_not_answer_well(settings, name):
+    answer, detail = _connect_failures()[name]
+    settings.pocket = FakePocketClient(answer)
+    response = _post_connect(settings, {"url": _SHELF_URL, "token": POCKET_TOKEN})
+    assert response.status_code == 502
+    assert response.json()["detail"] == detail
+    assert len(settings.pocket.created) == 1
+    assert _config_bytes(settings.out_dir) is None
+    _assert_no_pocket_secrets(response)
+
+
+def test_pocket_connect_reports_a_failed_save(settings, monkeypatch):
+    import bunri.pocket.connect as connect_module
+
+    def refuse(*_args):
+        raise OSError(f"cannot write {settings.out_dir}/.pocket/config.json")
+
+    monkeypatch.setattr(connect_module, "save_config", refuse)
+    response = _post_connect(settings, {"url": _SHELF_URL, "token": POCKET_TOKEN})
+    assert response.status_code == 500
+    assert response.json()["detail"] == "接続設定を保存できませんでした。"
+    assert _config_bytes(settings.out_dir) is None
+    _assert_no_pocket_secrets(response)
+
+
+def test_pocket_connect_waits_for_a_running_pocket_operation(settings):
+    from bunri.pocket.lock import SyncLock
+
+    _save_shelf(settings.out_dir)
+    before = _config_bytes(settings.out_dir)
+    with SyncLock(settings.out_dir):
+        response = _post_connect(settings, {"url": _OTHER_SHELF_URL, "token": OTHER_POCKET_TOKEN})
+    assert response.status_code == 409
+    assert response.json()["detail"] == _BUSY_DETAIL
+    assert settings.pocket.created == []
+    assert _config_bytes(settings.out_dir) == before
+    _assert_no_pocket_secrets(response)
+    # The lock is released again afterwards.
+    assert _post_connect(settings, {"url": _OTHER_SHELF_URL, "token": OTHER_POCKET_TOKEN}).status_code == 200
+
+
+def test_pocket_connect_reaches_a_loopback_pocket_over_http(tmp_path):
+    from bunri.pocket.config import PocketConfig, read_config
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with running_fake_pocket() as pocket, TestClient(app) as c:
+        response = c.post(
+            "/api/pocket/connect",
+            content=json.dumps({"url": pocket.url, "token": POCKET_TOKEN}).encode(),
+            headers=_JSON,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["connection_fingerprint"] == _fingerprint(pocket.url)
+        (request,) = pocket.requests
+        assert (request.method, request.path) == ("GET", "/api/v1/upload/capabilities")
+        assert request.header("Authorization") == f"Bearer {POCKET_TOKEN}"
+        assert read_config(tmp_path) == PocketConfig(pocket.url, POCKET_TOKEN)
+        _assert_no_pocket_secrets(response)
+
+
+# -- disconnect -------------------------------------------------------------
+
+
+def _delete_connection(settings, fingerprint: str | None):
+    return _settings_request(settings, "disconnect", headers=_SAME_ORIGIN, fingerprint=fingerprint)
+
+
+def test_pocket_disconnect_needs_the_fingerprint_of_the_saved_connection(settings):
+    missing = _delete_connection(settings, None)
+    assert missing.status_code == 409
+    assert missing.json()["detail"] == (
+        "Pocket の接続先を確認できないため解除を中止しました。状態を再読込して確認し直してください。"
+    )
+    not_connected = _delete_connection(settings, _fingerprint(_SHELF_URL))
+    assert not_connected.status_code == 409
+    assert not_connected.json()["detail"] == "Pocket の接続設定がありません。"
+
+    _save_shelf(settings.out_dir)
+    before = _config_bytes(settings.out_dir)
+    changed = _delete_connection(settings, _fingerprint(_OTHER_SHELF_URL))
+    assert changed.status_code == 409
+    assert changed.json()["detail"] == (
+        "Pocket の接続先が変更されたため解除を中止しました。状態を再読込して確認し直してください。"
+    )
+    assert _config_bytes(settings.out_dir) == before
+    for response in (missing, not_connected, changed):
+        _assert_no_pocket_secrets(response)
+
+
+def test_pocket_disconnect_reports_unreadable_settings(settings):
+    (settings.out_dir / ".pocket").mkdir()
+    (settings.out_dir / ".pocket" / "config.json").write_text("{ not json", encoding="utf-8")
+    response = _delete_connection(settings, _fingerprint(_SHELF_URL))
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Pocket の接続設定を確認できません。"
+    assert (settings.out_dir / ".pocket" / "config.json").exists()
+
+
+def test_pocket_disconnect_waits_for_a_running_pocket_operation(settings):
+    from bunri.pocket.lock import SyncLock
+
+    fingerprint = _save_shelf(settings.out_dir)
+    before = _config_bytes(settings.out_dir)
+    with SyncLock(settings.out_dir):
+        response = _delete_connection(settings, fingerprint)
+    assert response.status_code == 409
+    assert response.json()["detail"] == _BUSY_DETAIL
+    assert _config_bytes(settings.out_dir) == before
+    _assert_no_pocket_secrets(response)
+
+
+def test_pocket_disconnect_removes_only_the_saved_settings(settings):
+    fingerprint = _save_shelf(settings.out_dir)
+    assert settings.client.get("/api/pocket/job").json()["connected"] is True
+    response = _delete_connection(settings, fingerprint)
+    assert response.status_code == 204
+    assert response.content == b""
+    assert not (settings.out_dir / ".pocket" / "config.json").exists()
+    assert (settings.out_dir / ".pocket").is_dir()
+    assert (settings.out_dir / ".pocket" / "sync.lock").exists()
+    job = settings.client.get("/api/pocket/job").json()
+    assert job["connected"] is False and job["connection_fingerprint"] is None
+    assert settings.pocket.created == []
+    _assert_no_pocket_secrets(response)
+    # The lock is released: connecting again works.
+    assert _post_connect(settings, {"url": _SHELF_URL, "token": POCKET_TOKEN}).status_code == 200
+
+
+def test_pocket_disconnect_reports_a_failed_removal(settings, monkeypatch):
+    import bunri.web.pocket_settings as pocket_settings
+
+    fingerprint = _save_shelf(settings.out_dir)
+
+    def refuse(_out_dir):
+        raise OSError(f"cannot remove {_SHELF_URL}")
+
+    monkeypatch.setattr(pocket_settings, "delete_config", refuse)
+    response = _delete_connection(settings, fingerprint)
+    assert response.status_code == 500
+    assert response.json()["detail"] == "接続設定を削除できませんでした。"
+    assert _config_bytes(settings.out_dir) is not None
+    _assert_no_pocket_secrets(response)
+
+
+# -- password reset ---------------------------------------------------------
+
+
+def _post_reset(settings, fingerprint: str | None, document=None, *, content: bytes | None = None):
+    body = content if content is not None else json.dumps(_reset_document() if document is None else document).encode()
+    return _settings_request(settings, "password-reset", headers=_JSON, fingerprint=fingerprint, content=body)
+
+
+def test_pocket_password_reset_needs_the_fingerprint_of_the_saved_connection(settings):
+    missing = _post_reset(settings, None)
+    assert missing.status_code == 409
+    assert missing.json()["detail"] == (
+        "Pocket の接続先を確認できないため再設定を中止しました。状態を再読込して確認し直してください。"
+    )
+    not_connected = _post_reset(settings, _fingerprint(_SHELF_URL))
+    assert not_connected.status_code == 409
+    assert not_connected.json()["detail"] == "Pocket の接続設定がありません。"
+
+    _save_shelf(settings.out_dir)
+    changed = _post_reset(settings, _fingerprint(_OTHER_SHELF_URL))
+    assert changed.status_code == 409
+    assert changed.json()["detail"] == (
+        "Pocket の接続先が変更されたため再設定を中止しました。状態を再読込して確認し直してください。"
+    )
+    assert settings.pocket.created == [] and settings.pocket.bodies == []
+    for response in (missing, not_connected, changed):
+        assert response.headers["cache-control"] == "no-store"
+        _assert_no_pocket_secrets(response)
+
+
+def test_pocket_password_reset_rebuilds_the_document_it_sends(settings):
+    from bunri.pocket.password import build_reset_body
+
+    fingerprint = _save_shelf(settings.out_dir)
+    document = _reset_document()
+    # Same values, another key order and spacing: what reaches the Pocket is
+    # built here, not passed through.
+    reordered = {
+        "derived_key": document["derived_key"],
+        "kdf": dict(reversed(list(document["kdf"].items()))),
+    }
+    content = json.dumps(reordered, indent=2).encode()
+    assert content != build_reset_body(_RESET_SALT, _RESET_KEY)
+    response = _post_reset(settings, fingerprint, content=content)
+    assert response.status_code == 200, response.text
+    assert settings.pocket.created == [(_SHELF_URL, POCKET_TOKEN)]
+    assert settings.pocket.bodies == [build_reset_body(_RESET_SALT, _RESET_KEY)]
+    body = response.json()
+    assert set(body) == {"state", "via", "messages"}
+    assert (body["state"], body["via"]) == ("completed", "response")
+    assert body["messages"][0] == "閲覧パスワードを決め直しました。"
+    assert len(body["messages"]) == 4
+    assert response.headers["cache-control"] == "no-store"
+    assert settings.pocket.auth_calls == 0
+    assert settings.client.get("/api/jobs").json() == []
+    _assert_no_pocket_secrets(response)
+
+
+def _bad_reset_documents():
+    from bunri.pocket.password import b64url
+
+    def changed(**kdf):
+        document = _reset_document()
+        document["kdf"].update(kdf)
+        return document
+
+    extra = _reset_document()
+    extra["password"] = "plain-text-must-not-echo"
+    missing = _reset_document()
+    del missing["kdf"]["dk_len"]
+    short_key = _reset_document()
+    short_key["derived_key"] = b64url(_RESET_KEY[:31])
+    return {
+        "extra key": extra,
+        "missing kdf key": missing,
+        "salt of 15 bytes": changed(salt=b64url(_RESET_SALT[:15])),
+        "non-canonical salt": changed(salt=b64url(_RESET_SALT)[:-1] + "x"),
+        "fewer iterations": changed(iterations=1000),
+        "derived_key of 31 bytes": short_key,
+        "not an object": [_reset_document()],
+    }
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["extra key", "missing kdf key", "salt of 15 bytes", "non-canonical salt", "fewer iterations", "derived_key of 31 bytes", "not an object"],
+)
+def test_pocket_password_reset_rejects_any_other_document(settings, name):
+    fingerprint = _save_shelf(settings.out_dir)
+    response = _post_reset(settings, fingerprint, _bad_reset_documents()[name])
+    assert response.status_code == 400
+    assert response.json()["detail"] == "要求の形式が不正です。画面を再読込してやり直してください。"
+    assert settings.pocket.created == [] and settings.pocket.bodies == []
+    assert "plain-text-must-not-echo" not in response.text
+    assert response.headers["cache-control"] == "no-store"
+    _assert_no_pocket_secrets(response)
+
+
+def test_pocket_password_reset_rejects_a_body_that_is_not_json(settings):
+    fingerprint = _save_shelf(settings.out_dir)
+    for content in (b"{ not json", b"\xff\xfe", b""):
+        response = _post_reset(settings, fingerprint, content=content)
+        assert response.status_code == 400
+        assert response.json()["detail"] == "要求の形式が不正です。画面を再読込してやり直してください。"
+    assert settings.pocket.created == []
+
+
+def _probe_failures():
+    from bunri.pocket.http import PocketHTTPError
+
+    unsupported = "この音源ポケットは閲覧パスワードの再設定に未対応です。音源ポケットを 0.4.0 以降へ更新してください。"
+    return {
+        "older": ({"api": {"major": 1}, "features": {"pan_split": True}}, 409, unsupported),
+        "flag_off": ({"api": {"major": 1}, "features": {"password_reset": False}}, 409, unsupported),
+        "list": (["features"], 502, "音源ポケットの対応状況を確認できませんでした。"),
+        "text": ("password_reset", 502, "音源ポケットの対応状況を確認できませんでした。"),
+        "os_error": (OSError("cannot reach settings-pocket.invalid"), 502, "音源ポケットに接続できませんでした。"),
+        "401": (PocketHTTPError(401, "UNAUTHORIZED", _SHELF_URL), 502, "upload token が無効です。音源ポケットで token を再発行した場合は接続し直してください。"),
+    }
+
+
+@pytest.mark.parametrize("name", ["older", "flag_off", "list", "text", "os_error", "401"])
+def test_pocket_password_reset_stops_before_sending_when_support_is_not_confirmed(settings, name):
+    answer, status, message = _probe_failures()[name]
+    fingerprint = _save_shelf(settings.out_dir)
+    settings.pocket = FakePocketClient(answer)
+    response = _post_reset(settings, fingerprint)
+    assert response.status_code == status
+    assert response.json()["detail"] == message + _UNCHANGED
+    if status == 502:
+        assert "未対応" not in response.text
+    assert settings.pocket.bodies == []
+    assert response.headers["cache-control"] == "no-store"
+    _assert_no_pocket_secrets(response)
+
+
+def _reset_rejections():
+    from bunri.pocket.http import PocketHTTPError
+
+    return {
+        "401": (PocketHTTPError(401, "UNAUTHORIZED", _SHELF_URL), "upload token が無効です。音源ポケットで token を再発行した場合は接続し直してください。"),
+        "404": (PocketHTTPError(404, "NOT_FOUND", _SHELF_URL), "音源ポケットに再設定の経路がありません。音源ポケットを 0.4.0 以降へ更新するか、接続先 URL を確認してください。"),
+        "422": (PocketHTTPError(422, "UNSUPPORTED_KDF", _SHELF_URL), "この Bunri の鍵導出方式を音源ポケットが受け付けません。Bunri を更新してください。"),
+    }
+
+
+@pytest.mark.parametrize("name", ["401", "404", "422"])
+def test_pocket_password_reset_reports_a_rejection_as_a_result(settings, name):
+    failure, message = _reset_rejections()[name]
+    fingerprint = _save_shelf(settings.out_dir)
+    settings.pocket = FakePocketClient(reset=failure)
+    response = _post_reset(settings, fingerprint)
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "state": "not_applied",
+        "via": "response",
+        "messages": [message, _UNCHANGED],
+    }
+    assert settings.pocket.auth_calls == 0
+    _assert_no_pocket_secrets(response)
+
+
+def test_pocket_password_reset_503_is_retry_later(settings):
+    from bunri.pocket.http import PocketHTTPError
+
+    fingerprint = _save_shelf(settings.out_dir)
+    settings.pocket = FakePocketClient(reset=PocketHTTPError(503, "AUTH_UNAVAILABLE", _SHELF_URL))
+    response = _post_reset(settings, fingerprint)
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "state": "retry_later",
+        "via": "response",
+        "messages": ["音源ポケットの認証情報または保存領域を利用できませんでした。時間をおいて同じ操作を再実行してください。"],
+    }
+    assert settings.pocket.auth_calls == 0
+    _assert_no_pocket_secrets(response)
+
+
+@pytest.mark.parametrize(
+    ("params", "state", "calls", "first_line"),
+    [
+        ([FakePocketClient.MATCH], "completed", 1, "音源ポケットからの応答を確認できなかったため、結果を問い合わせました。再設定は完了していました。"),
+        (["AAECAwQFBgcICQoLDA0ODw"] * 3, "not_applied", 3, "音源ポケットからの応答を確認できなかったため、結果を問い合わせました。再設定は反映されていません。閲覧パスワードは以前のままです。"),
+        ([], "unknown", 3, "音源ポケットからの応答を確認できなかったため、結果を問い合わせましたが、確認できませんでした。"),
+    ],
+)
+def test_pocket_password_reset_settles_a_lost_response_by_asking(settings, params, state, calls, first_line):
+    fingerprint = _save_shelf(settings.out_dir)
+    settings.pocket = FakePocketClient(
+        reset=OSError("timed out talking to settings-pocket.invalid"), params=params
+    )
+    response = _post_reset(settings, fingerprint)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert (body["state"], body["via"]) == (state, "auth_params")
+    assert body["messages"][0] == first_line
+    assert settings.pocket.auth_calls == calls
+    _assert_no_pocket_secrets(response)
+
+
+def test_pocket_password_reset_runs_while_the_mutation_lock_is_held(settings):
+    from bunri.pocket.lock import SyncLock
+
+    fingerprint = _save_shelf(settings.out_dir)
+    with SyncLock(settings.out_dir):
+        response = _post_reset(settings, fingerprint)
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "completed"
+    assert len(settings.pocket.bodies) == 1
+    assert settings.client.get("/api/jobs").json() == []
+
+
+def test_pocket_password_reset_reaches_a_loopback_pocket(tmp_path):
+    """The whole path with the real HTTP client: the request the Pocket sees
+    carries the saved token and the rebuilt document, and nothing else."""
+    from bunri.pocket.password import b64url, build_reset_body
+
+    app = create_app(tmp_path, runner=ApiFakeRunner())
+    with running_fake_pocket() as pocket, TestClient(app) as c:
+        fingerprint = _save_shelf(tmp_path, pocket.url)
+        response = c.post(
+            f"/api/pocket/password-reset?pocket_fingerprint={fingerprint}",
+            content=json.dumps(_reset_document()).encode(),
+            headers=_JSON,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["state"] == "completed"
+        (reset,) = pocket.recorded("POST", "/api/v1/password/reset")
+        assert reset.body == build_reset_body(_RESET_SALT, _RESET_KEY)
+        assert reset.header("Authorization") == f"Bearer {POCKET_TOKEN}"
+        assert reset.header("Origin") is None and reset.header("Cookie") is None
+        assert pocket.salt == b64url(_RESET_SALT)
+        _assert_no_pocket_secrets(response)

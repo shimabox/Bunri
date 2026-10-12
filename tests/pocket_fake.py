@@ -59,6 +59,50 @@ def error_envelope(code: str) -> bytes:
     return json.dumps({"error": {"code": code}}).encode()
 
 
+class FakePocketClient:
+    """Stands in for PocketHTTPClient where no socket is wanted.
+
+    Pass the instance itself as the replacement class: calling it records the
+    URL and token it was given and returns the same object. An exception
+    given as an answer is raised instead of returned.
+    """
+
+    MATCH = object()  # auth_params answers with the salt that was just sent
+
+    def __init__(self, capabilities: Any = None, reset: BaseException | None = None, params: Any = ()) -> None:
+        self.capabilities_value = CAPABILITIES if capabilities is None else capabilities
+        self.reset = reset
+        self.params = list(params)
+        self.created: list[tuple[str, str]] = []
+        self.bodies: list[bytes] = []
+        self.auth_calls = 0
+
+    def __call__(self, base_url: str, token: str) -> "FakePocketClient":
+        self.created.append((base_url, token))
+        return self
+
+    def capabilities(self) -> Any:
+        if isinstance(self.capabilities_value, BaseException):
+            raise self.capabilities_value
+        return self.capabilities_value
+
+    def reset_password(self, body: bytes) -> None:
+        self.bodies.append(body)
+        if self.reset is not None:
+            raise self.reset
+
+    def auth_params(self) -> Any:
+        self.auth_calls += 1
+        item = self.params.pop(0) if self.params else OSError("no answer")
+        if isinstance(item, BaseException):
+            raise item
+        salt = json.loads(self.bodies[-1])["kdf"]["salt"] if item is self.MATCH else item
+        return {
+            "schema_version": 1,
+            "kdf": {"name": "PBKDF2-HMAC-SHA256", "iterations": 600000, "salt": salt, "dk_len": 32},
+        }
+
+
 @dataclass(frozen=True)
 class Recorded:
     method: str

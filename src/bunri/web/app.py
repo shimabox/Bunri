@@ -45,6 +45,7 @@ from bunri.web.jobs import (
     SongNotFoundError,
     safe_filename,
 )
+from bunri.web.pocket_settings import register_pocket_settings_routes
 
 # Audio formats plus the mp4/mov video containers, case-insensitive: the
 # pipeline normalizes through ffmpeg, which extracts the audio track from a
@@ -368,6 +369,8 @@ def create_app(out_dir: Path, runner: Optional[Runner] = None) -> FastAPI:
             ):
                 return PlainTextResponse("Not Found", status_code=404)
         return await call_next(request)
+
+    register_pocket_settings_routes(app, out_dir)
 
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 

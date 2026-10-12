@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from bunri.cli import app
+from pocket_fake import FakePocketClient as _ResetPocket
 
 
 @pytest.mark.parametrize("argument", ["pocket-song.mp3", "./pocket"])
@@ -597,7 +598,6 @@ def test_missing_input_file_is_rejected(tmp_path):
 # ---------------------------------------------------------------------------
 _RESET_URL = "https://reset-pocket.invalid/shelf"
 _RESET_PASSWORD = "new-viewing-password-01"
-_RESET_CAPABILITIES = {"api": {"major": 1}, "features": {"password_reset": True}}
 _RESET_COMPLETED = (
     "音源ポケットにログインしていたすべての端末はログアウトされました。新しいパスワードで入り直してください。",
     "直前にログインに失敗していた場合は、待ち時間(最大 60 秒)が明けるまでログインできないことがあります。",
@@ -624,44 +624,6 @@ def _reset_token() -> str:
     import base64
 
     return base64.urlsafe_b64encode(b"\x7e" * 33).decode().rstrip("=")
-
-
-class _ResetPocket:
-    """Stands in for PocketHTTPClient in the reset-password command."""
-
-    MATCH = object()  # auth_params answers with the salt that was just sent
-
-    def __init__(self, capabilities=_RESET_CAPABILITIES, reset=None, params=()):
-        self.capabilities_value = capabilities
-        self.reset = reset
-        self.params = list(params)
-        self.created: list[tuple[str, str]] = []
-        self.bodies: list[bytes] = []
-        self.auth_calls = 0
-
-    def __call__(self, base_url, token):
-        self.created.append((base_url, token))
-        return self
-
-    def capabilities(self):
-        if isinstance(self.capabilities_value, BaseException):
-            raise self.capabilities_value
-        return self.capabilities_value
-
-    def reset_password(self, body):
-        self.bodies.append(body)
-        if isinstance(self.reset, BaseException):
-            raise self.reset
-
-    def auth_params(self):
-        import json
-
-        self.auth_calls += 1
-        item = self.params.pop(0) if self.params else OSError("no answer")
-        if isinstance(item, BaseException):
-            raise item
-        salt = json.loads(self.bodies[-1])["kdf"]["salt"] if item is self.MATCH else item
-        return {"schema_version": 1, "kdf": {"name": "PBKDF2-HMAC-SHA256", "iterations": 600000, "salt": salt, "dk_len": 32}}
 
 
 def _reset_setup(tmp_path, monkeypatch, pocket=None, *, tty=True, connected=True):
